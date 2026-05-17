@@ -288,3 +288,283 @@ async def test_start_rtsp_subscription_with_explicit_url(monkeypatch):
     )
     await task
     assert task.done()
+
+
+# ── 外出期間タスク B: STT RTSP 購読スケルトン詳細テスト ───────────────
+
+
+# 環境変数とヘルパー関数 ──────────────────────────────
+
+
+def test_get_rtsp_url_from_env(monkeypatch):
+    """STT_RTSP_URL から URL を取得できる。"""
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://test:test@host/stream")
+    assert stt_kotoba._get_rtsp_url() == "rtsp://test:test@host/stream"
+
+
+def test_get_rtsp_url_none_when_unset(monkeypatch):
+    """STT_RTSP_URL 未設定なら None。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+    assert stt_kotoba._get_rtsp_url() is None
+
+
+def test_get_rtsp_url_none_when_empty_string(monkeypatch):
+    """STT_RTSP_URL 空文字なら None (空文字は未設定扱い)。"""
+    monkeypatch.setenv("STT_RTSP_URL", "")
+    assert stt_kotoba._get_rtsp_url() is None
+
+
+def test_get_rtsp_url_whitespace_only_treated_as_none(monkeypatch):
+    """STT_RTSP_URL が空白のみなら None。"""
+    monkeypatch.setenv("STT_RTSP_URL", "   \t  ")
+    assert stt_kotoba._get_rtsp_url() is None
+
+
+def test_ffmpeg_available_returns_bool(monkeypatch):
+    """_ffmpeg_available() は bool を返す。"""
+    assert isinstance(stt_kotoba._ffmpeg_available(), bool)
+
+
+def test_ffmpeg_available_true_when_in_path(monkeypatch):
+    """shutil.which が ffmpeg のパスを返したら True。"""
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which",
+        lambda n: "/usr/bin/ffmpeg" if n == "ffmpeg" else None,
+    )
+    assert stt_kotoba._ffmpeg_available() is True
+
+
+def test_ffmpeg_available_false_when_not_in_path(monkeypatch):
+    """shutil.which が None を返したら False。"""
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which", lambda n: None
+    )
+    assert stt_kotoba._ffmpeg_available() is False
+
+
+def test_silero_vad_available_returns_bool():
+    """_silero_vad_available() は bool を返す (実環境依存)。"""
+    assert isinstance(stt_kotoba._silero_vad_available(), bool)
+
+
+# _noop_subscription_loop 単体 ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_noop_subscription_loop_completes_immediately():
+    """_noop_subscription_loop は副作用なく即終了する。"""
+    await stt_kotoba._noop_subscription_loop("test reason")
+    # 例外を投げず、await が即返ること
+
+
+@pytest.mark.asyncio
+async def test_noop_subscription_loop_accepts_arbitrary_reason():
+    """reason 引数に任意の文字列を渡せる。"""
+    for reason in ("ffmpeg missing", "STT_RTSP_URL not set", "依存欠落", ""):
+        await stt_kotoba._noop_subscription_loop(reason)
+
+
+# start_rtsp_subscription の動作詳細 ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_env_url_used_when_no_arg(monkeypatch):
+    """rtsp_url 引数省略時、環境変数 STT_RTSP_URL が使われる。"""
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://env:env@host/stream")
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which", lambda n: None
+    )  # ffmpeg なし → no-op で抜ける
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    await task
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_explicit_url_overrides_env(monkeypatch):
+    """rtsp_url 引数が指定されたら環境変数より優先 (実装は URL チェックだけ突破)。"""
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://env_url@host/stream")
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which", lambda n: None
+    )
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(
+        _on_speech, rtsp_url="rtsp://explicit_url@host/stream"
+    )
+    await task
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_kwargs_accepted(monkeypatch):
+    """vad_threshold / min_silence_ms / chunk_duration_ms キーワード引数を受け取れる。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(
+        _on_speech,
+        rtsp_url=None,  # 結果として no-op
+        vad_threshold=0.7,
+        min_silence_ms=800,
+        chunk_duration_ms=20,
+    )
+    await task
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_returns_asyncio_task_no_url(monkeypatch):
+    """URL 未設定でも返り値は asyncio.Task で、cancel/await が可能。"""
+    import asyncio as _asyncio
+
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    assert isinstance(task, _asyncio.Task)
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_returns_asyncio_task_no_ffmpeg(monkeypatch):
+    """ffmpeg なしの no-op パスでも返り値は asyncio.Task。"""
+    import asyncio as _asyncio
+
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://fake/stream")
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which", lambda n: None
+    )
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    assert isinstance(task, _asyncio.Task)
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_does_not_call_on_speech_during_noop(monkeypatch):
+    """no-op タスクは on_speech callback を呼ばない (本実装未着手のため)。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    calls: list[str] = []
+
+    async def _on_speech(text: str) -> None:
+        calls.append(text)
+
+    task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    await task
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_task_can_be_cancelled_after_completion(monkeypatch):
+    """no-op タスクが終了した後でも cancel() は安全に呼べる。"""
+    import asyncio as _asyncio
+
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    await task
+    # 終了済 task の cancel() は no-op
+    task.cancel()
+    # await でも例外は出ない (CancelledError がキャッチされない場合がある)
+    try:
+        await task
+    except _asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_concurrent_invocations_each_get_own_task(monkeypatch):
+    """複数回呼び出すと、それぞれ別の Task インスタンスが返る。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    async def _on_speech(text: str) -> None:
+        pass
+
+    task1 = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    task2 = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    assert task1 is not task2
+    await task1
+    await task2
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_no_url_message(monkeypatch, caplog):
+    """URL 未設定時の warning ログに 'STT_RTSP_URL' が含まれる。"""
+    import logging
+
+    from loguru import logger as loguru_logger
+
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").warning(msg.strip()),
+        level="WARNING",
+        format="{message}",
+    )
+    try:
+        async def _on_speech(text: str) -> None:
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="loguru"):
+            task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+            await task
+
+        messages = [r.message for r in caplog.records]
+        assert any(
+            "STT_RTSP_URL" in m or "STT live capture" in m for m in messages
+        ), f"expected STT-related warning, got: {messages}"
+    finally:
+        loguru_logger.remove(handler_id)
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_all_deps_present_logs_pending(monkeypatch, caplog):
+    """全依存揃っていて本実装が pending なら、warning ログにその旨が出る。"""
+    import logging
+
+    from loguru import logger as loguru_logger
+
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://fake/stream")
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which",
+        lambda n: f"/usr/bin/{n}",
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba._silero_vad_available",
+        lambda: True,
+    )
+
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").warning(msg.strip()),
+        level="WARNING",
+        format="{message}",
+    )
+    try:
+        async def _on_speech(text: str) -> None:
+            pass
+
+        with caplog.at_level(logging.WARNING, logger="loguru"):
+            task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+            await task
+
+        messages = [r.message for r in caplog.records]
+        assert any(
+            "implementation pending" in m or "Phase D" in m or "Phase C-1" in m or "deps" in m
+            for m in messages
+        ), f"expected pending-implementation warning, got: {messages}"
+    finally:
+        loguru_logger.remove(handler_id)

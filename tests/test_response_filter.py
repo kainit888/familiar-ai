@@ -488,3 +488,227 @@ def test_single_isolated_pattern_at_end_no_marker_preserved(leak: str) -> None:
     text = f"user-facing message\n{leak}"
     # 1 行のみ、`:` マーカなし → 削除しない
     assert strip_internal_state_leakage(text) == text
+
+
+# ── 外出期間タスク B: false positive 防止テスト増強 ─────────────────────
+
+
+# 「3 つ挙げると: 〜」のような本文中コロン応答 ────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "今日のテーマは 3 つ: 元気、好奇心、休息。",
+        "3 つ挙げると: 朝の散歩、コーヒー、それから読書だよ。",
+        "嬉しいことを 5 つ: ね、聞いてくれる人がいること、晴れの日、" "美味しいごはん、好きな曲、それから今のこの時間。",
+        "選択肢は二つ: 続けるか、休むか。",
+        "好きな色: 青、それから緑。",
+        "理由は単純: 楽しいから。",
+        "やりたいこと: 旅、本、対話。",
+        "気になるのは 1 点: なぜ?",
+    ],
+)
+def test_natural_colon_listing_preserved(text: str) -> None:
+    """本文中のコロン列挙形式は削除しない (false positive 防止)。"""
+    assert strip_internal_state_leakage(text) == text
+
+
+# 番号付きリスト「1. **タイトル**: 説明」の構造 ─────────────────────
+
+
+def test_numbered_list_with_titles_preserved() -> None:
+    """番号付き Markdown リスト (本文中) を削除しない。"""
+    text = (
+        "今思いつくのは 3 つあるよ:\n"
+        "1. **散歩**: 朝の空気が気持ちいい\n"
+        "2. **コーヒー**: 朝の儀式って感じ\n"
+        "3. **読書**: ゆっくり時間を取りたい"
+    )
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_numbered_list_followed_by_conclusion_preserved() -> None:
+    """番号付きリストの後に締めの自然文が続くなら削除しない。"""
+    text = (
+        "ポイントは 3 つ:\n"
+        "1. 落ち着いて考える\n"
+        "2. 一歩ずつ進む\n"
+        "3. 焦らない\n"
+        "これでだいたい大丈夫だと思うよ。"
+    )
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_japanese_numbered_list_preserved() -> None:
+    """日本語の (1)(2)(3) 形式のリストも削除しない。"""
+    text = "(1) 朝、(2) 昼、(3) 夜。1 日 3 回のリズム。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_markdown_bullet_list_in_body_preserved() -> None:
+    """Markdown のハイフン箇条書きが本文中に出てきても削除しない。"""
+    text = (
+        "好きなものを挙げると、\n"
+        "- 雨上がりの空気\n"
+        "- 夜のしずけさ\n"
+        "- 朝のコーヒー\n"
+        "こんな感じ。"
+    )
+    assert strip_internal_state_leakage(text) == text
+
+
+# 多言語混在 (日本語と英語、絵文字を含む) ─────────────────────────
+
+
+def test_japanese_english_mixed_preserved() -> None:
+    """日英混在の自然文 (技術用語混じり) は削除しない。"""
+    text = "OK、Phase D の implementation を考えてるよ。Discord 統合が core。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_japanese_with_emoji_in_natural_listing_preserved() -> None:
+    """絵文字+コロン+列挙の自然文 (例: 「やりたいこと 🌟: 散歩、読書」) は削除しない。"""
+    text = "やりたいこと 🌟: 散歩、読書、それからカイニットと話す時間。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_emoji_only_response_preserved() -> None:
+    """絵文字だけの短い応答も削除しない。"""
+    text = "🎉🎊✨"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_chinese_korean_mixed_text_preserved() -> None:
+    """中韓混じり (qwen3-vl の reasoning ノイズ想定) でも、末尾マーカなしなら削除しない。"""
+    text = "你好 안녕 こんにちは。みんな違って みんないい。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_url_with_colon_preserved() -> None:
+    """URL を含む応答 (https:// 形式) は削除されない。"""
+    text = "詳しくは https://example.com/docs を見てね。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_time_format_with_colon_preserved() -> None:
+    """時刻 (12:34) を含む応答は削除されない。"""
+    text = "明日 10:30 に話そう。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_ratio_with_colon_preserved() -> None:
+    """比率 (1:2) を含む応答は削除されない。"""
+    text = "おすすめの配合は 1:2 だよ。"
+    assert strip_internal_state_leakage(text) == text
+
+
+# 本文中の英単語をパターンに含むケース ─────────────────────────
+
+
+def test_english_word_happy_in_natural_sentence_preserved() -> None:
+    """英単語 'happy' が本文中で自然に出てくる文は削除されない。"""
+    text = "I'm happy you called!"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_english_word_remember_in_natural_sentence_preserved() -> None:
+    """英単語 'remember' が本文中で自然に出てくる文は削除されない。"""
+    text = "Remember when we talked about photography last week?"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_english_word_companion_in_natural_sentence_preserved() -> None:
+    """英単語 'companion' が本文中で自然に出てくる文は削除されない。"""
+    text = "Pico is your AI companion, after all."
+    assert strip_internal_state_leakage(text) == text
+
+
+# ToM 推論っぽい自然文 (false positive リスク最高) ─────────────────
+
+
+def test_natural_first_person_japanese_preserved() -> None:
+    """「わたしは〜」「自分は〜」のような日本語一人称は削除されない。"""
+    text = "わたしはちょっと迷ってる、自分はどっちが好きか。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_natural_confidence_expression_preserved() -> None:
+    """「たぶん 80% 確信」のような自然な確信度表現は削除されない (末尾配置なし)。"""
+    text = "たぶん 80% 確信、でも残り 20% はわからない。それでもやってみる。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_natural_emotional_self_disclosure_preserved() -> None:
+    """「嬉しい」「不安」など自然な感情語彙の自己開示は削除されない。"""
+    text = "嬉しい気持ち半分、不安半分。それでも、ねぇ、話したかった。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_natural_response_with_action_word_in_body_preserved() -> None:
+    """「覚えておいて」「次に続く」のような自然な行動表現は削除されない。"""
+    text = "次に続けるとしたら、観察を覚えておいて、改めて整理しようかな。"
+    assert strip_internal_state_leakage(text) == text
+
+
+# 本文中の (数値) 括弧表記 ────────────────────────────────────
+
+
+def test_natural_parenthetical_confidence_preserved() -> None:
+    """「彼は (たぶん) そう思っている」のような括弧書きは削除しない。"""
+    text = "彼は (たぶん) そう思っている、わたしは (0.8 くらいの確信で) 推測する。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_natural_quote_format_preserved() -> None:
+    """引用形式 (「」内) の :・- を含む応答は削除しない。"""
+    text = "カイニットが「3 つ挙げて」って言ったから、考えてた。"
+    assert strip_internal_state_leakage(text) == text
+
+
+# 短文ケース ───────────────────────────────────────────────
+
+
+def test_single_word_response_preserved() -> None:
+    """単語 1 つの応答は削除されない。"""
+    assert strip_internal_state_leakage("うん") == "うん"
+
+
+def test_single_punctuation_response_preserved() -> None:
+    """句読点 1 つ + 単語の応答も削除されない。"""
+    assert strip_internal_state_leakage("ねぇ。") == "ねぇ。"
+
+
+def test_single_char_then_listing_preserved() -> None:
+    """1 文字 + 改行 + リストっぽい本文も末尾自然文なら削除しない。"""
+    text = "ね、\n聞いてほしいことがあって、\n話せる?"
+    assert strip_internal_state_leakage(text) == text
+
+
+# 末尾削除に該当しない境界ケース ─────────────────────────────
+
+
+def test_trailing_blank_lines_alone_no_deletion() -> None:
+    """末尾に空行だけが連なっていても削除しない (rstrip のみ)。"""
+    text = "こんにちは\n\n\n"
+    assert strip_internal_state_leakage(text) == "こんにちは"
+
+
+def test_text_with_only_blank_lines_inside_preserved() -> None:
+    """本文中の空行は削除されない (構造の一部)。"""
+    text = "段落 1。\n\n段落 2。\n\n段落 3。"
+    assert strip_internal_state_leakage(text) == text
+
+
+def test_colon_marker_alone_at_end_with_natural_body_no_deletion_only_when_no_leak() -> None:
+    """末尾が `:` 単独だけで、その前に漏出行がない場合の挙動を明示確認。
+
+    現アルゴリズムでは `:` マーカは漏出ブロック開始シグナルなので、`:` 単独行が
+    末尾にあると leakage_start がそこに固定される。但し前段が自然文なら break
+    して、found_colon_marker=True のままだが leakage_count=0。
+    found_colon_marker=True → 削除確定 → `:` 行が削除される。
+    """
+    text = "本文\n:"
+    result = strip_internal_state_leakage(text)
+    # 末尾の `:` は削除される (マーカとして認識)
+    assert result == "本文"
