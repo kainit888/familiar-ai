@@ -65,22 +65,16 @@ async def test_call_unknown_tool_returns_error():
 
 @pytest.mark.asyncio
 async def test_say_calls_elevenlabs_api():
-    """say() POSTs to ElevenLabs with the correct API key and text."""
+    """say() は pico_agent.adapters.tts_sbv2.speak() を経由する (Phase C-1)。
+
+    旧テスト名 (elevenlabs_api) は互換性のため維持。中身は adapter mock。
+    """
     tool = _make_tts(api_key="test-api-key")
 
-    mock_response = MagicMock()
-    mock_response.status = 200
-    mock_response.read = AsyncMock(return_value=b"fake_mp3_data")
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    mock_session.post = MagicMock(return_value=mock_response)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
+    fake_speak = AsyncMock(return_value=b"FAKE_WAV_BYTES")
 
     with (
-        patch("aiohttp.ClientSession", return_value=mock_session),
+        patch("pico_agent.adapters.tts_sbv2.speak", fake_speak),
         patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
         patch("builtins.open", MagicMock()),
         patch("os.unlink"),
@@ -89,52 +83,31 @@ async def test_say_calls_elevenlabs_api():
         tmp_file = MagicMock()
         tmp_file.__enter__ = MagicMock(return_value=tmp_file)
         tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.mp3"
+        tmp_file.name = "/tmp/fake.wav"
         mock_tmp.return_value = tmp_file
 
         await tool.say("hello world")
 
-    # Verify ElevenLabs API was called
-    mock_session.post.assert_called_once()
-    call_args = mock_session.post.call_args
-    assert "xi-api-key" in call_args[1]["headers"] or "xi-api-key" in call_args.kwargs.get(
-        "headers", {}
-    )
+    # adapter が呼ばれたことを検証 (text 引数チェック)。
+    fake_speak.assert_awaited_once()
+    awaited_args = fake_speak.await_args
+    assert awaited_args.args[0] == "hello world"
 
 
 @pytest.mark.asyncio
 async def test_say_truncates_long_text():
-    """say() truncates text longer than 200 characters."""
+    """say() は 200 文字超を 200 文字に切り詰めてから adapter に渡す。"""
     tool = _make_tts()
     long_text = "x" * 300
 
-    truncated_texts = []
+    sent_texts: list[str] = []
 
-    async def fake_say_inner(text, output=None):
-        truncated_texts.append(text)
-        return "Said: ..."
-
-    # Patch at the API call level instead
-    mock_response = MagicMock()
-    mock_response.status = 200
-    mock_response.read = AsyncMock(return_value=b"fake_mp3_data")
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    posted_payloads = []
-
-    def capture_post(url, json=None, headers=None):
-        if json:
-            posted_payloads.append(json)
-        return mock_response
-
-    mock_session.post = MagicMock(side_effect=capture_post)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
+    async def capture_speak(text, *_args, **_kwargs):
+        sent_texts.append(text)
+        return b"FAKE_WAV_BYTES"
 
     with (
-        patch("aiohttp.ClientSession", return_value=mock_session),
+        patch("pico_agent.adapters.tts_sbv2.speak", side_effect=capture_speak),
         patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
         patch("os.unlink"),
         patch("tempfile.NamedTemporaryFile") as mock_tmp,
@@ -142,57 +115,36 @@ async def test_say_truncates_long_text():
         tmp_file = MagicMock()
         tmp_file.__enter__ = MagicMock(return_value=tmp_file)
         tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.mp3"
+        tmp_file.name = "/tmp/fake.wav"
         mock_tmp.return_value = tmp_file
 
         await tool.say(long_text)
 
-    assert posted_payloads, "API was never called"
-    sent_text = posted_payloads[0]["text"]
+    assert sent_texts, "adapter was never called"
+    sent_text = sent_texts[0]
     assert len(sent_text) <= 200
     assert sent_text.endswith("...")
 
 
 @pytest.mark.asyncio
 async def test_say_returns_error_on_api_failure():
-    """say() returns an error string when the ElevenLabs API returns non-200."""
+    """adapter が空 bytes を返した時、say() はエラー文字列を返す。"""
     tool = _make_tts()
 
-    mock_response = MagicMock()
-    mock_response.status = 429
-    mock_response.text = AsyncMock(return_value="Rate limit exceeded")
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    mock_session.post = MagicMock(return_value=mock_response)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-
-    with patch("aiohttp.ClientSession", return_value=mock_session):
+    with patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"")):
         result = await tool.say("hello")
 
-    assert "429" in result or "failed" in result.lower()
+    assert "failed" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_say_notifies_voice_guard_on_success():
+    """voice_guard.on_tts_start / on_tts_end が呼ばれる (adapter 経由でも維持)。"""
     tool = _make_tts()
     tool._voice_guard = MagicMock()
 
-    mock_response = MagicMock()
-    mock_response.status = 200
-    mock_response.read = AsyncMock(return_value=b"fake_mp3_data")
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    mock_session.post = MagicMock(return_value=mock_response)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-
     with (
-        patch("aiohttp.ClientSession", return_value=mock_session),
+        patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"FAKE_WAV")),
         patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
         patch("os.unlink"),
         patch("tempfile.NamedTemporaryFile") as mock_tmp,
@@ -200,7 +152,7 @@ async def test_say_notifies_voice_guard_on_success():
         tmp_file = MagicMock()
         tmp_file.__enter__ = MagicMock(return_value=tmp_file)
         tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.mp3"
+        tmp_file.name = "/tmp/fake.wav"
         mock_tmp.return_value = tmp_file
 
         await tool.say("hello world")
@@ -214,19 +166,8 @@ async def test_say_serializes_concurrent_calls():
     """Concurrent say() calls must be serialized (lock prevents overlap)."""
     tool = _make_tts()
 
-    mock_response = MagicMock()
-    mock_response.status = 200
-    mock_response.read = AsyncMock(return_value=b"fake")
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    mock_session.post = MagicMock(return_value=mock_response)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-
     with (
-        patch("aiohttp.ClientSession", return_value=mock_session),
+        patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"FAKE_WAV")),
         patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
         patch("os.unlink"),
         patch("tempfile.NamedTemporaryFile") as mock_tmp,
@@ -234,7 +175,7 @@ async def test_say_serializes_concurrent_calls():
         tmp_file = MagicMock()
         tmp_file.__enter__ = MagicMock(return_value=tmp_file)
         tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.mp3"
+        tmp_file.name = "/tmp/fake.wav"
         mock_tmp.return_value = tmp_file
 
         # Launch two say() calls concurrently

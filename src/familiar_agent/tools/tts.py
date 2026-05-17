@@ -133,27 +133,33 @@ class TTSTool:
         _ensure_go2rtc(self.go2rtc_url)
 
     async def say(self, text: str, output: str | None = None) -> str:
-        """Speak text aloud via ElevenLabs.
+        """Speak text aloud (pico_v3: routed through Style-BERT-VITS2 adapter).
 
         output: "local" = PC speaker, "remote" = camera speaker (go2rtc), "both" = both.
                 Defaults to self.output when not specified.
 
         Concurrent calls are serialized via self._lock so audio never overlaps.
+
+        Phase C-1 で pico_agent.adapters.tts_sbv2 経由に差し替え。ElevenLabs
+        直叩きコードは dead-code として残置 (上流マージコンフリクト最小化)。
         """
-        import aiohttp
+        # NOTE: aiohttp 直叩きは pico_v3 で停止 (adapter 経由に統一)。
+        from pico_agent.adapters import tts_sbv2
 
         if output is None:
             output = self.output
         if len(text) > 200:
             text = text[:197] + "..."
 
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}?output_format=pcm_16000"
-        headers = {"xi-api-key": self.api_key, "Content-Type": "application/json"}
-        payload = {
-            "text": text,
-            "model_id": "eleven_v3",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-        }
+        # ── DEAD CODE (Phase C-1, ElevenLabs 直叩き、SBV2 移行で停止) ──
+        # url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}?output_format=pcm_16000"
+        # headers = {"xi-api-key": self.api_key, "Content-Type": "application/json"}
+        # payload = {
+        #     "text": text,
+        #     "model_id": "eleven_v3",
+        #     "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        # }
+        # ─────────────────────────────────────────────────────────────────
 
         async with self._lock:
             voice_guard = getattr(self, "_voice_guard", None)
@@ -164,25 +170,14 @@ class TTSTool:
             tmp_path: str | None = None
             voice_guard.on_tts_start(text)
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers) as resp:
-                        if resp.status != 200:
-                            err = await resp.text()
-                            return f"TTS API failed ({resp.status}): {err[:80]}"
-                        content_type = resp.headers.get("Content-Type", "")
-                        audio_data = await resp.read()
+                # SBV2 adapter は WAV bytes を返す (失敗時は空 bytes)。
+                target = "discord_vc" if output in ("remote", "both") else "local_speaker"
+                audio_data = await tts_sbv2.speak(text, target=target)
+                if not audio_data:
+                    return "TTS API failed (adapter returned empty bytes)"
 
-                # ElevenLabs may return MP3 even when PCM was requested (model-dependent).
-                # Detect by content-type and save to the correct format.
-                is_mp3 = "mpeg" in content_type or audio_data[:3] in (
-                    b"ID3",
-                    b"\xff\xfb",
-                    b"\xff\xf3",
-                )
-                if is_mp3:
-                    tmp_path = _write_tmp_audio(audio_data, suffix=".mp3")
-                else:
-                    tmp_path = _write_pcm_as_wav(audio_data, sample_rate=16000)
+                # SBV2 は WAV を返すので tmp に書き出して既存再生経路を再利用。
+                tmp_path = _write_tmp_audio(audio_data, suffix=".wav")
 
                 if output in ("remote", "both"):
                     ok, msg = await asyncio.to_thread(

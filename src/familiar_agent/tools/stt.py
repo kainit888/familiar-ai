@@ -218,35 +218,44 @@ class STTTool:
     # ── transcription ─────────────────────────────────────────────────────
 
     async def _transcribe_elevenlabs(self, audio_bytes: bytes) -> str:
-        """Send audio to ElevenLabs Scribe and return the transcript."""
+        """Send audio to STT backend and return the transcript.
+
+        Phase C-1 で pico_agent.adapters.stt_kotoba 経由に差し替え。
+        メソッド名は呼び出し側互換のため残しているが、内部実装は
+        Kotoba-Whisper (whisper_server.py) を経由する。ElevenLabs Scribe
+        直叩きコードは dead-code として残置 (上流マージコンフリクト最小化)。
+        """
         if not audio_bytes:
             return ""
 
-        headers = {"xi-api-key": self._api_key}
-        form = aiohttp.FormData()
-        form.add_field(
-            "file",
-            audio_bytes,
-            filename="audio.wav",
-            content_type="audio/wav",
-        )
-        form.add_field("model_id", "scribe_v1")
-        form.add_field("tag_audio_events", "false")
-        if self._language:
-            form.add_field("language_code", self._language)
+        # ── DEAD CODE (Phase C-1, ElevenLabs Scribe 直叩き) ──
+        # headers = {"xi-api-key": self._api_key}
+        # form = aiohttp.FormData()
+        # form.add_field("file", audio_bytes, filename="audio.wav", content_type="audio/wav")
+        # form.add_field("model_id", "scribe_v1")
+        # form.add_field("tag_audio_events", "false")
+        # if self._language:
+        #     form.add_field("language_code", self._language)
+        # try:
+        #     timeout = aiohttp.ClientTimeout(total=60)
+        #     async with aiohttp.ClientSession(timeout=timeout) as session:
+        #         async with session.post(_ELEVENLABS_STT_URL, headers=headers, data=form) as resp:
+        #             if resp.status != 200:
+        #                 body = await resp.text()
+        #                 logger.warning("STT: ElevenLabs error %d: %s", resp.status, body[:200])
+        #                 return ""
+        #             data = await resp.json()
+        #             text: str = data.get("text", "")
+        #             logger.info("STT: transcribed %d chars", len(text))
+        #             return text
+        # except Exception as e:
+        #     logger.warning("STT: transcription failed: %s", e)
+        #     return ""
+        # ────────────────────────────────────────────────────────────────
 
-        try:
-            timeout = aiohttp.ClientTimeout(total=60)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(_ELEVENLABS_STT_URL, headers=headers, data=form) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning("STT: ElevenLabs error %d: %s", resp.status, body[:200])
-                        return ""
-                    data = await resp.json()
-                    text: str = data.get("text", "")
-                    logger.info("STT: transcribed %d chars", len(text))
-                    return text
-        except Exception as e:
-            logger.warning("STT: transcription failed: %s", e)
-            return ""
+        from pico_agent.adapters import stt_kotoba
+
+        text = await stt_kotoba.transcribe(audio_bytes, sample_rate=16000)
+        if text:
+            logger.info("STT: transcribed %d chars", len(text))
+        return text

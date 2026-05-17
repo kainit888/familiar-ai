@@ -80,7 +80,12 @@ def test_write_pcm_as_wav_different_sample_rates(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_tts_payload_requests_pcm_format() -> None:
-    """TTSTool.say() must request pcm_16000 from ElevenLabs, not MP3."""
+    """Phase C-1: TTSTool.say() は pico_agent.adapters.tts_sbv2.speak を経由する。
+
+    旧テストは ElevenLabs URL に output_format=pcm_16000 が含まれることを検証して
+    いたが、SBV2 adapter に差し替わったため、検証対象は「adapter が WAV bytes を
+    返す」に変更。テスト名は呼び出し側互換のため維持。
+    """
     from familiar_agent.tools.tts import TTSTool
 
     tool = TTSTool.__new__(TTSTool)
@@ -91,56 +96,19 @@ async def test_tts_payload_requests_pcm_format() -> None:
     tool.go2rtc_stream = "test"
     tool._lock = __import__("asyncio").Lock()
 
-    captured_payload: dict = {}
-    captured_url = ""
+    # SBV2 adapter が返すであろう WAV bytes を mock。
+    fake_wav = b"RIFF\x24\x00\x00\x00WAVE" + _make_pcm(1600)
+    fake_speak = AsyncMock(return_value=fake_wav)
 
-    class FakeResp:
-        status = 200
-        headers: dict = {"Content-Type": "audio/pcm"}
+    with (
+        patch("pico_agent.adapters.tts_sbv2.speak", fake_speak),
+        patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
+    ):
+        await tool.say("テスト")
 
-        async def read(self):
-            return _make_pcm(1600)
-
-        async def text(self):
-            return ""
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-    class FakePost:
-        def __init__(self, *a, **kw):
-            nonlocal captured_url
-            if a:
-                captured_url = a[0]
-            captured_payload.update(kw.get("json", {}))
-
-        async def __aenter__(self):
-            return FakeResp()
-
-        async def __aexit__(self, *a):
-            pass
-
-    class FakeSession:
-        def post(self, *a, **kw):
-            return FakePost(*a, **kw)
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            pass
-
-    with patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)):
-        with patch("aiohttp.ClientSession", return_value=FakeSession()):
-            await tool.say("テスト")
-
-    assert "output_format=pcm_16000" in captured_url, (
-        f"Expected output_format=pcm_16000 in URL, got: {captured_url}"
-    )
-    assert captured_payload.get("model_id") == "eleven_v3"
+    fake_speak.assert_awaited_once()
+    awaited_args = fake_speak.await_args
+    assert awaited_args.args[0] == "テスト"
 
 
 # ---------------------------------------------------------------------------

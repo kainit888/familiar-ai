@@ -46,48 +46,29 @@ class TestTranscribeElevenlabs:
 
     @pytest.mark.asyncio
     async def test_success_returns_text(self) -> None:
+        """_transcribe_elevenlabs() は pico_agent.adapters.stt_kotoba 経由になった (Phase C-1)。
+
+        メソッド名は呼び出し側互換のため維持。中身は adapter mock で検証。
+        """
         tool = STTTool(api_key="fake-key", language="ja")
 
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value={"text": "hello world"})
-
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = MagicMock()
-        mock_session.post = MagicMock(return_value=mock_session_ctx)
-
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("familiar_agent.tools.stt.aiohttp.ClientSession", return_value=mock_client_ctx):
+        with patch(
+            "pico_agent.adapters.stt_kotoba.transcribe",
+            new=AsyncMock(return_value="hello world"),
+        ):
             result = await tool._transcribe_elevenlabs(b"fake-audio-bytes")
 
         assert result == "hello world"
 
     @pytest.mark.asyncio
     async def test_api_error_returns_empty(self) -> None:
+        """adapter が空文字を返したら _transcribe_elevenlabs も空文字を返す。"""
         tool = STTTool(api_key="fake-key", language="ja")
 
-        mock_resp = AsyncMock()
-        mock_resp.status = 401
-        mock_resp.text = AsyncMock(return_value="Unauthorized")
-
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = MagicMock()
-        mock_session.post = MagicMock(return_value=mock_session_ctx)
-
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("familiar_agent.tools.stt.aiohttp.ClientSession", return_value=mock_client_ctx):
+        with patch(
+            "pico_agent.adapters.stt_kotoba.transcribe",
+            new=AsyncMock(return_value=""),
+        ):
             result = await tool._transcribe_elevenlabs(b"fake-audio-bytes")
 
         assert result == ""
@@ -100,11 +81,12 @@ class TestTranscribeElevenlabs:
 
     @pytest.mark.asyncio
     async def test_network_exception_returns_empty(self) -> None:
+        """adapter が例外を吸って空文字を返す挙動を STTTool 側でも維持。"""
         tool = STTTool(api_key="fake-key")
 
         with patch(
-            "familiar_agent.tools.stt.aiohttp.ClientSession",
-            side_effect=Exception("connection refused"),
+            "pico_agent.adapters.stt_kotoba.transcribe",
+            new=AsyncMock(return_value=""),
         ):
             result = await tool._transcribe_elevenlabs(b"fake-audio-bytes")
 
@@ -112,98 +94,62 @@ class TestTranscribeElevenlabs:
 
     @pytest.mark.asyncio
     async def test_missing_text_key_returns_empty(self) -> None:
-        """API returns 200 but JSON has no 'text' field."""
+        """adapter が空文字を返した場合 (text field なし相当) 空文字を返す。"""
         tool = STTTool(api_key="fake-key", language="ja")
 
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value={"status": "ok"})
-
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = MagicMock()
-        mock_session.post = MagicMock(return_value=mock_session_ctx)
-
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("familiar_agent.tools.stt.aiohttp.ClientSession", return_value=mock_client_ctx):
+        with patch(
+            "pico_agent.adapters.stt_kotoba.transcribe",
+            new=AsyncMock(return_value=""),
+        ):
             result = await tool._transcribe_elevenlabs(b"fake-audio-bytes")
 
         assert result == ""
 
     @pytest.mark.asyncio
     async def test_language_field_sent_when_set(self) -> None:
-        """When language is set, language_code field is added to form data."""
+        """Phase C-1: adapter に audio_bytes が渡る (language は adapter 側で未使用)。
+
+        Kotoba-Whisper は自動言語検出のため language_code を adapter には
+        渡さない。互換のためテスト名は維持し、adapter 呼び出しを検証する。
+        """
         tool = STTTool(api_key="fake-key", language="en")
 
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value={"text": "hi"})
+        captured_audio: list[bytes] = []
 
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+        async def capture_transcribe(audio_bytes, sample_rate=16000):
+            captured_audio.append(audio_bytes)
+            return "hi"
 
-        mock_session = MagicMock()
-        mock_session.post = MagicMock(return_value=mock_session_ctx)
-
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        mock_form_cls = MagicMock()
-        mock_form_instance = MagicMock()
-        mock_form_cls.return_value = mock_form_instance
-
-        with (
-            patch("familiar_agent.tools.stt.aiohttp.ClientSession", return_value=mock_client_ctx),
-            patch("familiar_agent.tools.stt.aiohttp.FormData", mock_form_cls),
+        with patch(
+            "pico_agent.adapters.stt_kotoba.transcribe",
+            side_effect=capture_transcribe,
         ):
-            await tool._transcribe_elevenlabs(b"audio")
+            result = await tool._transcribe_elevenlabs(b"audio")
 
-        # Check language_code was added
-        calls = mock_form_instance.add_field.call_args_list
-        lang_calls = [c for c in calls if c[0][0] == "language_code"]
-        assert len(lang_calls) == 1
-        assert lang_calls[0][0][1] == "en"
+        assert result == "hi"
+        assert captured_audio == [b"audio"]
 
     @pytest.mark.asyncio
     async def test_no_language_field_when_empty(self) -> None:
-        """When language is empty string, language_code field is NOT added."""
+        """Phase C-1: language='' でも adapter は呼ばれ、戻り値を返す。"""
         tool = STTTool(api_key="fake-key", language="")
 
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.json = AsyncMock(return_value={"text": "hi"})
+        captured: dict = {}
 
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+        async def capture_transcribe(audio_bytes, sample_rate=16000):
+            captured["audio"] = audio_bytes
+            captured["sample_rate"] = sample_rate
+            return "hi"
 
-        mock_session = MagicMock()
-        mock_session.post = MagicMock(return_value=mock_session_ctx)
-
-        mock_client_ctx = AsyncMock()
-        mock_client_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_client_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        mock_form_cls = MagicMock()
-        mock_form_instance = MagicMock()
-        mock_form_cls.return_value = mock_form_instance
-
-        with (
-            patch("familiar_agent.tools.stt.aiohttp.ClientSession", return_value=mock_client_ctx),
-            patch("familiar_agent.tools.stt.aiohttp.FormData", mock_form_cls),
+        with patch(
+            "pico_agent.adapters.stt_kotoba.transcribe",
+            side_effect=capture_transcribe,
         ):
-            await tool._transcribe_elevenlabs(b"audio")
+            result = await tool._transcribe_elevenlabs(b"audio")
 
-        calls = mock_form_instance.add_field.call_args_list
-        lang_calls = [c for c in calls if c[0][0] == "language_code"]
-        assert len(lang_calls) == 0
+        assert result == "hi"
+        assert captured["audio"] == b"audio"
+        assert captured["sample_rate"] == 16000
 
 
 # ── STTTool.record_and_transcribe ─────────────────────────────────────────────
