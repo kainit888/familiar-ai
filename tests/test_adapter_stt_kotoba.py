@@ -162,3 +162,129 @@ async def test_transcribe_includes_sample_rate_field(monkeypatch):
     sr_fields = [f for f in captured_fields if f[0] == "sample_rate"]
     assert len(sr_fields) == 1
     assert sr_fields[0][1] == "22050"
+
+
+# ── v4.2 14-4: start_rtsp_subscription() スケルトンのテスト ─────────────
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_no_url_returns_noop_task(monkeypatch):
+    """STT_RTSP_URL 未設定・引数も None なら no-op タスクを返す。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    async def _dummy_on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_dummy_on_speech)
+    # no-op タスクは即終了する
+    await task
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_no_ffmpeg_returns_noop_task(monkeypatch):
+    """ffmpeg が PATH になければ no-op タスクを返す。"""
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://fake:fake@example/stream1")
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which",
+        lambda name: None,
+    )
+
+    async def _dummy_on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_dummy_on_speech)
+    await task
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_no_vad_returns_noop_task(monkeypatch):
+    """silero-vad / torch 未インストールなら no-op タスクを返す。"""
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://fake:fake@example/stream1")
+    # ffmpeg は存在することにする
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which",
+        lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None,
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba._silero_vad_available",
+        lambda: False,
+    )
+
+    async def _dummy_on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_dummy_on_speech)
+    await task
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_all_deps_present_still_noop(monkeypatch):
+    """全依存が揃っていても Phase C-1 段階では本実装が無いので no-op で抜ける。
+
+    将来 (Phase D 以降) 本実装を入れたら、このテストは on_speech が呼ばれる
+    か `transcribe()` が呼ばれるかを検証する形に書き換える。
+    """
+    monkeypatch.setenv("STT_RTSP_URL", "rtsp://fake:fake@example/stream1")
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba._silero_vad_available",
+        lambda: True,
+    )
+
+    calls: list[str] = []
+
+    async def _on_speech(text: str) -> None:
+        calls.append(text)
+
+    task = await stt_kotoba.start_rtsp_subscription(_on_speech)
+    await task
+    # Phase C-1 では on_speech は呼ばれない (本実装未着手)
+    assert calls == []
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_returns_task_object(monkeypatch):
+    """戻り値は asyncio.Task インスタンス (cancel 可能であること)。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+
+    async def _dummy_on_speech(text: str) -> None:
+        pass
+
+    task = await stt_kotoba.start_rtsp_subscription(_dummy_on_speech)
+    import asyncio
+
+    assert isinstance(task, asyncio.Task)
+    # task.cancel() が呼べる (no-op 終了済みなら何もしない)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_subscription_with_explicit_url(monkeypatch):
+    """rtsp_url を明示指定したら環境変数より優先される (依存チェックは通る前提)。"""
+    monkeypatch.delenv("STT_RTSP_URL", raising=False)
+    monkeypatch.setattr(
+        "pico_agent.adapters.stt_kotoba.shutil.which",
+        lambda name: None,  # ffmpeg なし → no-op
+    )
+
+    async def _dummy_on_speech(text: str) -> None:
+        pass
+
+    # rtsp_url 指定で URL チェックは突破、ffmpeg チェックで no-op
+    task = await stt_kotoba.start_rtsp_subscription(
+        _dummy_on_speech,
+        rtsp_url="rtsp://explicit:url@example/stream1",
+    )
+    await task
+    assert task.done()

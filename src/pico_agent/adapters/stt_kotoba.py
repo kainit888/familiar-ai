@@ -1,20 +1,39 @@
-"""STT adapter (Kotoba-Whisper) - 設計書 v4.0 第 7-3 章。
+"""STT adapter (Kotoba-Whisper) - 設計書 v4.0 第 7-3 章 / v4.2 第 14-4 章。
 
 メイン PC で稼働中の ``whisper_server.py`` (デフォルト
 192.168.10.104:8765) の /transcribe エンドポイントに音声を POST して
 書き起こしテキストを取得する。
 
-I/F (設計書 7-3 章):
+I/F (設計書 7-3 章 + v4.2 14-4 章):
     async def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str
+
+    # v4.2 14-4 RTSP 購読常駐 (Phase C-1 で追加):
+    async def start_rtsp_subscription(
+        rtsp_url: str,
+        on_speech: Callable[[str], Awaitable[None]],
+        ...
+    ) -> asyncio.Task:
+        "Tapo C210 RTSP 音声トラックを連続購読し、VAD で発話区切りを検出 →
+        Kotoba-Whisper に転送 → on_speech(text) を呼ぶ常駐タスクを起動"
 
 エラーハンドリング方針 (planner 確認済み):
     - 例外を raise せず silent fail + logger.warning
     - 失敗時は空文字を返す
+    - start_rtsp_subscription は ffmpeg / VAD 依存ライブラリが揃っていない時
+      no-op タスク (即終了) を返す
+
+依存ライブラリ (Phase C-1):
+    - ffmpeg (system, RTSP demux + PCMA → PCM 16kHz 変換)
+    - silero-vad (optional, 発話区切り検出)
+    どちらも未インストールなら start_rtsp_subscription() は no-op
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
+from typing import Awaitable, Callable, Optional
 
 import aiohttp
 from loguru import logger
@@ -101,3 +120,108 @@ async def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
     except Exception as e:
         logger.warning("stt_kotoba.transcribe: request failed: {}", e)
         return ""
+
+
+# ── v4.2 14-4: Tapo RTSP 音声トラック購読 (Phase C-1 で追加) ──────────────
+#
+# 設計書 v4.2 14-4 が要求する常駐コンポーネント。Tapo C210 の RTSP 音声トラック
+# (PCMA/8000) を ffmpeg で PCM 16kHz に変換しつつ、Silero VAD で発話区切りを
+# 検出し、発話単位で transcribe() を呼んで上位 callback に流す。
+#
+# Phase C-1 では「**依存ライブラリ (ffmpeg + silero-vad) が揃っているか動的に
+# 判定し、揃っていなければ no-op タスクを返す**」スケルトン実装にとどめる。
+# 実稼働は Phase D Discord 統合と同時に詰める。
+
+
+def _get_rtsp_url() -> Optional[str]:
+    """環境変数 STT_RTSP_URL から Tapo RTSP URL を取得 (未設定なら None)。
+
+    例: ``rtsp://Pico:password@192.168.10.110:554/stream1``
+    """
+    raw = os.environ.get("STT_RTSP_URL", "").strip()
+    return raw or None
+
+
+def _ffmpeg_available() -> bool:
+    """ffmpeg バイナリが PATH にあるかを判定 (RTSP demux + 変換に必要)。"""
+    return shutil.which("ffmpeg") is not None
+
+
+def _silero_vad_available() -> bool:
+    """silero-vad (or torch.hub silero_vad) が import 可能かを判定。
+
+    Phase C-1 では import 試行のみ。RPi5 上では torch インストールが
+    重いので、`uv add` は本実装時に行う。
+    """
+    try:
+        import silero_vad  # type: ignore  # noqa: F401
+        return True
+    except Exception:
+        pass
+    try:
+        import torch  # type: ignore  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+async def _noop_subscription_loop(reason: str) -> None:
+    """依存が揃っていない時の no-op ループ (起動ログだけ出して即終了)。"""
+    logger.warning(
+        "stt_kotoba.start_rtsp_subscription: skipped ({}); "
+        "STT live capture disabled until dependencies are installed",
+        reason,
+    )
+
+
+async def start_rtsp_subscription(
+    on_speech: Callable[[str], Awaitable[None]],
+    rtsp_url: Optional[str] = None,
+    *,
+    vad_threshold: float = 0.5,
+    min_silence_ms: int = 500,
+    chunk_duration_ms: int = 30,
+) -> asyncio.Task:
+    """Tapo C210 RTSP 音声トラックを連続購読し、発話単位で transcribe を呼ぶ常駐タスクを起動。
+
+    設計書 v4.2 14-4 章の常駐コンポーネント。Phase C-1 ではスケルトン実装で、
+    依存ライブラリ (ffmpeg + silero-vad) が揃っていない場合は no-op タスクを
+    返す。本実装は Phase D 着手時または依存揃い次第。
+
+    Args:
+        on_speech: 1 発話の書き起こしテキストを受け取る async callback。
+        rtsp_url: Tapo RTSP URL (未指定なら環境変数 STT_RTSP_URL から取得)。
+        vad_threshold: Silero VAD の発話判定閾値 (0.0-1.0)。
+        min_silence_ms: 発話終端と判定する無音時間 (ミリ秒)。
+        chunk_duration_ms: VAD に流す 1 chunk の長さ (ミリ秒)。
+
+    Returns:
+        起動した `asyncio.Task`。停止は ``task.cancel()`` で。
+        依存未満の場合も Task を返す (即終了する no-op タスク)。
+    """
+    url = rtsp_url or _get_rtsp_url()
+    if not url:
+        return asyncio.create_task(_noop_subscription_loop("STT_RTSP_URL not set"))
+    if not _ffmpeg_available():
+        return asyncio.create_task(_noop_subscription_loop("ffmpeg not in PATH"))
+    if not _silero_vad_available():
+        return asyncio.create_task(
+            _noop_subscription_loop("silero-vad / torch not installed")
+        )
+
+    # 実装本体は Phase D / 本実装時に詰める。
+    # スケルトン段階ではここに到達したらログを残して no-op で抜ける。
+    logger.warning(
+        "stt_kotoba.start_rtsp_subscription: dependencies present but "
+        "implementation pending (Phase D or dedicated session). "
+        "Returning no-op task. url={}, vad_threshold={}, min_silence_ms={}",
+        url,
+        vad_threshold,
+        min_silence_ms,
+    )
+    # on_speech は将来の本実装で呼ぶ。ここでは未使用なので参照だけして
+    # static analyzer 警告を抑止。
+    _ = on_speech, chunk_duration_ms
+    return asyncio.create_task(
+        _noop_subscription_loop("implementation pending (Phase D)")
+    )
