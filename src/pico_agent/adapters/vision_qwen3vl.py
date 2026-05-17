@@ -62,10 +62,20 @@ def _get_timeout() -> float:
 
 
 def _build_messages(image_bytes: bytes, prompt: str) -> list[dict[str, Any]]:
-    """Ollama OpenAI 互換 chat/completions の image_url payload を組み立てる。"""
+    """Ollama OpenAI 互換 chat/completions の image_url payload を組み立てる。
+
+    qwen3-vl は thinking mode が既定で有効になっており、放置すると
+    ``choices[0].message.content`` が空文字 / 思考過程は ``reasoning``
+    フィールドに多言語混在で出力される (Phase C-1 実機検証で判明)。
+    qwen3 公式の thinking 無効化指示である ``/no_think`` プレフィックスを
+    user_text 先頭に付与して、content に直接日本語応答を出させる。
+    """
     b64 = base64.b64encode(image_bytes).decode("ascii")
     image_url = f"data:image/jpeg;base64,{b64}"
-    user_text = prompt.strip() if prompt and prompt.strip() else "What is in this image?"
+    base_text = prompt.strip() if prompt and prompt.strip() else "What is in this image?"
+    # qwen3-vl の thinking mode を無効化 (実機検証で reasoning フィールドに
+    # 出力が偏り content が空になる現象を回避する)。
+    user_text = f"/no_think {base_text}"
     return [
         {
             "role": "user",
@@ -158,6 +168,12 @@ async def parse_scene(image_bytes: bytes) -> dict[str, Any]:
         ``{"description": str, "entities": list[str]}`` 形式の dict。
         失敗時は ``{"description": "", "entities": []}`` を返す
         (Phase G で joint_attention.ingest_scene_parse 側で確定スキーマ予定)。
+
+    TODO(phase-g): qwen3-vl:4b は JSON 構造化指示があると ``/no_think`` を
+    上書きして thinking mode を強制発動し、content が空 / reasoning に出力する
+    現象を Phase C-1 実機検証で確認 (5 プロンプトバリエーション全失敗)。
+    Phase G で joint_attention 統合時に reasoning fallback / Ollama ネイティブ
+    ``/api/chat`` の ``think: false`` / qwen3-vl:8b への切替を再評価する。
     """
     fallback: dict[str, Any] = {"description": "", "entities": []}
     if not image_bytes:

@@ -159,3 +159,82 @@ async def test_post_chat_includes_keep_alive_in_payload(monkeypatch):
     assert captured["url"] == "http://test:11434/v1/chat/completions"
     assert captured["json"]["model"] == "qwen3-vl:test"
     assert captured["json"]["keep_alive"] == -1
+    # qwen3-vl thinking mode 無効化のため、user text 先頭に /no_think が付く。
+    messages = captured["json"]["messages"]
+    text_part = next(p for p in messages[0]["content"] if p["type"] == "text")
+    assert text_part["text"].startswith("/no_think ")
+    assert "hi" in text_part["text"]
+
+
+def _capturing_session_factory(captured: dict):
+    """payload を captured dict に取り込む aiohttp.ClientSession スタブを返す。"""
+
+    class _CapturingSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def post(self, url, json=None):  # noqa: A002
+            captured["url"] = url
+            captured["json"] = json
+            resp = MagicMock()
+            resp.status = 200
+            resp.json = AsyncMock(
+                return_value={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"description": "x", "entities": ["x"]}'
+                            }
+                        }
+                    ]
+                }
+            )
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+    return _CapturingSession
+
+
+@pytest.mark.asyncio
+async def test_describe_scene_payload_includes_no_think_prefix(monkeypatch):
+    """describe_scene の user message text が ``/no_think `` で始まる。"""
+    captured: dict = {}
+    monkeypatch.setattr(
+        vision_qwen3vl.aiohttp, "ClientSession", _capturing_session_factory(captured)
+    )
+
+    await vision_qwen3vl.describe_scene(
+        b"\xff\xd8data", prompt="この画像に何が写ってる?"
+    )
+
+    messages = captured["json"]["messages"]
+    assert messages[0]["role"] == "user"
+    text_part = next(p for p in messages[0]["content"] if p["type"] == "text")
+    assert text_part["text"].startswith("/no_think ")
+    # 元プロンプトが失われていないこと。
+    assert "この画像に何が写ってる?" in text_part["text"]
+
+
+@pytest.mark.asyncio
+async def test_parse_scene_payload_includes_no_think_prefix(monkeypatch):
+    """parse_scene 側でも内部 _PARSE_SCENE_PROMPT の前に ``/no_think `` が付く。"""
+    captured: dict = {}
+    monkeypatch.setattr(
+        vision_qwen3vl.aiohttp, "ClientSession", _capturing_session_factory(captured)
+    )
+
+    await vision_qwen3vl.parse_scene(b"\xff\xd8data")
+
+    messages = captured["json"]["messages"]
+    text_part = next(p for p in messages[0]["content"] if p["type"] == "text")
+    assert text_part["text"].startswith("/no_think ")
+    # 内部 _PARSE_SCENE_PROMPT の冒頭文言が後続している。
+    assert "Look at this image" in text_part["text"]
