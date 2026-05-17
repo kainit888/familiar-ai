@@ -56,6 +56,9 @@ from .tools.tts import TTSTool
 from ._i18n import _t
 from .mcp_client import MCPClientManager, _resolve_config_path
 
+# pico_v3 拡張: 応答漏出フィルタ (内部メンタル状態スキャフォールディング除去)
+from pico_agent.response_filter import strip_internal_state_leakage
+
 logger = logging.getLogger(__name__)
 
 
@@ -175,6 +178,29 @@ SYSTEM_PROMPT = """
     (constraint :priority critical :id no-tts-tags
       "NEVER output [bracket-tag] markers like [cheerful][laughs][whispers]
        in text responses. Those are TTS codes for audio only.")
+
+    ; ── Suppress meta-reasoning / internal-state leakage ───────────────
+    (constraint :priority critical :id suppress-meta-reasoning
+      "NEVER surface your internal mental-state scaffolding in user-visible output.
+       Forbidden to echo back, paraphrase, or quote any of:
+         - emotion / affect numeric values such as arousal=0.85 or valence=0.2
+         - inner-state bullet lists imitating the Mental state block
+           starting with [Mental state] or bullets like
+           '- affect: ...', '- social: ...', '- drives: ...',
+           '- working-memory: ...', '- continuity: ...',
+           '- interoception: ...' and similar.
+         - mental-state S-expression nodes (the body-state form,
+           the tension form, the sensing form, the interoception form,
+           or markers like :private true)
+         - ToM analysis headings or confidence numerics
+           such as '# ToM:', '## エビデンス', '## 推論', '## 応答方針',
+           or trailing parenthesized confidences like (0.8) / (confidence 0.5)
+         - action memos or planning bullets that are notes-to-self
+           rather than speech for the user.
+       Natural emotional vocabulary in your own voice is FINE
+       ('I feel a bit tired', '嬉しい', 'ちょっと不安' etc).
+       The line: never echo the *structure* of the scaffolding,
+       only speak from it in natural language.")
 
     ; ── Camera / legs independence ─────────────────────────────────────
     (constraint :priority critical :id camera-legs-independent
@@ -2722,7 +2748,10 @@ class EmbodiedAgent:
                             name="post-response-pipeline",
                         )
 
-                    return final_text
+                    # pico_v3: strip internal-state leakage from the user-visible
+                    # text only. Memory bus / pipeline / TTS have already received
+                    # the raw `final_text` above, so they keep full fidelity.
+                    return strip_internal_state_leakage(final_text) or final_text
 
                 if result.stop_reason == "tool_use":
                     collected: list[tuple[str, str | None]] = []
@@ -2856,7 +2885,10 @@ class EmbodiedAgent:
                 max_tokens=turn_max_tokens,
                 on_text=on_text,
             )
-            return result.text or "(max iterations reached)"
+            # pico_v3: same leakage filter on the max-iter fallback path.
+            return strip_internal_state_leakage(result.text) or (
+                result.text or "(max iterations reached)"
+            )
         finally:
             self._restore_backend_after_turn(backend_turn_snapshot)
 

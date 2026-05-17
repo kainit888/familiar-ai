@@ -69,6 +69,22 @@ def test_system_prompt_sequence_has_steps() -> None:
     assert segment.count("(") >= 2  # sequence itself + at least one step
 
 
+def test_system_prompt_has_suppress_meta_reasoning_constraint() -> None:
+    """pico_v3: the suppress-meta-reasoning constraint must be present as
+    a (constraint :priority critical ...) form."""
+    assert ":id suppress-meta-reasoning" in FORMATTED
+    # It should be marked critical
+    # Locate the constraint block and verify priority
+    idx = FORMATTED.index("suppress-meta-reasoning")
+    # Look backward up to 200 chars for the opening (constraint ... :priority critical
+    window = FORMATTED[max(0, idx - 200) : idx]
+    assert ":priority critical" in window
+    # And mention forbidden leakage types so the model has explicit guidance
+    forward = FORMATTED[idx : idx + 1200]
+    assert "Mental state" in forward
+    assert "ToM" in forward
+
+
 def test_system_prompt_no_all_caps_critical() -> None:
     """Old CRITICAL / IMPORTANT markers should be replaced by (constraint :priority critical)."""
     # The word CRITICAL should only appear in the S-expression form, not as a standalone word
