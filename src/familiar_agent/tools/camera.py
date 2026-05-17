@@ -272,9 +272,9 @@ class CameraTool:
             elif direction == "right":
                 pan_delta = -degrees / 180.0
             elif direction == "up":
-                tilt_delta = -degrees / 90.0
-            elif direction == "down":
                 tilt_delta = degrees / 90.0
+            elif direction == "down":
+                tilt_delta = -degrees / 90.0
 
             # Relative move via ONVIF PTZ service
             await self._ptz.RelativeMove(

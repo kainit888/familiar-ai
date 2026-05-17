@@ -176,6 +176,90 @@ async def test_call_unknown_tool_returns_error():
     assert "Unknown" in result or "nonexistent" in result
 
 
+# ---------------------------------------------------------------------------
+# Tests: move() — PTZ direction sign convention (ONVIF / Tapo C220)
+# ---------------------------------------------------------------------------
+
+
+class _FakePTZ:
+    """Minimal async PTZ stub that records RelativeMove arguments."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def RelativeMove(self, payload: dict) -> None:
+        self.calls.append(payload)
+
+
+def _attach_fake_ptz(cam) -> _FakePTZ:
+    """Wire a fake PTZ service into a CameraTool and bypass ONVIF connect."""
+    fake = _FakePTZ()
+    cam._ptz = fake
+    cam._profile_token = "Profile_1"
+
+    async def _already_connected() -> bool:
+        return True
+
+    cam._ensure_connected = _already_connected  # type: ignore[method-assign]
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_move_up_sends_positive_tilt():
+    """move('up') sends a positive y to ONVIF RelativeMove (Tapo C220 / ONVIF spec)."""
+    cam = _make_camera_tool()
+    fake = _attach_fake_ptz(cam)
+
+    result = await cam.move("up", degrees=90)
+
+    assert "up" in result
+    assert len(fake.calls) == 1
+    pan_tilt = fake.calls[0]["Translation"]["PanTilt"]
+    assert pan_tilt["x"] == 0.0
+    assert pan_tilt["y"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_move_down_sends_negative_tilt():
+    """move('down') sends a negative y to ONVIF RelativeMove."""
+    cam = _make_camera_tool()
+    fake = _attach_fake_ptz(cam)
+
+    result = await cam.move("down", degrees=90)
+
+    assert "down" in result
+    assert len(fake.calls) == 1
+    pan_tilt = fake.calls[0]["Translation"]["PanTilt"]
+    assert pan_tilt["x"] == 0.0
+    assert pan_tilt["y"] == pytest.approx(-1.0)
+
+
+@pytest.mark.asyncio
+async def test_move_left_sends_positive_pan():
+    """move('left') sends a positive x to ONVIF RelativeMove (unchanged behaviour)."""
+    cam = _make_camera_tool()
+    fake = _attach_fake_ptz(cam)
+
+    await cam.move("left", degrees=180)
+
+    pan_tilt = fake.calls[0]["Translation"]["PanTilt"]
+    assert pan_tilt["x"] == pytest.approx(1.0)
+    assert pan_tilt["y"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_move_right_sends_negative_pan():
+    """move('right') sends a negative x to ONVIF RelativeMove (unchanged behaviour)."""
+    cam = _make_camera_tool()
+    fake = _attach_fake_ptz(cam)
+
+    await cam.move("right", degrees=180)
+
+    pan_tilt = fake.calls[0]["Translation"]["PanTilt"]
+    assert pan_tilt["x"] == pytest.approx(-1.0)
+    assert pan_tilt["y"] == 0.0
+
+
 def test_ptz_params_fall_back_to_stream_url_credentials():
     cam = _make_camera_tool("rtsp://stream-user:stream-pass@192.168.1.206/live0")
     cam.username = ""
