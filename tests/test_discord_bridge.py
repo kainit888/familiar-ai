@@ -9,7 +9,7 @@ Phase C-1 完了時点では discord.py 未インストール想定で:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -352,15 +352,40 @@ async def test_voice_listener_speak_returns_false_when_tts_not_configured():
 
 
 @pytest.mark.asyncio
-async def test_voice_listener_speak_calls_tts_and_returns_true_when_listening():
-    """state=LISTENING かつ tts_callable があれば speak() は True を返す。"""
+async def test_voice_listener_speak_returns_false_without_voice_client():
+    """state=LISTENING かつ tts 成功でも、voice_client が無ければ False。"""
     tts = AsyncMock(return_value=b"WAV_DATA")
     listener = VoiceChannelListener(tts_callable=tts)
     listener._state = VoiceChannelState.LISTENING
+    # voice_client は None のまま
+    result = await listener.speak("こんにちは")
+    assert result is False
+    tts.assert_awaited_once_with("こんにちは")
+    # speak 後に LISTENING に戻る (finally)
+    assert listener.state == VoiceChannelState.LISTENING
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_speak_returns_true_with_mock_voice_client(monkeypatch):
+    """voice_client があれば speak() は True を返す (mock 再生)。"""
+    tts = AsyncMock(return_value=b"WAV_DATA")
+    listener = VoiceChannelListener(tts_callable=tts)
+    listener._state = VoiceChannelState.LISTENING
+
+    # voice_client を MagicMock で差し込み
+    mock_vc = MagicMock()
+    mock_vc.play = MagicMock()
+    listener._voice_client = mock_vc
+
+    # _play_audio_via_voice_client を直接モック (discord.py 非依存)
+    async def fake_play(wav_bytes):
+        return True
+
+    monkeypatch.setattr(listener, "_play_audio_via_voice_client", fake_play)
+
     result = await listener.speak("こんにちは")
     assert result is True
     tts.assert_awaited_once_with("こんにちは")
-    # speak 後に LISTENING に戻る
     assert listener.state == VoiceChannelState.LISTENING
 
 
@@ -387,7 +412,7 @@ async def test_voice_listener_audio_chunk_skips_empty_transcript():
 
 
 @pytest.mark.asyncio
-async def test_voice_listener_audio_chunk_pipes_stt_to_on_speech():
+async def test_voice_listener_audio_chunk_pipes_stt_to_on_speech(monkeypatch):
     """STT が text を返したら on_speech_detected が呼ばれる。"""
     stt = AsyncMock(return_value="こんにちは")
     on_speech = AsyncMock(return_value="やあ")
@@ -398,8 +423,449 @@ async def test_voice_listener_audio_chunk_pipes_stt_to_on_speech():
         tts_callable=tts,
     )
     listener._state = VoiceChannelState.LISTENING
+
+    # voice_client を mock し _play_audio_via_voice_client を no-op に置換
+    listener._voice_client = MagicMock()
+
+    async def fake_play(wav_bytes):
+        return True
+
+    monkeypatch.setattr(listener, "_play_audio_via_voice_client", fake_play)
+
     await listener._on_audio_chunk("user1", b"audio_bytes")
     stt.assert_awaited_once_with(b"audio_bytes")
     on_speech.assert_awaited_once_with("user1", "こんにちは")
     # 応答 "やあ" → speak() → tts も呼ばれる
     tts.assert_awaited_once_with("やあ")
+
+
+# ── 外出期間タスク C: Phase D 本実装 mock テスト ───────────────────────
+
+
+# incoming_message_from_discord (duck typing) ─────────────────────
+
+
+def test_incoming_message_from_discord_with_full_attrs():
+    """duck-typed discord.Message 相当オブジェクトから IncomingMessage に変換。"""
+    from pico_agent.discord_bridge.text_channel import incoming_message_from_discord
+
+    fake_msg = MagicMock()
+    fake_msg.author.id = 42
+    fake_msg.author.bot = False
+    fake_msg.guild.id = 100
+    fake_msg.channel.id = 5
+    fake_msg.content = "やあ"
+
+    result = incoming_message_from_discord(fake_msg)
+    assert result.author_id == 42
+    assert result.author_is_bot is False
+    assert result.guild_id == 100
+    assert result.channel_id == 5
+    assert result.content == "やあ"
+
+
+def test_incoming_message_from_discord_dm_has_no_guild():
+    """DM の場合 (msg.guild=None) は guild_id=None になる。"""
+    from pico_agent.discord_bridge.text_channel import incoming_message_from_discord
+
+    fake_msg = MagicMock()
+    fake_msg.author.id = 42
+    fake_msg.author.bot = False
+    fake_msg.guild = None  # DM
+    fake_msg.channel.id = 5
+    fake_msg.content = "DM だよ"
+
+    result = incoming_message_from_discord(fake_msg)
+    assert result.guild_id is None
+    assert result.content == "DM だよ"
+
+
+def test_incoming_message_from_discord_bot_author_detected():
+    """bot からのメッセージは author_is_bot=True。"""
+    from pico_agent.discord_bridge.text_channel import incoming_message_from_discord
+
+    fake_msg = MagicMock()
+    fake_msg.author.id = 99
+    fake_msg.author.bot = True
+    fake_msg.guild.id = 1
+    fake_msg.channel.id = 1
+    fake_msg.content = "Bot ack"
+
+    result = incoming_message_from_discord(fake_msg)
+    assert result.author_is_bot is True
+
+
+def test_incoming_message_from_discord_content_none_treated_as_empty():
+    """content が None でも空文字として扱う。"""
+    from pico_agent.discord_bridge.text_channel import incoming_message_from_discord
+
+    fake_msg = MagicMock()
+    fake_msg.author.id = 1
+    fake_msg.author.bot = False
+    fake_msg.guild.id = 1
+    fake_msg.channel.id = 1
+    fake_msg.content = None
+
+    result = incoming_message_from_discord(fake_msg)
+    assert result.content == ""
+
+
+def test_incoming_message_from_discord_missing_required_raises():
+    """author.id がなければ AttributeError。"""
+    from pico_agent.discord_bridge.text_channel import incoming_message_from_discord
+
+    fake_msg = MagicMock()
+    fake_msg.author = MagicMock(spec=[])  # id 属性なし
+    fake_msg.channel.id = 1
+    fake_msg.content = ""
+
+    with pytest.raises(AttributeError):
+        incoming_message_from_discord(fake_msg)
+
+
+# PicoBot.start() / stop() / send_message() の mock client テスト ────
+
+
+@pytest.mark.asyncio
+async def test_picobot_start_initializes_client_when_configured(monkeypatch):
+    """設定揃 + discord.py mock で start() が discord.Client.start() を呼ぶ。"""
+    monkeypatch.setenv("DISCORD_TOKEN", "fake-token")
+    monkeypatch.setenv("DISCORD_OWNER_ID", "42")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "100")
+
+    # is_discord_available を True に
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.bot.is_discord_available",
+        lambda: True,
+    )
+
+    # _build_intents で discord.Intents を mock
+    mock_intents = MagicMock(name="intents")
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.bot._build_intents",
+        lambda: mock_intents,
+    )
+
+    # discord.Client クラスを mock
+    mock_client_instance = MagicMock(name="discord_client")
+    mock_client_instance.start = AsyncMock()
+    mock_client_instance.event = lambda func: func  # decorator passthrough
+
+    mock_discord_module = MagicMock()
+    mock_discord_module.Client = MagicMock(return_value=mock_client_instance)
+
+    monkeypatch.setitem(__import__("sys").modules, "discord", mock_discord_module)
+
+    bot = PicoBot()
+    await bot.start()
+
+    # discord.Client が intents 引数で生成された
+    mock_discord_module.Client.assert_called_once_with(intents=mock_intents)
+    # Client.start(token) が呼ばれた
+    mock_client_instance.start.assert_awaited_once_with("fake-token")
+
+
+@pytest.mark.asyncio
+async def test_picobot_send_message_uses_get_channel_first(monkeypatch):
+    """send_message: キャッシュにあるチャンネルを get_channel で取得。"""
+    bot = PicoBot()
+    mock_client = MagicMock()
+    mock_channel = MagicMock()
+    mock_channel.send = AsyncMock()
+    mock_client.get_channel = MagicMock(return_value=mock_channel)
+    bot._client = mock_client
+
+    result = await bot.send_message(channel_id=999, content="hello")
+
+    assert result is True
+    mock_client.get_channel.assert_called_once_with(999)
+    mock_channel.send.assert_awaited_once_with("hello")
+
+
+@pytest.mark.asyncio
+async def test_picobot_send_message_falls_back_to_fetch_channel(monkeypatch):
+    """get_channel が None を返したら fetch_channel に fallback。"""
+    bot = PicoBot()
+    mock_client = MagicMock()
+    mock_channel = MagicMock()
+    mock_channel.send = AsyncMock()
+    mock_client.get_channel = MagicMock(return_value=None)
+    mock_client.fetch_channel = AsyncMock(return_value=mock_channel)
+    bot._client = mock_client
+
+    result = await bot.send_message(channel_id=999, content="hello")
+
+    assert result is True
+    mock_client.fetch_channel.assert_awaited_once_with(999)
+    mock_channel.send.assert_awaited_once_with("hello")
+
+
+@pytest.mark.asyncio
+async def test_picobot_send_message_empty_content_returns_false():
+    """空文字 / 空白のみは送信しない (False)。"""
+    bot = PicoBot()
+    bot._client = MagicMock()
+    result = await bot.send_message(channel_id=1, content="")
+    assert result is False
+    result2 = await bot.send_message(channel_id=1, content="   \n  ")
+    assert result2 is False
+
+
+@pytest.mark.asyncio
+async def test_picobot_send_message_no_client_raises():
+    """client が None なら DiscordDisabledError。"""
+    bot = PicoBot()
+    bot._client = None
+    with pytest.raises(DiscordDisabledError):
+        await bot.send_message(channel_id=1, content="hi")
+
+
+@pytest.mark.asyncio
+async def test_picobot_send_message_silent_fail_on_channel_send_error():
+    """channel.send() が例外を投げても raise せず False を返す。"""
+    bot = PicoBot()
+    mock_client = MagicMock()
+    mock_channel = MagicMock()
+    mock_channel.send = AsyncMock(side_effect=RuntimeError("Discord API error"))
+    mock_client.get_channel = MagicMock(return_value=mock_channel)
+    bot._client = mock_client
+
+    result = await bot.send_message(channel_id=1, content="hi")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_picobot_stop_closes_client(monkeypatch):
+    """stop() で client.close() が awaited される。"""
+    bot = PicoBot()
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    bot._client = mock_client
+    bot._is_running = True
+
+    await bot.stop()
+    mock_client.close.assert_awaited_once()
+    assert bot.is_running is False
+    assert bot._client is None
+
+
+@pytest.mark.asyncio
+async def test_picobot_stop_safe_when_client_close_raises():
+    """client.close() が例外でも stop() は raise しない。"""
+    bot = PicoBot()
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock(side_effect=ConnectionError("network"))
+    bot._client = mock_client
+
+    await bot.stop()
+    assert bot._client is None
+
+
+@pytest.mark.asyncio
+async def test_picobot_start_in_background_returns_task(monkeypatch):
+    """start_in_background() は asyncio.Task を返す。"""
+    import asyncio as _asyncio
+
+    monkeypatch.setenv("DISCORD_TOKEN", "fake-token")
+    monkeypatch.setenv("DISCORD_OWNER_ID", "42")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "100")
+    # is_discord_available を True に + start を即終了 mock
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.bot.is_discord_available", lambda: True
+    )
+
+    bot = PicoBot()
+    bot.start = AsyncMock()  # start() を即終了 mock に
+
+    task = await bot.start_in_background()
+    assert isinstance(task, _asyncio.Task)
+    await task  # 即終了
+
+
+@pytest.mark.asyncio
+async def test_picobot_start_in_background_returns_existing_if_already_running(monkeypatch):
+    """既に起動中なら同じ task を返す (二重起動防止)。"""
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.bot.is_discord_available", lambda: True
+    )
+
+    bot = PicoBot()
+
+    started = False
+
+    async def long_running():
+        nonlocal started
+        started = True
+        await _asyncio.sleep(10)  # long task
+
+    bot.start = long_running
+
+    task1 = await bot.start_in_background()
+    task2 = await bot.start_in_background()
+    assert task1 is task2  # 同じ task
+
+    task1.cancel()
+    try:
+        await task1
+    except _asyncio.CancelledError:
+        pass
+
+
+# VoiceChannelListener.join() with mock client ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_join_raises_when_no_client(monkeypatch):
+    """client=None で join() を呼ぶと DiscordDisabledError。"""
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.voice_channel.is_discord_available",
+        lambda: True,
+    )
+    listener = VoiceChannelListener()
+    with pytest.raises(DiscordDisabledError):
+        await listener.join(channel_id=1, client=None)
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_join_returns_true_on_success(monkeypatch):
+    """mock client + mock channel.connect() で join() が True。"""
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.voice_channel.is_discord_available",
+        lambda: True,
+    )
+    listener = VoiceChannelListener()
+
+    mock_channel = MagicMock()
+    mock_voice_client = MagicMock()
+    mock_channel.connect = AsyncMock(return_value=mock_voice_client)
+
+    mock_client = MagicMock()
+    mock_client.get_channel = MagicMock(return_value=mock_channel)
+
+    result = await listener.join(channel_id=555, client=mock_client)
+    assert result is True
+    assert listener.state == VoiceChannelState.LISTENING
+    assert listener.current_channel_id == 555
+    assert listener._voice_client is mock_voice_client
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_join_falls_back_to_fetch_channel(monkeypatch):
+    """get_channel が None なら fetch_channel に fallback。"""
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.voice_channel.is_discord_available",
+        lambda: True,
+    )
+    listener = VoiceChannelListener()
+
+    mock_channel = MagicMock()
+    mock_voice_client = MagicMock()
+    mock_channel.connect = AsyncMock(return_value=mock_voice_client)
+
+    mock_client = MagicMock()
+    mock_client.get_channel = MagicMock(return_value=None)
+    mock_client.fetch_channel = AsyncMock(return_value=mock_channel)
+
+    result = await listener.join(channel_id=555, client=mock_client)
+    assert result is True
+    mock_client.fetch_channel.assert_awaited_once_with(555)
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_join_returns_false_when_channel_not_found(monkeypatch):
+    """get_channel / fetch_channel が両方 None なら False を返し DISCONNECTED に戻る。"""
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.voice_channel.is_discord_available",
+        lambda: True,
+    )
+    listener = VoiceChannelListener()
+
+    mock_client = MagicMock()
+    mock_client.get_channel = MagicMock(return_value=None)
+    mock_client.fetch_channel = AsyncMock(return_value=None)
+
+    result = await listener.join(channel_id=999, client=mock_client)
+    assert result is False
+    assert listener.state == VoiceChannelState.DISCONNECTED
+    assert listener._voice_client is None
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_join_silent_fail_on_connect_exception(monkeypatch):
+    """channel.connect() が例外を投げたら silent fail で False。"""
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.voice_channel.is_discord_available",
+        lambda: True,
+    )
+    listener = VoiceChannelListener()
+
+    mock_channel = MagicMock()
+    mock_channel.connect = AsyncMock(side_effect=ConnectionError("VC unreachable"))
+
+    mock_client = MagicMock()
+    mock_client.get_channel = MagicMock(return_value=mock_channel)
+
+    result = await listener.join(channel_id=1, client=mock_client)
+    assert result is False
+    assert listener.state == VoiceChannelState.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_join_when_already_listening_leaves_first(monkeypatch):
+    """既に LISTENING 状態で join() を呼ぶと、先に leave() してから再接続を試みる。"""
+    monkeypatch.setattr(
+        "pico_agent.discord_bridge.voice_channel.is_discord_available",
+        lambda: True,
+    )
+    listener = VoiceChannelListener()
+    listener._state = VoiceChannelState.LISTENING
+
+    old_vc = MagicMock()
+    old_vc.disconnect = AsyncMock()
+    listener._voice_client = old_vc
+    listener._current_channel_id = 100
+
+    new_channel = MagicMock()
+    new_voice_client = MagicMock()
+    new_channel.connect = AsyncMock(return_value=new_voice_client)
+
+    mock_client = MagicMock()
+    mock_client.get_channel = MagicMock(return_value=new_channel)
+
+    result = await listener.join(channel_id=200, client=mock_client)
+    assert result is True
+    old_vc.disconnect.assert_awaited_once()
+    assert listener.current_channel_id == 200
+    assert listener._voice_client is new_voice_client
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_leave_calls_voice_client_disconnect():
+    """leave() で voice_client.disconnect() が awaited される。"""
+    listener = VoiceChannelListener()
+    mock_vc = MagicMock()
+    mock_vc.disconnect = AsyncMock()
+    listener._voice_client = mock_vc
+    listener._state = VoiceChannelState.LISTENING
+    listener._current_channel_id = 50
+
+    await listener.leave()
+    mock_vc.disconnect.assert_awaited_once()
+    assert listener.state == VoiceChannelState.DISCONNECTED
+    assert listener._voice_client is None
+    assert listener._current_channel_id is None
+
+
+@pytest.mark.asyncio
+async def test_voice_listener_leave_silent_fail_on_disconnect_exception():
+    """voice_client.disconnect() で例外が出ても leave() は raise しない。"""
+    listener = VoiceChannelListener()
+    mock_vc = MagicMock()
+    mock_vc.disconnect = AsyncMock(side_effect=ConnectionError("network"))
+    listener._voice_client = mock_vc
+    listener._state = VoiceChannelState.LISTENING
+
+    await listener.leave()
+    assert listener.state == VoiceChannelState.DISCONNECTED

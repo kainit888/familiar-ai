@@ -1,14 +1,13 @@
 """Discord テキストチャンネル on_message ハンドラ (設計書 v4.0 第 13-1 章)。
 
-Phase D 着手時に discord.Message を受けて ReAct loop へ橋渡しする。
-Phase C-1 完了時点ではフィルタロジック (OWNER 判定 / bot 判定 / Guild 判定)
-の純粋関数化と単体テストのみ。
+Phase D 実装版: discord.Message → IncomingMessage の変換関数を追加。
+boundary 判定ロジックは Phase C-1 のままで、純粋関数として再利用可能。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
 
@@ -92,3 +91,40 @@ class TextChannelHandler:
             )
             return None
         return await self.on_input(str(msg.author_id), msg.content)
+
+
+def incoming_message_from_discord(msg: Any) -> IncomingMessage:
+    """discord.Message → IncomingMessage 変換 (Phase D 実装版)。
+
+    discord.py を import 依存にしないため、duck-typing で必要属性を抽出する。
+    呼び出し側 (PicoBot.on_message) は msg が discord.Message であることを
+    前提とするが、本関数は型に縛られない (テスト時は MagicMock でも動く)。
+
+    Args:
+        msg: discord.Message 相当オブジェクト。以下の属性を持つ前提:
+            - author.id (int)
+            - author.bot (bool)
+            - guild.id (int or None)
+            - channel.id (int)
+            - content (str)
+
+    Returns:
+        IncomingMessage dataclass。
+
+    Raises:
+        AttributeError: 必要な属性が欠けている場合。
+    """
+    author_id = int(msg.author.id)
+    author_is_bot = bool(getattr(msg.author, "bot", False))
+    guild = getattr(msg, "guild", None)
+    guild_id = int(guild.id) if guild is not None else None
+    channel_id = int(msg.channel.id)
+    content = str(getattr(msg, "content", "") or "")
+
+    return IncomingMessage(
+        author_id=author_id,
+        author_is_bot=author_is_bot,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        content=content,
+    )
