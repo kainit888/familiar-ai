@@ -5,6 +5,9 @@
   auto-say / mental_state_bus に渡される text にも適用されること
   (TTS adapter 経由で漏出が音声化されることを防ぐため)
 - 漏出のない応答は変化しないこと
+
+漏出パターンは実本番に近い「末尾 `:` マーカ + 構造化箇条書き」を使う
+(phase_c_handoff.md 1-4 参照)。
 """
 
 from __future__ import annotations
@@ -27,15 +30,14 @@ def _patch_heavy_with(extra: dict | None = None):
 
 
 @pytest.mark.asyncio
-async def test_run_strips_mental_state_leakage_from_return_value() -> None:
-    """end_turn 経路: 漏出を含む応答からユーザー宛応答だけがフィルタされる。"""
+async def test_run_strips_trailing_leakage_from_return_value() -> None:
+    """end_turn 経路: 末尾漏出ブロックを含む応答からユーザー宛応答だけがフィルタされる。"""
     agent = _make_agent()
     leaked_text = (
-        "[Mental state]\n"
+        "おはよう、いい朝だね\n"
+        ":\n"
         "- affect: calm\n"
-        "- interoception: warm\n"
-        "\n"
-        "おはよう、いい朝だね"
+        "- interoception: warm"
     )
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=leaked_text), leaked_text)
@@ -51,10 +53,9 @@ async def test_run_strips_mental_state_leakage_from_return_value() -> None:
             p.stop()
 
     # ユーザー宛応答は filter 後
-    assert "[Mental state]" not in result
+    assert result == "おはよう、いい朝だね"
     assert "affect" not in result
     assert "interoception" not in result
-    assert "おはよう、いい朝だね" in result
 
 
 @pytest.mark.asyncio
@@ -84,11 +85,9 @@ async def test_run_post_response_pipeline_receives_filtered_text() -> None:
 
     検証方法: _run_post_response_pipeline AsyncMock の **呼び出し引数** の
     `final_text` が、フィルタ適用後の漏出を含まない text であることを確認する。
-    実際の background task await は test 終了後に走るので、call_args の検査で
-    十分。
     """
     agent = _make_agent()
-    leaked_text = "[Mental state]\n- affect: calm\n- interoception: warm\n\nやあ"
+    leaked_text = "やあ\n:\n- affect: calm\n- interoception: warm"
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=leaked_text), leaked_text)
     )
@@ -107,16 +106,14 @@ async def test_run_post_response_pipeline_receives_filtered_text() -> None:
             p.stop()
 
     # 返却値は filter 済み
-    assert "[Mental state]" not in result
-    assert "やあ" in result
+    assert result == "やあ"
 
     # pipeline も filter 後 text を受け取っているはず
     assert pipeline_mock.call_count >= 1
     kwargs = pipeline_mock.call_args.kwargs
-    assert "[Mental state]" not in kwargs["final_text"]
+    assert kwargs["final_text"] == "やあ"
     assert "affect" not in kwargs["final_text"]
     assert "interoception" not in kwargs["final_text"]
-    assert "やあ" in kwargs["final_text"]
 
 
 @pytest.mark.asyncio
@@ -132,7 +129,7 @@ async def test_run_mental_state_bus_append_called_with_clean_response() -> None:
     bus_mock.summarize_recent_for_prompt = MagicMock(return_value="")
     agent._mental_state_bus = bus_mock
 
-    leaked_text = "[Mental state]\n- affect: warm\n\n本文"
+    leaked_text = "本文\n:\n- affect: warm\n- interoception: cool"
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=leaked_text), leaked_text)
     )
@@ -158,7 +155,7 @@ async def test_run_tts_auto_say_receives_filtered_text() -> None:
     agent = _make_agent(with_tts=True)
     agent.config.auto_say = True
 
-    leaked_text = "[Mental state]\n- affect: bright\n- interoception: warm\n\nおはよう"
+    leaked_text = "おはよう\n:\n- affect: bright\n- interoception: warm"
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=leaked_text), leaked_text)
     )
@@ -173,18 +170,16 @@ async def test_run_tts_auto_say_receives_filtered_text() -> None:
             p.stop()
 
     # 返却値は filter 済み
-    assert "[Mental state]" not in result
-    assert "おはよう" in result
+    assert result == "おはよう"
 
     # TTS は filter 後 final_text を受け取っている (漏出は音声化されない)
     assert agent._tts.call.await_count == 1
     call_args = agent._tts.call.await_args
     assert call_args.args[0] == "say"
     spoken_text = call_args.args[1]["text"]
-    assert "[Mental state]" not in spoken_text
+    assert spoken_text == "おはよう"
     assert "affect" not in spoken_text
     assert "interoception" not in spoken_text
-    assert "おはよう" in spoken_text
 
 
 @pytest.mark.asyncio
@@ -201,7 +196,7 @@ async def test_run_max_iterations_path_strips_leakage() -> None:
     # MAX_ITERATIONS 回 tool_use を返す
     iter_results = [(tool_turn, None) for _ in range(MAX_ITERATIONS)]
     # その後 fallback の最終 stream_turn 呼び出しで漏出付き text を返す
-    leaked_text = "[Mental state]\n- affect: tired\n\nもう限界かも"
+    leaked_text = "もう限界かも\n:\n- affect: tired\n- interoception: heavy"
     final_turn = TurnResult(stop_reason="end_turn", text=leaked_text)
     iter_results.append((final_turn, leaked_text))
 
@@ -217,8 +212,8 @@ async def test_run_max_iterations_path_strips_leakage() -> None:
             p.stop()
 
     # max-iter fallback でも filter が効いている
-    assert "[Mental state]" not in result
     assert "affect" not in result
+    assert "interoception" not in result
     assert "もう限界かも" in result
 
 
@@ -226,7 +221,7 @@ async def test_run_max_iterations_path_strips_leakage() -> None:
 async def test_run_full_leakage_response_falls_back_to_raw() -> None:
     """応答が全部漏出だった場合、空文字を避けて raw final_text を返す (fallback)。"""
     agent = _make_agent()
-    all_leaked = "[Mental state]\n- affect: calm\n- social: alone"
+    all_leaked = ":\n- affect: calm\n- social: alone"
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=all_leaked), all_leaked)
     )
