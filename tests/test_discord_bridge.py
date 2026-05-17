@@ -49,6 +49,7 @@ def test_discord_disabled_error_has_default_message():
 
 def test_picobot_is_configured_false_without_env(monkeypatch):
     """token/owner_id/guild_id 未設定なら is_configured=False。"""
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_OWNER_ID", raising=False)
     monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
@@ -57,8 +58,9 @@ def test_picobot_is_configured_false_without_env(monkeypatch):
 
 
 def test_picobot_is_configured_true_when_all_env_set(monkeypatch):
-    """token + owner_id + guild_id が揃っていれば is_configured=True。"""
-    monkeypatch.setenv("DISCORD_BOT_TOKEN", "fake-token")
+    """DISCORD_TOKEN + owner_id + guild_id が揃っていれば is_configured=True。"""
+    monkeypatch.setenv("DISCORD_TOKEN", "fake-token")
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.setenv("DISCORD_OWNER_ID", "123456789012345678")
     monkeypatch.setenv("DISCORD_GUILD_ID", "987654321098765432")
     bot = PicoBot()
@@ -68,9 +70,29 @@ def test_picobot_is_configured_true_when_all_env_set(monkeypatch):
     assert bot.guild_id == 987654321098765432
 
 
+def test_picobot_legacy_discord_bot_token_fallback(monkeypatch):
+    """DISCORD_BOT_TOKEN だけでも (後方互換) token は読める。"""
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "legacy-token")
+    monkeypatch.setenv("DISCORD_OWNER_ID", "1")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "2")
+    bot = PicoBot()
+    assert bot.token == "legacy-token"
+    assert bot.is_configured is True
+
+
+def test_picobot_discord_token_takes_precedence_over_legacy(monkeypatch):
+    """DISCORD_TOKEN が DISCORD_BOT_TOKEN より優先される。"""
+    monkeypatch.setenv("DISCORD_TOKEN", "primary-token")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "legacy-token")
+    bot = PicoBot()
+    assert bot.token == "primary-token"
+
+
 def test_picobot_invalid_owner_id_falls_back_to_none(monkeypatch):
     """DISCORD_OWNER_ID が int に変換できない場合は None で扱う (silent fail)。"""
     monkeypatch.setenv("DISCORD_OWNER_ID", "not-a-number")
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
     bot = PicoBot()
@@ -103,6 +125,7 @@ async def test_picobot_start_raises_when_not_configured(monkeypatch):
         "pico_agent.discord_bridge.bot.is_discord_available",
         lambda: True,
     )
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_OWNER_ID", raising=False)
     monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)

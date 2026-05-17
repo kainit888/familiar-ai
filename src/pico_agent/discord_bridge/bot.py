@@ -25,9 +25,13 @@ def _load_bot_token() -> Optional[str]:
     """Discord Bot Token を取得。
 
     Phase D 本実装時は load_secret() 経由に切替えるが、Phase C-1 では
-    環境変数 DISCORD_BOT_TOKEN を読む暫定実装。未設定なら None。
+    環境変数 DISCORD_TOKEN を読む暫定実装。
+    discord.py 標準慣習に合わせて DISCORD_TOKEN を優先、後方互換で
+    DISCORD_BOT_TOKEN もフォールバック。両方未設定なら None。
     """
-    raw = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    raw = os.environ.get("DISCORD_TOKEN", "").strip()
+    if not raw:
+        raw = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     return raw or None
 
 
