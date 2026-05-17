@@ -29,10 +29,12 @@ class SetupConfig:
     utility_platform: str = ""
     utility_api_key: str = ""
     utility_model: str = ""
+    utility_base_url: str = ""
 
     scene_platform: str = ""
     scene_api_key: str = ""
     scene_model: str = ""
+    scene_base_url: str = ""
 
     camera_host: str = ""
     camera_username: str = ""
@@ -359,6 +361,16 @@ SETTINGS_FIELDS: tuple[SettingField, ...] = (
         runtime_getter=lambda config: config.utility_model,
     ),
     SettingField(
+        env_key="UTILITY_BASE_URL",
+        attr="utility_base_url",
+        section="advanced",
+        label="Utility base URL:",
+        widget="text",
+        default="",
+        setup_visible=False,
+        runtime_getter=lambda config: config.utility_base_url,
+    ),
+    SettingField(
         env_key="SCENE_PLATFORM",
         attr="scene_platform",
         section="advanced",
@@ -390,6 +402,16 @@ SETTINGS_FIELDS: tuple[SettingField, ...] = (
         default="",
         setup_visible=False,
         runtime_getter=lambda config: config.scene_model,
+    ),
+    SettingField(
+        env_key="SCENE_BASE_URL",
+        attr="scene_base_url",
+        section="advanced",
+        label="Scene base URL:",
+        widget="text",
+        default="",
+        setup_visible=False,
+        runtime_getter=lambda config: config.scene_base_url,
     ),
     SettingField(
         env_key="MEMORY_DB_PATH",

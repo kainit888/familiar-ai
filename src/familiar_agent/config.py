@@ -191,6 +191,9 @@ class AgentConfig:
     utility_platform: str = field(default_factory=lambda: os.environ.get("UTILITY_PLATFORM", ""))
     utility_api_key: str = field(default_factory=lambda: os.environ.get("UTILITY_API_KEY", ""))
     utility_model: str = field(default_factory=lambda: os.environ.get("UTILITY_MODEL", ""))
+    # OpenAI-compatible エンドポイント上書き (Ollama 等のローカル backend 向け)。
+    # 未指定時は公式 OpenAI エンドポイントにフォールバック。
+    utility_base_url: str = field(default_factory=lambda: os.environ.get("UTILITY_BASE_URL", ""))
 
     # ── Scene backend (optional) ────────────────────────────────────────
     # Separate backend for scene entity extraction — cheaper/local model.
@@ -198,6 +201,7 @@ class AgentConfig:
     scene_platform: str = field(default_factory=lambda: os.environ.get("SCENE_PLATFORM", ""))
     scene_api_key: str = field(default_factory=lambda: os.environ.get("SCENE_API_KEY", ""))
     scene_model: str = field(default_factory=lambda: os.environ.get("SCENE_MODEL", ""))
+    scene_base_url: str = field(default_factory=lambda: os.environ.get("SCENE_BASE_URL", ""))
 
     # ── Autonomous behavior ───────────────────────────────────────
     # Desire-driven idle turns are OFF by default.
