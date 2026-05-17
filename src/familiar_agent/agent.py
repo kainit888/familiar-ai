@@ -2294,7 +2294,7 @@ class EmbodiedAgent:
     async def close(self) -> None:
         """Clean up resources. Bounded by timeouts to avoid hanging on exit."""
         if self._camera:
-            self._camera.close()
+            await self._camera.close()
 
         await self._drain_background_tasks()
 

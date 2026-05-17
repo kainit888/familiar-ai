@@ -82,14 +82,32 @@ class CameraTool:
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
 
-    def close(self):
-        """Stop capture and release resources."""
+    async def close(self) -> None:
+        """Stop capture and release resources.
+
+        ONVIF クライアント (onvif-zeep-async) は内部で aiohttp.ClientSession を
+        保持しており、明示的に await close() を呼ばないと "Unclosed client session"
+        警告が出る。Phase C-1 引き継ぎ 1-2 対処。
+        """
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
         if self._cap:
             self._cap.release()
         cv2.destroyAllWindows()
+
+        # ONVIF クライアントの非同期 cleanup (aiohttp ハンドルリーク防止)。
+        if self._cam_onvif is not None:
+            try:
+                await self._cam_onvif.close()
+                logger.debug("ONVIF client closed.")
+            except Exception as e:
+                logger.warning("ONVIF close failed: %s", e)
+            finally:
+                self._cam_onvif = None
+                self._ptz = None
+                self._profile_token = None
+
         logger.info("Camera resources released.")
 
     def _capture_loop(self):
@@ -287,7 +305,16 @@ class CameraTool:
             return f"Looked {direction} by ~{degrees} degrees."
         except Exception as e:
             logger.warning("Camera move failed: %s", e)
+            # ONVIF クライアントを明示的に close してから捨てる (aiohttp リーク防止)。
+            stale = self._cam_onvif
             self._cam_onvif = None
+            self._ptz = None
+            self._profile_token = None
+            if stale is not None:
+                try:
+                    await stale.close()
+                except Exception as close_err:
+                    logger.debug("ONVIF close after failed move errored: %s", close_err)
             return f"Camera move failed: {e}"
 
     def get_tool_definitions(self) -> list[dict]:

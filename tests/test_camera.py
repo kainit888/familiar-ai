@@ -289,3 +289,39 @@ def test_ptz_params_prefer_explicit_overrides():
     assert username == "ptz-user"
     assert password == "ptz-pass"
     assert port == 8899
+
+
+# ---------------------------------------------------------------------------
+# Tests: close() — Phase C-1 引き継ぎ 1-2 ONVIF aiohttp cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_awaits_onvif_client_when_present():
+    """close() は ONVIF クライアントが存在すれば await close() する (Unclosed session 防止)。"""
+    from unittest.mock import AsyncMock
+
+    cam = _make_camera_tool()
+    fake_onvif = AsyncMock()
+    fake_onvif.close = AsyncMock()
+    cam._cam_onvif = fake_onvif
+    cam._ptz = object()
+    cam._profile_token = "Profile_1"
+
+    await cam.close()
+
+    fake_onvif.close.assert_awaited_once()
+    assert cam._cam_onvif is None
+    assert cam._ptz is None
+    assert cam._profile_token is None
+
+
+@pytest.mark.asyncio
+async def test_close_is_safe_when_no_onvif_client():
+    """ONVIF クライアントが None でも close() は例外を出さずに完走する。"""
+    cam = _make_camera_tool()
+    cam._cam_onvif = None
+
+    # 例外が出なければ OK (戻り値なし)。
+    result = await cam.close()
+    assert result is None

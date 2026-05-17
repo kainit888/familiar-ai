@@ -47,6 +47,8 @@ async def main() -> int:
 
     last_error: Exception | None = None
     for try_port in ports_to_try:
+        cam: ONVIFCamera | None = None
+        success = False
         try:
             print(f"[try ] port={try_port}")
             cam = ONVIFCamera(host, try_port, user, password, wsdl_dir=wsdl_dir)
@@ -58,10 +60,19 @@ async def main() -> int:
             print(f"[ ok ] Camera PTZ connected via ONVIF: {host} (port {try_port})")
             print(f"[info] profile_count={len(profiles)} profile_token={profile_token}")
             print(f"[info] ptz_service={ptz!r}")
-            return 0
+            success = True
         except Exception as e:  # noqa: BLE001
             print(f"[fail] port={try_port} error={type(e).__name__}: {e}")
             last_error = e
+        finally:
+            # aiohttp Unclosed client session 警告防止 (Phase C-1 引き継ぎ 1-2)。
+            if cam is not None:
+                try:
+                    await cam.close()
+                except Exception as close_err:  # noqa: BLE001
+                    print(f"[warn] cam.close() error: {close_err}")
+        if success:
+            return 0
 
     print(f"[ERR ] ONVIF PTZ unavailable. last_error={last_error!r}")
     return 1
