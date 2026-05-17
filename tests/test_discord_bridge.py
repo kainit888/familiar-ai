@@ -142,6 +142,65 @@ async def test_picobot_send_message_always_raises_in_phase_c1():
         await bot.send_message(channel_id=12345, content="hi")
 
 
+# ── .env から読めることの smoke テスト (値そのものは expose しない) ──────
+
+
+def test_env_file_contains_discord_credentials_smoke():
+    """プロジェクトの .env に DISCORD_TOKEN/OWNER_ID/GUILD_ID が存在すること。
+
+    値そのものはテスト出力に出さない (機密)。キーの存在と非空であることだけ確認。
+    .env が無い CI 等の環境では skip。
+    """
+    from pathlib import Path
+
+    from dotenv import dotenv_values
+
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        pytest.skip(f".env not found at {env_path} (CI / fresh checkout)")
+
+    values = dotenv_values(env_path)
+    for key in ("DISCORD_TOKEN", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"):
+        assert key in values, f"{key} missing from .env"
+        v = values[key]
+        assert v is not None and v.strip() != "", f"{key} present but empty in .env"
+
+
+def test_picobot_reads_token_when_env_loaded_from_dotenv(monkeypatch, tmp_path):
+    """.env の内容を os.environ に load_dotenv した時、PicoBot がそれを拾うこと。
+
+    実 .env は触らず、fake .env を作って load_dotenv → PicoBot 初期化の流れを mock。
+    """
+    from dotenv import load_dotenv
+
+    fake_env = tmp_path / ".env"
+    fake_env.write_text(
+        "DISCORD_TOKEN=mock-discord-token-for-test\n"
+        "DISCORD_OWNER_ID=111\n"
+        "DISCORD_GUILD_ID=222\n",
+        encoding="utf-8",
+    )
+
+    # 既存値を消して、fake .env からのみ読む
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DISCORD_OWNER_ID", raising=False)
+    monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
+
+    load_dotenv(fake_env, override=True)
+    try:
+        bot = PicoBot()
+        assert bot.token == "mock-discord-token-for-test"
+        assert bot.owner_id == 111
+        assert bot.guild_id == 222
+        assert bot.is_configured is True
+    finally:
+        # tear-down: 他のテストに影響を残さない
+        monkeypatch.delenv("DISCORD_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_OWNER_ID", raising=False)
+        monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
+
+
 @pytest.mark.asyncio
 async def test_picobot_stop_is_safe_noop():
     """stop() は例外を投げず副作用なく終了する (Phase D pending)。"""
