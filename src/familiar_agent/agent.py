@@ -2716,20 +2716,27 @@ class EmbodiedAgent:
 
                     self._coherence_retried = False
 
+                    # pico_v3: strip internal-state leakage BEFORE feeding TTS /
+                    # post-response pipeline / mental_state_bus. The raw `final_text`
+                    # was leaking into voice output via TTS adapter; routing the
+                    # filtered text downstream prevents the leak from being spoken
+                    # or persisted into memory.
+                    filtered_text = strip_internal_state_leakage(final_text) or final_text
+
                     # Auto-say: if the model wrote text but never called say(), speak it aloud.
                     _auto_say_enabled = getattr(self.config, "auto_say", False)
                     if (
                         _auto_say_enabled
                         and self._tts
                         and not say_used
-                        and final_text
-                        and final_text != "(no response)"
+                        and filtered_text
+                        and filtered_text != "(no response)"
                     ):
                         if on_action:
-                            on_action("say", {"text": final_text})
-                        await self._tts.call("say", {"text": final_text})
+                            on_action("say", {"text": filtered_text})
+                        await self._tts.call("say", {"text": filtered_text})
 
-                    if final_text and final_text != "(no response)":
+                    if filtered_text and filtered_text != "(no response)":
                         try:
                             self._mental_state_bus.append(mental_snapshot)
                         except Exception as exc:  # noqa: BLE001
@@ -2737,7 +2744,7 @@ class EmbodiedAgent:
                         self._spawn_background_task(
                             self._run_post_response_pipeline(
                                 user_input=user_input,
-                                final_text=final_text,
+                                final_text=filtered_text,
                                 camera_used=camera_used,
                                 observation_action_name=observation_action_name,
                                 observation_action_input=observation_action_input,
@@ -2748,10 +2755,7 @@ class EmbodiedAgent:
                             name="post-response-pipeline",
                         )
 
-                    # pico_v3: strip internal-state leakage from the user-visible
-                    # text only. Memory bus / pipeline / TTS have already received
-                    # the raw `final_text` above, so they keep full fidelity.
-                    return strip_internal_state_leakage(final_text) or final_text
+                    return filtered_text
 
                 if result.stop_reason == "tool_use":
                     collected: list[tuple[str, str | None]] = []

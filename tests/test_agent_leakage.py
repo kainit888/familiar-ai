@@ -1,8 +1,9 @@
 """EmbodiedAgent.run() の漏出フィルタ統合の動作検証。
 
 - 2 つの return パス (end_turn / max-iterations fallback) でフィルタが効くこと
-- フィルタは「ユーザー宛返却値」だけに作用し、memory / pipeline / TTS には
-  生 text が流れていること
+- フィルタは「ユーザー宛返却値」だけでなく、post-response pipeline / TTS
+  auto-say / mental_state_bus に渡される text にも適用されること
+  (TTS adapter 経由で漏出が音声化されることを防ぐため)
 - 漏出のない応答は変化しないこと
 """
 
@@ -27,7 +28,7 @@ def _patch_heavy_with(extra: dict | None = None):
 
 @pytest.mark.asyncio
 async def test_run_strips_mental_state_leakage_from_return_value() -> None:
-    """end_turn 経路: 漏出を含む final_text からユーザー宛応答だけがフィルタされる。"""
+    """end_turn 経路: 漏出を含む応答からユーザー宛応答だけがフィルタされる。"""
     agent = _make_agent()
     leaked_text = (
         "[Mental state]\n"
@@ -50,10 +51,10 @@ async def test_run_strips_mental_state_leakage_from_return_value() -> None:
             p.stop()
 
     # ユーザー宛応答は filter 後
-    assert result == "おはよう、いい朝だね"
     assert "[Mental state]" not in result
     assert "affect" not in result
     assert "interoception" not in result
+    assert "おはよう、いい朝だね" in result
 
 
 @pytest.mark.asyncio
@@ -78,16 +79,16 @@ async def test_run_keeps_clean_response_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_post_response_pipeline_receives_raw_text() -> None:
-    """漏出フィルタは return 値だけに作用し、post-response pipeline には生 text が渡る。
+async def test_run_post_response_pipeline_receives_filtered_text() -> None:
+    """漏出フィルタは post-response pipeline に渡される final_text にも適用される。
 
     検証方法: _run_post_response_pipeline AsyncMock の **呼び出し引数** の
-    `final_text` が、フィルタ適用前 (漏出を含む) のままであることを確認する。
+    `final_text` が、フィルタ適用後の漏出を含まない text であることを確認する。
     実際の background task await は test 終了後に走るので、call_args の検査で
     十分。
     """
     agent = _make_agent()
-    leaked_text = "[Mental state]\n- affect: calm\n\nやあ"
+    leaked_text = "[Mental state]\n- affect: calm\n- interoception: warm\n\nやあ"
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=leaked_text), leaked_text)
     )
@@ -106,23 +107,25 @@ async def test_run_post_response_pipeline_receives_raw_text() -> None:
             p.stop()
 
     # 返却値は filter 済み
-    assert result == "やあ"
+    assert "[Mental state]" not in result
+    assert "やあ" in result
 
-    # pipeline は生 text を受け取っているはず (await の有無に関係なく
-    # 呼び出された時点で call_args が記録される)
+    # pipeline も filter 後 text を受け取っているはず
     assert pipeline_mock.call_count >= 1
     kwargs = pipeline_mock.call_args.kwargs
-    assert kwargs["final_text"] == leaked_text  # 生 text のまま
-    assert "[Mental state]" in kwargs["final_text"]
+    assert "[Mental state]" not in kwargs["final_text"]
+    assert "affect" not in kwargs["final_text"]
+    assert "interoception" not in kwargs["final_text"]
+    assert "やあ" in kwargs["final_text"]
 
 
 @pytest.mark.asyncio
-async def test_run_mental_state_bus_receives_raw_snapshot() -> None:
-    """`_mental_state_bus.append` は filter 影響を受けない (raw snapshot 保存)。
+async def test_run_mental_state_bus_append_called_with_clean_response() -> None:
+    """`_mental_state_bus.append` は filter 後 text が空でない時のみ呼ばれる。
 
     実装上 `_mental_state_bus.append(mental_snapshot)` は別オブジェクト
-    (MentalStateSnapshot) を渡しており filter とは独立だが、念のため
-    `final_text` が漏出を含む状態で append が呼ばれていることを確認する。
+    (MentalStateSnapshot) を渡しており filter とは独立だが、`filtered_text`
+    が空でない時のみ append が呼ばれる経路をテストする。
     """
     agent = _make_agent()
     bus_mock = MagicMock()
@@ -145,17 +148,17 @@ async def test_run_mental_state_bus_receives_raw_snapshot() -> None:
 
     # 返却値は filter 済み
     assert result == "本文"
-    # mental_state_bus.append が呼ばれていること (filter 経路と独立)
+    # mental_state_bus.append が呼ばれていること (filter 後 text が空でないため)
     assert bus_mock.append.called
 
 
 @pytest.mark.asyncio
-async def test_run_tts_auto_say_receives_raw_text() -> None:
-    """auto-say 有効時、TTS には生 final_text が流れる (フィルタ非適用)。"""
+async def test_run_tts_auto_say_receives_filtered_text() -> None:
+    """auto-say 有効時、TTS には filter 後 final_text が流れる (漏出の音声化防止)。"""
     agent = _make_agent(with_tts=True)
     agent.config.auto_say = True
 
-    leaked_text = "[Mental state]\n- affect: bright\n\nおはよう"
+    leaked_text = "[Mental state]\n- affect: bright\n- interoception: warm\n\nおはよう"
     agent.backend.stream_turn = AsyncMock(
         return_value=(_turn("end_turn", text=leaked_text), leaked_text)
     )
@@ -170,13 +173,18 @@ async def test_run_tts_auto_say_receives_raw_text() -> None:
             p.stop()
 
     # 返却値は filter 済み
-    assert result == "おはよう"
+    assert "[Mental state]" not in result
+    assert "おはよう" in result
 
-    # TTS は raw final_text を受け取っている
+    # TTS は filter 後 final_text を受け取っている (漏出は音声化されない)
     assert agent._tts.call.await_count == 1
     call_args = agent._tts.call.await_args
     assert call_args.args[0] == "say"
-    assert call_args.args[1]["text"] == leaked_text  # 生 text のまま
+    spoken_text = call_args.args[1]["text"]
+    assert "[Mental state]" not in spoken_text
+    assert "affect" not in spoken_text
+    assert "interoception" not in spoken_text
+    assert "おはよう" in spoken_text
 
 
 @pytest.mark.asyncio
