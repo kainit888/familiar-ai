@@ -110,35 +110,57 @@ class CameraTool:
 
         logger.info("Camera resources released.")
 
+    def _open_capture(self) -> "cv2.VideoCapture":
+        """Open a fresh cv2.VideoCapture for the configured stream (案 1)."""
+        source = self._get_stream_url()
+        if isinstance(source, str) and source.startswith("rtsp://"):
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        return cv2.VideoCapture(
+            source, cv2.CAP_FFMPEG if isinstance(source, str) else cv2.CAP_ANY
+        )
+
+    def _reset_capture(self) -> None:
+        """Fully release the current capture and reopen it (案 1: release/reopen).
+
+        Replaces the previous ``self._cap.open(source)`` retry path. Calling
+        ``release()`` first ensures the ffmpeg internal handle is dropped,
+        which is required to recover from RTSP zero-buffer pathology after
+        long uptime (see ``docs/capture_loop_fix_design_memo.md``).
+        """
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception as e:
+                logger.debug("Capture release errored (ignored): %s", e)
+        time.sleep(2.0)
+        self._cap = self._open_capture()
+
     def _capture_loop(self):
         """Background thread to keep camera buffer fresh and optionally show preview."""
-        source = self._get_stream_url()
-
         # Suppress ffmpeg C-level warnings (SEI type 764 spam from Tapo).
         # Cannot redirect stderr (breaks Textual TUI), so use OPENCV env vars instead.
         os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"  # AV_LOG_QUIET
         os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
         try:
-            if isinstance(source, str) and source.startswith("rtsp://"):
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-            self._cap = cv2.VideoCapture(
-                source, cv2.CAP_FFMPEG if isinstance(source, str) else cv2.CAP_ANY
-            )
+            self._cap = self._open_capture()
 
             if not self._cap.isOpened():
-                logger.error("Failed to open camera source: %s", source)
+                logger.error("Failed to open camera source: %s", self._get_stream_url())
                 self._running = False
                 return
 
-            logger.info("Camera capture thread started for source: %s", source)
+            logger.info(
+                "Camera capture thread started for source: %s", self._get_stream_url()
+            )
 
             while self._running:
                 ret, frame = self._cap.read()
-                if not ret:
-                    logger.warning("Failed to read frame, retrying in 2s...")
-                    time.sleep(2.0)
-                    self._cap.open(source)
+                if not ret or frame is None:
+                    logger.warning(
+                        "Failed to read frame, releasing and reopening in 2s..."
+                    )
+                    self._reset_capture()
                     continue
 
                 with self._lock:
