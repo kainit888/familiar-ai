@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -325,3 +325,171 @@ async def test_close_is_safe_when_no_onvif_client():
     # 例外が出なければ OK (戻り値なし)。
     result = await cam.close()
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: _is_frame_black() — RTSP zero-buffer pathology detection (案 2)
+# ---------------------------------------------------------------------------
+
+
+def test_is_frame_black_returns_true_for_zero_frame():
+    """完全な zero frame (RTSP zero-buffer) は黒画像と判定される。"""
+    from familiar_agent.tools.camera import _is_frame_black
+
+    zero = np.zeros((10, 10, 3), dtype=np.uint8)
+    assert _is_frame_black(zero) is True
+
+
+def test_is_frame_black_returns_false_for_normal_frame():
+    """明るい通常フレームは黒画像と判定されない。"""
+    from familiar_agent.tools.camera import _is_frame_black
+
+    bright = np.full((10, 10, 3), 128, dtype=np.uint8)
+    assert _is_frame_black(bright) is False
+
+
+def test_is_frame_black_returns_false_for_none():
+    """None フレームは黒画像扱いしない (read 失敗経路で処理する)。"""
+    from familiar_agent.tools.camera import _is_frame_black
+
+    assert _is_frame_black(None) is False
+
+
+def test_is_frame_black_returns_false_for_dark_room():
+    """薄暗い部屋 (mean=20) は zero buffer と区別される (false positive 防止)。"""
+    from familiar_agent.tools.camera import _is_frame_black
+
+    dark = np.full((10, 10, 3), 20, dtype=np.uint8)
+    assert _is_frame_black(dark) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: _reset_capture() + _capture_loop() — 案 1 release/reopen + 案 2 trigger
+# ---------------------------------------------------------------------------
+
+
+def test_reset_capture_releases_and_reopens(monkeypatch):
+    """_reset_capture() は既存 VideoCapture を release し、新規 capture を開く。"""
+    cam = _make_camera_tool()
+    old_cap = MagicMock()
+    cam._cap = old_cap
+
+    new_cap = MagicMock()
+    cam._open_capture = lambda: new_cap  # type: ignore[method-assign]
+
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    cam._reset_capture()
+
+    assert old_cap.release.called
+    assert cam._cap is new_cap
+
+
+def test_capture_loop_resets_after_consecutive_black_frames(monkeypatch):
+    """連続 _BLACK_CONSECUTIVE_LIMIT 枚の黒画像で _reset_capture が起動する。"""
+    import familiar_agent.tools.camera as camera_module
+
+    black = np.zeros((50, 50, 3), dtype=np.uint8)
+    normal = np.full((50, 50, 3), 128, dtype=np.uint8)
+
+    cam = _make_camera_tool()
+    cam._running = True
+
+    cap1 = MagicMock()
+    cap1.isOpened.return_value = True
+    cap1.read.side_effect = [
+        (True, black)
+    ] * camera_module._BLACK_CONSECUTIVE_LIMIT
+
+    cap2 = MagicMock()
+    cap2.isOpened.return_value = True
+
+    def cap2_read():
+        cam._running = False
+        return (True, normal)
+
+    cap2.read.side_effect = cap2_read
+
+    captures = iter([cap1, cap2])
+    cam._open_capture = lambda: next(captures)  # type: ignore[method-assign]
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    cam._capture_loop()
+
+    # cap1 was released during reset (and again at loop exit if _cap is cap1,
+    # but here _cap was switched to cap2 before exit)
+    assert cap1.release.called
+    # cap2 served the final normal frame → committed to _last_frame
+    assert cam._last_frame is not None
+    np.testing.assert_array_equal(cam._last_frame, normal)
+
+
+def test_capture_loop_does_not_reset_on_isolated_black_frame(monkeypatch):
+    """黒と正常が交互に来る場合は連続カウンタがリセットされ、_reset_capture は起動しない。"""
+    import familiar_agent.tools.camera as camera_module
+
+    black = np.zeros((50, 50, 3), dtype=np.uint8)
+    normal = np.full((50, 50, 3), 128, dtype=np.uint8)
+
+    cam = _make_camera_tool()
+    cam._running = True
+
+    # 交互 (black, normal) を LIMIT * 2 ペア繰り返してもリセットされないこと
+    frames: list = []
+    for _ in range(camera_module._BLACK_CONSECUTIVE_LIMIT * 2):
+        frames.append((True, black))
+        frames.append((True, normal))
+
+    call_idx = [0]
+
+    def scripted_read():
+        if call_idx[0] >= len(frames):
+            cam._running = False
+            return (True, normal)
+        result = frames[call_idx[0]]
+        call_idx[0] += 1
+        return result
+
+    cap1 = MagicMock()
+    cap1.isOpened.return_value = True
+    cap1.read.side_effect = scripted_read
+
+    # 2 つ目の capture を返せないので、reset が走ったらテストが StopIteration で失敗する。
+    captures = iter([cap1])
+    cam._open_capture = lambda: next(captures)  # type: ignore[method-assign]
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    cam._capture_loop()
+
+    # cap1 は最終 cleanup の 1 回のみ release される (reset は走らない)
+    assert cap1.release.call_count == 1
+
+
+def test_capture_loop_resets_on_read_failure(monkeypatch):
+    """ret=False を検知したとき _reset_capture が起動する (案 1 経路)。"""
+    normal = np.full((50, 50, 3), 128, dtype=np.uint8)
+
+    cam = _make_camera_tool()
+    cam._running = True
+
+    cap1 = MagicMock()
+    cap1.isOpened.return_value = True
+    cap1.read.side_effect = [(False, None)]  # 単発の read 失敗
+
+    cap2 = MagicMock()
+    cap2.isOpened.return_value = True
+
+    def cap2_read():
+        cam._running = False
+        return (True, normal)
+
+    cap2.read.side_effect = cap2_read
+
+    captures = iter([cap1, cap2])
+    cam._open_capture = lambda: next(captures)  # type: ignore[method-assign]
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    cam._capture_loop()
+
+    assert cap1.release.called
+    assert cam._last_frame is not None
