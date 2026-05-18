@@ -237,7 +237,7 @@ class MetaMonitor:
             ):
                 reasons.append("validation-before-advice violation")
                 repaired_response = (
-                    "それはほんまにしんどかったよね。無理に解決へ急がんでええ。 "
+                    "それは本当に辛かったね。…焦らなくていいよ。 "
                     + candidate_response
                 )
 
