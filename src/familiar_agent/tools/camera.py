@@ -21,6 +21,28 @@ logger = logging.getLogger(__name__)
 
 CAPTURE_DIR = Path.home() / ".familiar_ai" / "captures"
 
+# 案 2: 黒画像 (RTSP zero-buffer pathology) 検知の閾値。
+# diagnose_rtsp_black.py と同じ判定基準 (channel-mean < 5)。通常の暗所撮影でも
+# センサーノイズで mean ≥ 10 になるため、mean < 5 は zero buffer の明確なサイン。
+_BLACK_MEAN_THRESHOLD = 5.0
+# 連続 N フレームで初めてリセット (warmup や瞬間欠落での誤発火を防ぐ)。
+_BLACK_CONSECUTIVE_LIMIT = 5
+
+
+def _is_frame_black(frame: Any, threshold: float = _BLACK_MEAN_THRESHOLD) -> bool:
+    """Return True if frame looks like an RTSP zero-buffer black frame.
+
+    Pure helper so it can be unit-tested without spinning up a CameraTool.
+    See docs/capture_loop_fix_design_memo.md for the threshold rationale.
+    """
+    if frame is None:
+        return False
+    try:
+        mean_value = float(frame.mean())
+    except Exception:
+        return False
+    return 0.0 <= mean_value < threshold
+
 
 class CameraTool:
     """Controls a camera via OpenCV (RTSP, USB, file) and optionally via ONVIF (PTZ)."""
@@ -154,6 +176,7 @@ class CameraTool:
                 "Camera capture thread started for source: %s", self._get_stream_url()
             )
 
+            consecutive_black = 0
             while self._running:
                 ret, frame = self._cap.read()
                 if not ret or frame is None:
@@ -161,7 +184,23 @@ class CameraTool:
                         "Failed to read frame, releasing and reopening in 2s..."
                     )
                     self._reset_capture()
+                    consecutive_black = 0
                     continue
+
+                # 案 2: zero-buffer pathology の検知。連続 N フレーム黒で reset。
+                if _is_frame_black(frame):
+                    consecutive_black += 1
+                    if consecutive_black >= _BLACK_CONSECUTIVE_LIMIT:
+                        logger.warning(
+                            "Detected %d consecutive black frames (mean<%.1f); "
+                            "releasing and reopening capture.",
+                            consecutive_black,
+                            _BLACK_MEAN_THRESHOLD,
+                        )
+                        self._reset_capture()
+                        consecutive_black = 0
+                    continue
+                consecutive_black = 0
 
                 with self._lock:
                     self._last_frame = frame.copy()
