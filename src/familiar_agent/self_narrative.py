@@ -95,7 +95,7 @@ class SelfNarrative:
         if not entries:
             return None
         lines = [f"[{e.date}] {e.text}" for e in entries]
-        return "過去のウチからの続き:\n" + "\n".join(lines)
+        return "過去の自分からの続き:\n" + "\n".join(lines)
 
     def as_coalition(self) -> Coalition | None:
         """Return a workspace Coalition from recent self-narrative entries."""

@@ -2092,12 +2092,12 @@ class EmbodiedAgent:
             return
 
         prompt = (
-            "次の出来事を、ウチ自身の自己叙述として一文で書いて。\n"
+            "次の出来事を、私自身の自己叙述として一文で書いて。\n"
             f"user: {user_input[:160]}\n"
             f"agent: {final_text[:220]}\n"
             f"emotion: {emotion}\n"
             f"agency_error: {agency_error:.2f}\n"
-            "条件: 一人称は『ウチ』。60文字以内。説明や前置きは禁止。"
+            "条件: 一人称は『私』。60文字以内。説明や前置きは禁止。"
         )
         try:
             text = await asyncio.wait_for(
@@ -2277,8 +2277,8 @@ class EmbodiedAgent:
             mood, _ = self._decayed_mood()
             prompt = (
                 f"今日起きたこと（要約）:\n{summary_hint}\n\n"
-                "ウチ（ここね）として、今日という日を一文で書いて。"
-                "一人称は「ウチ」、50文字以内、過去形。"
+                "私として、今日という日を一文で書いて。"
+                "一人称は「私」、50文字以内、過去形。"
                 "感情や気づきを含めて。"
             )
             text = await asyncio.wait_for(
