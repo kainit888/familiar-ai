@@ -1,18 +1,17 @@
 """TTS adapter (Style-BERT-VITS2) - 設計書 v4.0 第 7-2 章 / v4.2 第 14-5 章。
 
 メイン PC で稼働中の Style-BERT-VITS2 サーバ (デフォルト 192.168.10.104:5000)
-に GET /voice?text=... を投げて WAV bytes を取得する。
+に GET /voice?text=...&model_name=... を投げて WAV bytes を取得する。
 
-I/F (設計書 7-2 章 + v4.2 14-5 章):
+公開 I/F (設計書 7-2 章 + v4.2 14-5 章、Phase C-3 で固定):
     async def speak(
         text: str,
         speaker_id: int = 0,
         emotion: dict | None = None,    # valence/arousal で声色変化
         target: str = "discord_vc",     # 既存値域維持
     ) -> bytes
-    "100 文字制限 → 句読点で分割 → asyncio.Queue でストリーミング"
+        "30 文字制限 → 句読点優先で分割 → 順次取得して連結"
 
-    # v4.2 14-5 フォールバックチェーン (Phase C-1 で追加):
     async def play_with_fallback(
         text: str,
         target: str = "auto",  # "tapo_speaker" | "main_pc" | "rpi5" | "auto"
@@ -20,44 +19,63 @@ I/F (設計書 7-2 章 + v4.2 14-5 章):
     ) -> tuple[bool, str]:
         "WAV bytes 取得 + 物理再生まで実行、target 失敗時は順次フォールバック"
 
-エラーハンドリング方針 (planner 確認済み):
+エラーハンドリング方針 (絶対遵守):
     - 例外を raise せず silent fail + logger.warning
-    - 失敗時は空 bytes を返す
-    - target はメタ情報として現状ログのみ (再生先の振り分けは呼び出し側責務)
-    - play_with_fallback() は (success, played_via) を返す (例外は呼ばない)
+    - 失敗時は空 bytes を返す / play_with_fallback() は (False, 理由) を返す
+    - target=tapo_speaker は go2rtc POST /api/streams?dst=...&src=ffmpeg:... 方式
 
-emotion マッピング (Phase E で再調整、Phase C-1 は保守的デフォルト):
+go2rtc 連携 (v4.2 14-5、カイニット実機検証で確定):
+    - POST {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=<URL-encoded ffmpeg URL>
+    - src 形式: ffmpeg:<wav_path>#audio=pcma#input=file
+    - Body 空、Authorization なし、Content-Type なし
+    - LAN 内認証なし (192.168.10.104:1984)
+
+emotion マッピング (Phase E で再調整、保守的デフォルト):
     style_weight = (valence - 0.5) * 2  # -1.0〜+1.0
 
-go2rtc 連携 (v4.2 14-5):
-    - go2rtc 本体のセットアップは TP-Link クラウドパスワードが必要 (カイニット手動)
-    - _play_via_go2rtc() は API 呼び出しコードのスケルトンのみ、デフォルト off
+暖機 (案 A): モジュール初回呼び出し時に「ん」1 文字を SBV2 で生成して
+    /tmp/pico_v3_warmup.wav に保存。次回以降はファイル存在のみ確認。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 from loguru import logger
 
-# ── 設定 ─────────────────────────────────────────────────────────────────
+# ── 設定 (環境変数で上書き可能、ハードコード禁止) ────────────────────────────
 _DEFAULT_BASE_URL = "http://192.168.10.104:5000"
 _DEFAULT_TIMEOUT_SEC = 60.0
+_DEFAULT_GO2RTC_BASE_URL = "http://127.0.0.1:1984"
+_DEFAULT_TAPO_STREAM_NAME = "tapo_c210"
+_DEFAULT_TTS_MODEL_NAME = "jvnv-F1-jp"
+_DEFAULT_TTS_VOLUME = 0.5
+_DEFAULT_TTS_PRE_RESAMPLE = 16000
+_DEFAULT_TTS_TAIL_SILENCE = 0.5
+_DEFAULT_TTS_CHUNK_MAX_CHARS = 30
+_DEFAULT_TTS_CHUNK_DELAY_MS = 0
 
-# 100 文字を超えるテキストは句読点で分割してから順次送信する (設計書 7-2 章)。
-_MAX_CHUNK_CHARS = 100
-_SPLIT_PUNCT_PATTERN = re.compile(r"(?<=[。、！？!?,.\n])")
+# 暖機ファイル (カイニット指定)
+_WARMUP_WAV_PATH = Path("/tmp/pico_v3_warmup.wav")
+_WARMUP_TEXT = "ん"
+_WARMUP_DONE: bool = False
+
+# 分割優先度: 「。」「！」「？」「、」「\n」の順
+_SPLIT_PRIORITY: tuple[str, ...] = ("。", "！", "？", "、", "\n")
 
 _VALID_TARGETS = ("discord_vc", "local_speaker")
+
+
+# ── 環境変数アクセサ ──────────────────────────────────────────────────────
 
 
 def _get_base_url() -> str:
@@ -74,45 +92,132 @@ def _get_timeout() -> float:
         return _DEFAULT_TIMEOUT_SEC
 
 
-def _split_chunks(text: str) -> list[str]:
-    """100 文字制限を満たすように句読点で分割する。
+def _get_go2rtc_base_url() -> str:
+    """go2rtc REST API のベース URL を取得 (環境変数 GO2RTC_BASE_URL)。"""
+    return os.environ.get("GO2RTC_BASE_URL", _DEFAULT_GO2RTC_BASE_URL).rstrip("/")
 
-    SBV2 の安全側として、句読点ごとに切ってから ``_MAX_CHUNK_CHARS`` までを
-    1 チャンクにまとめて返す。長文 1 行の場合は強制的にスライス。
+
+def _get_tapo_stream_name() -> str:
+    """go2rtc ストリーム名 (Tapo C210) を取得 (環境変数 TAPO_STREAM_NAME)。"""
+    return os.environ.get("TAPO_STREAM_NAME", _DEFAULT_TAPO_STREAM_NAME)
+
+
+def _is_go2rtc_enabled() -> bool:
+    """環境変数 GO2RTC_ENABLED=1/true/yes のときのみ go2rtc 再生を試みる。"""
+    return os.environ.get("GO2RTC_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+
+def _get_tts_model_name() -> str:
+    """SBV2 の model_name を取得 (環境変数 TTS_MODEL_NAME)。"""
+    return os.environ.get("TTS_MODEL_NAME", _DEFAULT_TTS_MODEL_NAME)
+
+
+def _get_tts_volume() -> float:
+    """ffmpeg volume フィルタ係数を取得 (環境変数 TTS_VOLUME)。"""
+    raw = os.environ.get("TTS_VOLUME", "")
+    try:
+        return float(raw) if raw else _DEFAULT_TTS_VOLUME
+    except ValueError:
+        return _DEFAULT_TTS_VOLUME
+
+
+def _get_tts_pre_resample() -> int:
+    """ffmpeg 再サンプリング rate を取得 (環境変数 TTS_PRE_RESAMPLE)。"""
+    raw = os.environ.get("TTS_PRE_RESAMPLE", "")
+    try:
+        return int(raw) if raw else _DEFAULT_TTS_PRE_RESAMPLE
+    except ValueError:
+        return _DEFAULT_TTS_PRE_RESAMPLE
+
+
+def _get_tts_tail_silence() -> float:
+    """ffmpeg apad pad_dur 秒数を取得 (環境変数 TTS_TAIL_SILENCE)。"""
+    raw = os.environ.get("TTS_TAIL_SILENCE", "")
+    try:
+        return float(raw) if raw else _DEFAULT_TTS_TAIL_SILENCE
+    except ValueError:
+        return _DEFAULT_TTS_TAIL_SILENCE
+
+
+def _get_chunk_max_chars() -> int:
+    """テキスト分割の上限文字数を取得 (環境変数 TTS_CHUNK_MAX_CHARS)。"""
+    raw = os.environ.get("TTS_CHUNK_MAX_CHARS", "")
+    try:
+        return int(raw) if raw else _DEFAULT_TTS_CHUNK_MAX_CHARS
+    except ValueError:
+        return _DEFAULT_TTS_CHUNK_MAX_CHARS
+
+
+def _get_chunk_delay_ms() -> int:
+    """チャンク間のディレイ ms を取得 (環境変数 TTS_CHUNK_DELAY_MS)。"""
+    raw = os.environ.get("TTS_CHUNK_DELAY_MS", "")
+    try:
+        return int(raw) if raw else _DEFAULT_TTS_CHUNK_DELAY_MS
+    except ValueError:
+        return _DEFAULT_TTS_CHUNK_DELAY_MS
+
+
+# ── テキスト分割 ──────────────────────────────────────────────────────────
+
+
+def _split_chunks(text: str) -> list[str]:
+    """30 文字制限を満たすように句読点優先でテキストを分割する。
+
+    アルゴリズム:
+        1. 残り文字列の先頭から ``max_chars`` 文字ウィンドウを取る
+        2. ``_SPLIT_PRIORITY`` の優先順 (。→！→？→、→\\n) で
+           ウィンドウ内を ``rfind`` し、見つかった位置で切る
+        3. どれも見つからなければ強制 ``max_chars`` で切る
+        4. 切った後のチャンクは ``.lstrip()`` で前後空白を除去
+        5. 空チャンクは結果に含めない
+        6. 1 ステップで必ず 1 文字以上進めて無限ループ防止
     """
     if not text:
         return []
 
-    pieces = [p for p in _SPLIT_PUNCT_PATTERN.split(text) if p]
-    chunks: list[str] = []
-    buf = ""
-    for piece in pieces:
-        if not piece:
-            continue
-        if len(buf) + len(piece) <= _MAX_CHUNK_CHARS:
-            buf += piece
-        else:
-            if buf:
-                chunks.append(buf)
-            buf = piece
-    if buf:
-        chunks.append(buf)
+    max_chars = _get_chunk_max_chars()
+    if max_chars <= 0:
+        # 異常設定の保険。ハードコードではなく定数フォールバック。
+        max_chars = _DEFAULT_TTS_CHUNK_MAX_CHARS
 
-    # 句読点がない長文の場合は強制スライス。
-    overflow_split: list[str] = []
-    for c in chunks:
-        if len(c) <= _MAX_CHUNK_CHARS:
-            overflow_split.append(c)
-        else:
-            for i in range(0, len(c), _MAX_CHUNK_CHARS):
-                overflow_split.append(c[i : i + _MAX_CHUNK_CHARS])
-    return overflow_split
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_chars:
+            piece = remaining.lstrip()
+            if piece:
+                chunks.append(piece)
+            break
+
+        window = remaining[:max_chars]
+        cut_at = -1
+        # 優先順に探す。先頭 (idx=0) でしか見つからない場合は無限ループになるので除外。
+        for delim in _SPLIT_PRIORITY:
+            idx = window.rfind(delim)
+            if idx > 0:  # 先頭区切りは無視して次の優先度へ
+                cut_at = idx + len(delim)
+                break
+
+        if cut_at <= 0:
+            # どの区切りも見つからず、または先頭にしか無い → 強制スライス
+            cut_at = max_chars
+
+        piece = remaining[:cut_at].lstrip()
+        if piece:
+            chunks.append(piece)
+        remaining = remaining[cut_at:]
+
+    return chunks
+
+
+# ── emotion → style_weight ────────────────────────────────────────────────
 
 
 def _emotion_to_style_weight(emotion: dict[str, Any] | None) -> float:
     """emotion dict から SBV2 の style_weight (-1.0〜+1.0 目安) を導出。
 
-    Phase C-1 では保守的デフォルト (valence のみ参照、arousal は将来用)。
+    Phase C-3 では保守的デフォルト (valence のみ参照、arousal は将来用)。
     Phase E (感情 3 値実装) で再調整予定。
     """
     if not emotion:
@@ -124,6 +229,9 @@ def _emotion_to_style_weight(emotion: dict[str, Any] | None) -> float:
     return max(-1.0, min(1.0, (valence - 0.5) * 2.0))
 
 
+# ── SBV2 GET /voice 呼び出し ──────────────────────────────────────────────
+
+
 def _build_query(
     text: str,
     speaker_id: int,
@@ -131,13 +239,12 @@ def _build_query(
 ) -> str:
     """SBV2 GET /voice 用クエリ文字列を組み立てる。
 
-    公式 API 仕様の確認時間が取れなかったため、第一候補 (カイニット確定):
-    ``/voice?text=...&model_id=0&speaker_id=0`` 形式を採用。
+    形式: ``/voice?text=...&model_name=...&speaker_id=...&style_weight=...``
     """
     style_weight = _emotion_to_style_weight(emotion)
     params: list[tuple[str, str]] = [
         ("text", text),
-        ("model_id", "0"),
+        ("model_name", _get_tts_model_name()),
         ("speaker_id", str(int(speaker_id))),
         ("style_weight", f"{style_weight:.2f}"),
     ]
@@ -166,6 +273,54 @@ async def _fetch_one_chunk(session: aiohttp.ClientSession, chunk: str, query_suf
         return b""
 
 
+# ── 暖機 ──────────────────────────────────────────────────────────────────
+
+
+async def _warmup_once() -> None:
+    """プロセス起動後 1 回だけ SBV2 に「ん」を投げて暖機する (silent fail)。
+
+    動作:
+        - すでに ``_WARMUP_DONE`` なら何もしない
+        - ``/tmp/pico_v3_warmup.wav`` が既存ならファイルを信頼してフラグだけ立てる
+        - 存在しなければ SBV2 に「ん」を投げて WAV を取得して保存
+        - 取得失敗時は警告のみ、フラグは立てない (次回再試行)
+    """
+    global _WARMUP_DONE
+    if _WARMUP_DONE:
+        return
+
+    try:
+        if _WARMUP_WAV_PATH.exists() and _WARMUP_WAV_PATH.stat().st_size > 0:
+            _WARMUP_DONE = True
+            logger.debug("tts_sbv2._warmup: existing file {}, skipping fetch", _WARMUP_WAV_PATH)
+            return
+    except OSError as e:
+        logger.warning("tts_sbv2._warmup: stat failed: {}", e)
+        # フラグは立てない
+
+    query = _build_query(_WARMUP_TEXT, speaker_id=0, emotion=None)
+    timeout = aiohttp.ClientTimeout(total=_get_timeout())
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            wav = await _fetch_one_chunk(session, _WARMUP_TEXT, query)
+        if not wav:
+            logger.warning("tts_sbv2._warmup: SBV2 returned empty bytes; will retry next call")
+            return
+        _WARMUP_WAV_PATH.write_bytes(wav)
+        _WARMUP_DONE = True
+        logger.info(
+            "tts_sbv2._warmup: saved warmup wav to {} ({} bytes)",
+            _WARMUP_WAV_PATH,
+            len(wav),
+        )
+    except Exception as e:
+        logger.warning("tts_sbv2._warmup: silent fail: {}", e)
+        # フラグは立てない、次回再試行
+
+
+# ── 公開 API: speak() ─────────────────────────────────────────────────────
+
+
 async def speak(
     text: str,
     speaker_id: int = 0,
@@ -175,7 +330,8 @@ async def speak(
     """テキストを Style-BERT-VITS2 に投げて WAV bytes を返す (設計書 7-2 章)。
 
     Args:
-        text: 読み上げ対象テキスト (100 文字を超えると句読点で分割)。
+        text: 読み上げ対象テキスト。30 文字 (TTS_CHUNK_MAX_CHARS) を超えると
+            句読点優先で分割される。
         speaker_id: SBV2 サーバ側の speaker ID (デフォルト 0)。
         emotion: ``{"valence": 0.0-1.0, "arousal": 0.0-1.0}`` 形式の感情 dict。
             ``None`` のときは中立。
@@ -192,6 +348,8 @@ async def speak(
         logger.warning("tts_sbv2.speak: unknown target {!r}, defaulting to discord_vc", target)
         target = "discord_vc"
 
+    await _warmup_once()
+
     chunks = _split_chunks(text.strip())
     if not chunks:
         return b""
@@ -206,13 +364,16 @@ async def speak(
 
     timeout = aiohttp.ClientTimeout(total=_get_timeout())
     audio_parts: list[bytes] = []
+    chunk_delay_ms = _get_chunk_delay_ms()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 query = _build_query(chunk, speaker_id, emotion)
                 part = await _fetch_one_chunk(session, chunk, query)
                 if part:
                     audio_parts.append(part)
+                if chunk_delay_ms > 0 and i < len(chunks) - 1:
+                    await asyncio.sleep(chunk_delay_ms / 1000.0)
     except Exception as e:
         logger.warning("tts_sbv2.speak: session-level failure: {}", e)
         return b""
@@ -220,38 +381,13 @@ async def speak(
     if not audio_parts:
         return b""
 
-    # 単純連結 (RIFF ヘッダの厳密マージは呼び出し側か Phase D で対応)。
     return b"".join(audio_parts)
 
 
 # ── v4.2 14-5: フォールバック再生チェーン ────────────────────────────────────
-#
-# Phase C-1 で追加。speak() (WAV bytes 取得) と再生 (subprocess) を組み合わせて、
-# Tapo C210 スピーカー → メイン PC → RPi5 アナログ出力 の順にフォールバックする。
-# go2rtc 連携 (_play_via_go2rtc) は本体未セットアップなので no-op 既定。
 
-# サポート target
-_FALLBACK_TARGETS: tuple[str, ...] = ("tapo_speaker", "main_pc", "rpi5")
+
 _AUTO_FALLBACK_CHAIN: tuple[str, ...] = ("tapo_speaker", "main_pc", "rpi5")
-
-
-def _get_go2rtc_url() -> str:
-    """go2rtc REST API のベース URL を取得 (環境変数 GO2RTC_URL)。"""
-    return os.environ.get("GO2RTC_URL", "http://localhost:1984").rstrip("/")
-
-
-def _get_go2rtc_stream() -> str:
-    """go2rtc ストリーム名を取得 (環境変数 GO2RTC_STREAM、デフォルト pico_camera)。"""
-    return os.environ.get("GO2RTC_STREAM", "pico_camera")
-
-
-def _is_go2rtc_enabled() -> bool:
-    """環境変数 GO2RTC_ENABLED=1 のときのみ go2rtc 再生を試みる。
-
-    Phase C-1 では go2rtc 本体のセットアップが完了していないため、デフォルト off。
-    本番稼働時にカイニットが go2rtc を起動した上で GO2RTC_ENABLED=1 を設定する。
-    """
-    return os.environ.get("GO2RTC_ENABLED", "").strip() in ("1", "true", "yes")
 
 
 def _write_tmp_wav(wav_bytes: bytes) -> str:
@@ -266,12 +402,91 @@ def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
+# ── ffmpeg 前処理 (RPi5 ホスト側) ─────────────────────────────────────────
+
+
+def _build_ffmpeg_args(src: str, dst: str) -> list[str]:
+    """ffmpeg 前処理用のコマンド引数を組み立てる。
+
+    生成コマンド:
+        ffmpeg -y -loglevel error -i <src> \
+          -af "volume=<TTS_VOLUME>,apad=pad_dur=<TTS_TAIL_SILENCE>" \
+          -ar <TTS_PRE_RESAMPLE> -ac 1 -f wav <dst>
+    """
+    volume = _get_tts_volume()
+    tail = _get_tts_tail_silence()
+    ar = _get_tts_pre_resample()
+    af = f"volume={volume},apad=pad_dur={tail}"
+    return [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        src,
+        "-af",
+        af,
+        "-ar",
+        str(ar),
+        "-ac",
+        "1",
+        "-f",
+        "wav",
+        dst,
+    ]
+
+
+async def _preprocess_wav_with_ffmpeg(src_path: str) -> str | None:
+    """SBV2 出力 WAV を ffmpeg で前処理 (音量・PCMA 用 16k 単 ch) して新ファイルパスを返す。
+
+    Returns:
+        前処理済み WAV の絶対パス。ffmpeg 失敗時 / バイナリ無しなら ``None``。
+    """
+    ffmpeg = _which("ffmpeg")
+    if ffmpeg is None:
+        logger.warning("tts_sbv2._preprocess_wav_with_ffmpeg: ffmpeg not found in PATH")
+        return None
+
+    dst_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    args = _build_ffmpeg_args(src_path, dst_path)
+    # _which が見つけた絶対パスを引数 0 に差し替え
+    args[0] = ffmpeg
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "tts_sbv2._preprocess_wav_with_ffmpeg: ffmpeg rc={} stderr={!r}",
+                proc.returncode,
+                stderr.decode("utf-8", errors="replace")[:200] if stderr else "",
+            )
+            try:
+                os.unlink(dst_path)
+            except OSError:
+                pass
+            return None
+        return dst_path
+    except Exception as e:
+        logger.warning("tts_sbv2._preprocess_wav_with_ffmpeg: exec failed: {}", e)
+        try:
+            os.unlink(dst_path)
+        except OSError:
+            pass
+        return None
+
+
+# ── バックエンド: main_pc / rpi5 ─────────────────────────────────────────
+
+
 async def _play_via_main_pc(wav_bytes: bytes) -> bool:
     """メイン PC のスピーカーで WAV を再生する (mpv / ffplay 経由)。
 
-    現状はメイン PC へ実装を委譲する設計だが、Phase D まで Discord 統合が
-    入らないので、暫定的に **このプロセスが動いているマシン** (RPi5 か別 PC)
-    の音声出力デバイスで mpv / ffplay 再生を試みる。
+    実装が走るマシン (RPi5 か別 PC) の音声出力デバイスで mpv / ffplay 再生を試みる。
 
     Returns:
         再生プロセスが exit code 0 で終わったら True、それ以外 False。
@@ -280,9 +495,7 @@ async def _play_via_main_pc(wav_bytes: bytes) -> bool:
         return False
     bin_path = _which("mpv") or _which("ffplay")
     if bin_path is None:
-        logger.warning(
-            "tts_sbv2._play_via_main_pc: neither mpv nor ffplay found in PATH"
-        )
+        logger.warning("tts_sbv2._play_via_main_pc: neither mpv nor ffplay found in PATH")
         return False
 
     tmp_path = _write_tmp_wav(wav_bytes)
@@ -319,15 +532,11 @@ async def _play_via_rpi5(wav_bytes: bytes) -> bool:
     if not wav_bytes:
         return False
     if sys.platform != "linux":
-        logger.warning(
-            "tts_sbv2._play_via_rpi5: not on Linux ({}); skipping", sys.platform
-        )
+        logger.warning("tts_sbv2._play_via_rpi5: not on Linux ({}); skipping", sys.platform)
         return False
     bin_path = _which("aplay") or _which("paplay")
     if bin_path is None:
-        logger.warning(
-            "tts_sbv2._play_via_rpi5: neither aplay nor paplay found in PATH"
-        )
+        logger.warning("tts_sbv2._play_via_rpi5: neither aplay nor paplay found in PATH")
         return False
 
     tmp_path = _write_tmp_wav(wav_bytes)
@@ -351,63 +560,89 @@ async def _play_via_rpi5(wav_bytes: bytes) -> bool:
             pass
 
 
+# ── バックエンド: tapo_speaker (go2rtc 経由) ─────────────────────────────
+
+
+def _build_go2rtc_url(wav_path: str) -> str:
+    """go2rtc POST URL を組み立てる。
+
+    形式:
+        {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=<URL-encoded ffmpeg src>
+
+    src 形式:
+        ffmpeg:<wav_path>#audio=pcma#input=file
+    """
+    base_url = _get_go2rtc_base_url()
+    stream = _get_tapo_stream_name()
+    src = f"ffmpeg:{wav_path}#audio=pcma#input=file"
+    # # と : を含むので quote(safe="") で完全エンコード
+    src_encoded = quote(src, safe="")
+    return f"{base_url}/api/streams?dst={quote(stream, safe='')}&src={src_encoded}"
+
+
 async def _play_via_go2rtc(wav_bytes: bytes) -> bool:
-    """go2rtc REST API 経由で Tapo C210 スピーカーに WAV を流す (スケルトン)。
+    """go2rtc REST API 経由で Tapo C210 スピーカーに WAV を流す。
 
-    ⚠️ Phase C-1 では **GO2RTC_ENABLED=1 でないと no-op**。go2rtc 本体の
-    セットアップ (TP-Link クラウドパスワード必要) が完了するまでこの経路は
-    使えない。設計書 v4.2 14-5 章参照。
-
-    go2rtc API 仕様 (案):
-        POST {GO2RTC_URL}/api/streams/{stream}/play?file=<tmp_path>
-        または PUT {GO2RTC_URL}/api/streams/{stream}/audio (WAV body)
-
-    実 API 仕様は go2rtc 起動後に確認して詰める (Phase C-1 着手時の TODO)。
+    GO2RTC_ENABLED=1/true/yes でないと no-op (False)。
+    ffmpeg 前処理 → 一時 WAV → POST /api/streams?dst=...&src=ffmpeg:... を実行。
 
     Returns:
-        GO2RTC_ENABLED=0 のとき False、API 呼び出し成功で True。
+        - GO2RTC_ENABLED が偽 → False
+        - 空 bytes → False
+        - ffmpeg / HTTP 失敗 → False (silent fail)
+        - 成功 → True
     """
     if not wav_bytes:
         return False
     if not _is_go2rtc_enabled():
-        logger.debug(
-            "tts_sbv2._play_via_go2rtc: GO2RTC_ENABLED not set, skipping"
-        )
+        logger.debug("tts_sbv2._play_via_go2rtc: GO2RTC_ENABLED not set, skipping")
         return False
 
-    base_url = _get_go2rtc_url()
-    stream = _get_go2rtc_stream()
-    timeout = aiohttp.ClientTimeout(total=_get_timeout())
-
-    # API 仕様確定までの暫定 endpoint (PUT で WAV body を送る)
-    url = f"{base_url}/api/streams/{stream}/audio"
+    # SBV2 出力を tmp に保存 → ffmpeg 前処理 → 結果を go2rtc に投げる
+    src_path = _write_tmp_wav(wav_bytes)
+    pre_path: str | None = None
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.put(
-                url,
-                data=wav_bytes,
-                headers={"Content-Type": "audio/wav"},
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.warning(
-                        "tts_sbv2._play_via_go2rtc: HTTP {} from {} body={!r}",
-                        resp.status,
-                        url,
-                        body[:200],
-                    )
-                    return False
-                return True
-    except Exception as e:
-        logger.warning("tts_sbv2._play_via_go2rtc: request failed: {}", e)
-        return False
+        pre_path = await _preprocess_wav_with_ffmpeg(src_path)
+        if pre_path is None:
+            logger.warning("tts_sbv2._play_via_go2rtc: ffmpeg preprocess failed")
+            return False
+
+        url = _build_go2rtc_url(pre_path)
+        timeout = aiohttp.ClientTimeout(total=_get_timeout())
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.warning(
+                            "tts_sbv2._play_via_go2rtc: HTTP {} from {} body={!r}",
+                            resp.status,
+                            url,
+                            body[:200],
+                        )
+                        return False
+                    return True
+        except Exception as e:
+            logger.warning("tts_sbv2._play_via_go2rtc: request failed: {}", e)
+            return False
+    finally:
+        for p in (src_path, pre_path):
+            if not p:
+                continue
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
-_BACKENDS = {
+_BACKENDS: dict[str, Any] = {
     "tapo_speaker": _play_via_go2rtc,
     "main_pc": _play_via_main_pc,
     "rpi5": _play_via_rpi5,
 }
+
+
+# ── 公開 API: play_with_fallback() ────────────────────────────────────────
 
 
 async def play_with_fallback(
@@ -431,7 +666,7 @@ async def play_with_fallback(
     Returns:
         ``(success, played_via)``。
         - success=True なら played_via は使用されたバックエンド名 (例: "main_pc")
-        - success=False なら played_via は理由文字列 (例: "no_audio" / "all_failed")
+        - success=False なら played_via は理由文字列 ("empty_text" / "no_audio" / "all_failed")
     """
     if not text or not text.strip():
         return False, "empty_text"
