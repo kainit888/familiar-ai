@@ -1,8 +1,8 @@
 # pytest baseline (件数推移)
 
 **初版作成**: 2026-05-16 18:17 JST (Stage 1 Phase A 完了時)
-**最終更新**: 2026-05-19 (Phase C-3 完了)
-**ブランチ**: `pico-base` (`pico/pico-base` 同期、HEAD `89c78f5`)
+**最終更新**: 2026-05-19 (Phase C-4 完了)
+**ブランチ**: `pico-base` (`pico/pico-base` 同期、HEAD は Phase C-4 commit 後に更新)
 **Python**: 3.11.15 (uv 自動取得)
 **環境**: RPi5 (aarch64), Linux 6.12.62
 
@@ -10,10 +10,10 @@
 
 | 項目 | 値 |
 |---|---|
-| **現在の総件数** | **1217 件** |
-| 結果 | 1217 passed, 0 failed |
-| 警告 | 6-7 件 (主に `AsyncMockMixin._execute_mock_call` coroutine never awaited、実害なし) |
-| 所要 | 約 24 秒 (Phase C-3 完了時、5/19) |
+| **現在の総件数** | **1258 件** |
+| 結果 | 1258 passed, 0 failed |
+| 警告 | 6 件 (主に `AsyncMockMixin._execute_mock_call` coroutine never awaited、実害なし) |
+| 所要 | 約 26 秒 (Phase C-4 完了時、5/19) |
 
 ## 2. コマンド
 
@@ -43,8 +43,9 @@ uv run pytest --cov=src --cov-report=term-missing
 | 2026-05-18 夜 | Day 1 タスク C 完了 | **1170** | +24 | discord_bridge Phase D 本実装 (incoming_message_from_discord, mock client) |
 | 2026-05-19 〜 5/20 | Day 2-3 (調査タスク中心) | **1170** | ±0 | 新規テストなし (調査と doc のみ) |
 | 2026-05-19 | Phase C-3 (tts_sbv2 本実装) | **1217** | +47 | tts_sbv2 分割 9 + ffmpeg 4 + 暖機 4 + go2rtc URL 3 + model_name 2 + 旧キー廃止 2 (= 新規 24)、加えて parametrize 展開分の +23 |
+| 2026-05-19 | Phase C-4 (stt_kotoba RTSP 本実装) | **1258** | +41 | _build_ffmpeg_rtsp_cmd 5 + parse_silencedetect 6 + wrap_pcm_to_wav 3 + _emit_segment 5 + env 値 10 + RTSP URL 組み立て 4 + URL マスク 2 + VAD backend 2 + _subscription_loop シナリオ 5 (2 件は既存リネーム + 中身置換、件数据え置き) |
 
-**累積**: 883 → **1217** (+334 件、グリーン維持)
+**累積**: 883 → **1258** (+375 件、グリーン維持)
 
 ## 4. テストファイル一覧 (Phase C-1 + Day 1-2 完了時点)
 
@@ -65,7 +66,7 @@ tests/test_response_filter.py          113 件 (末尾ブロック algo + 大量
 tests/test_agent_leakage.py              7 件 (memory/bus/TTS 経路への filter 流入)
 tests/test_system_prompt.py            (+1 件は既存ファイルに追記)
 tests/test_adapter_tts_sbv2.py          77 件 (Phase C-3 本実装後: 基本 8 + フォールバック 14 + go2rtc + 分割 + ffmpeg + 暖機)
-tests/test_adapter_stt_kotoba.py        33 件 (基本 7 + RTSP スケルトン 13 + ヘルパー 8 + log 等)
+tests/test_adapter_stt_kotoba.py        74 件 (基本 8 + start_rtsp_subscription 11 + ヘルパー 22 + Phase C-4 本実装内部 33: build_ffmpeg 5 + parse 6 + wrap 3 + emit 5 + env 10 + loop 4)
 tests/test_adapter_vision_qwen3vl.py   (Phase C-1 で追加)
 tests/test_discord_bridge.py            57 件 (availability 3 + bot 16 + text 11 + voice 14 + dotenv 4 + ...)
 ```
@@ -115,8 +116,9 @@ Day 3 候補 I (テスト可読性改善、時間が許せば) で、件数を�
 | Day 1 タスク C 完了 (1170 件) | 27.18 秒 |
 | Day 3 終了時 (1170 件) | 26.09 秒 |
 | Phase C-3 完了 (1217 件) | 23.75 秒 |
+| Phase C-4 完了 (1258 件) | 25.80 秒 |
 
-時間軸での実行高速化は SSD/uv キャッシュ効果。1170 件で 26 秒は良好。
+時間軸での実行高速化は SSD/uv キャッシュ効果。1258 件で 26 秒は良好。
 今後の追加でも 30 秒以内を維持目標。
 
 ## 10. 関連ドキュメント
@@ -125,7 +127,8 @@ Day 3 候補 I (テスト可読性改善、時間が許せば) で、件数を�
 - [`outside_period_summary.md`](./outside_period_summary.md) — 外出期間まとめ
 - [`phase_c_v4.2_alignment.md`](./phase_c_v4.2_alignment.md) — v4.2 整合差分
 - [`phase_c3_migration_notes.md`](./phase_c3_migration_notes.md) — Phase C-3 tts_sbv2 本実装の差分
+- [`phase_c4_migration_notes.md`](./phase_c4_migration_notes.md) — Phase C-4 stt_kotoba RTSP 購読本実装の差分
 
 ---
 
-*pytest baseline | 初版 2026-05-16, 最終更新 2026-05-19 (Phase C-3 完了)*
+*pytest baseline | 初版 2026-05-16, 最終更新 2026-05-19 (Phase C-4 完了)*
