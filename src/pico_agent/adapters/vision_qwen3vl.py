@@ -23,10 +23,24 @@ from __future__ import annotations
 import base64
 import json
 import os
-from typing import Any
+from typing import Any, TypedDict
 
 import aiohttp
 from loguru import logger
+
+
+# ── 型エイリアス ──────────────────────────────────────────────────────────
+class ParseSceneResult(TypedDict):
+    """parse_scene() の戻り値スキーマ (Phase G で joint_attention 側と整合予定)。
+
+    Attributes:
+        description: 1 文の日本語シーン記述。失敗時は空文字。
+        entities: 画像内の主要物体名 (最大 8 件) リスト。失敗時は空リスト。
+    """
+
+    description: str
+    entities: list[str]
+
 
 # ── 設定 ─────────────────────────────────────────────────────────────────
 # .env 上書き可能なエンドポイント / モデル名。デフォルトはメイン PC を想定。
@@ -69,6 +83,14 @@ def _build_messages(image_bytes: bytes, prompt: str) -> list[dict[str, Any]]:
     フィールドに多言語混在で出力される (Phase C-1 実機検証で判明)。
     qwen3 公式の thinking 無効化指示である ``/no_think`` プレフィックスを
     user_text 先頭に付与して、content に直接日本語応答を出させる。
+
+    Note:
+        戻り型は ``list[dict[str, Any]]`` のまま。OpenAI ChatCompletion
+        message スキーマは ``content`` が ``str`` / ``list[dict]`` の union
+        になっており、さらに ``type`` 別のキー差分 (text / image_url /
+        audio_url 等) が多いため、TypedDict 化すると caller 側で TYPE_CHECKING
+        分岐が増えてしまう。Phase G で OpenAI SDK の ``ChatCompletionMessageParam``
+        相当の Pydantic 化を検討するまで Any を維持する。
     """
     b64 = base64.b64encode(image_bytes).decode("ascii")
     image_url = f"data:image/jpeg;base64,{b64}"
@@ -158,16 +180,19 @@ async def describe_scene(image_bytes: bytes, prompt: str = "") -> str:
     return await _post_chat(messages)
 
 
-async def parse_scene(image_bytes: bytes) -> dict[str, Any]:
+async def parse_scene(image_bytes: bytes) -> ParseSceneResult:
     """画像から構造化シーン情報 (description + entities) を抽出する。
 
     Args:
         image_bytes: JPEG/PNG エンコード済みの画像 bytes。
 
     Returns:
-        ``{"description": str, "entities": list[str]}`` 形式の dict。
+        ``ParseSceneResult`` TypedDict
+        (``{"description": str, "entities": list[str]}`` 互換)。
         失敗時は ``{"description": "", "entities": []}`` を返す
         (Phase G で joint_attention.ingest_scene_parse 側で確定スキーマ予定)。
+        ``dict[str, Any]`` として読みたい caller も従来通り
+        ``result["description"]`` でアクセス可能。
 
     TODO(phase-g): qwen3-vl:4b は JSON 構造化指示があると ``/no_think`` を
     上書きして thinking mode を強制発動し、content が空 / reasoning に出力する
@@ -175,7 +200,7 @@ async def parse_scene(image_bytes: bytes) -> dict[str, Any]:
     Phase G で joint_attention 統合時に reasoning fallback / Ollama ネイティブ
     ``/api/chat`` の ``think: false`` / qwen3-vl:8b への切替を再評価する。
     """
-    fallback: dict[str, Any] = {"description": "", "entities": []}
+    fallback: ParseSceneResult = {"description": "", "entities": []}
     if not image_bytes:
         logger.warning("vision_qwen3vl.parse_scene: empty image_bytes")
         return fallback

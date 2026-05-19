@@ -51,11 +51,28 @@ import os
 import re
 import shutil
 import wave
-from typing import Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable
+from typing import TypedDict
 from urllib.parse import quote
 
 import aiohttp
 from loguru import logger
+
+
+# ── 型エイリアス ──────────────────────────────────────────────────────────
+class _SilenceEvent(TypedDict):
+    """ffmpeg silencedetect filter の 1 イベントを表す内部 dict。
+
+    Attributes:
+        event: ``"start"`` (無音開始) または ``"end"`` (無音終了)。
+        time: イベント発生時刻 (秒、ffmpeg の入力時刻軸)。
+        duration: ``"end"`` 時のみ silence_duration 値 (秒)。
+            ``"start"`` または duration 欠落時は ``None``。
+    """
+
+    event: str
+    time: float
+    duration: float | None
 
 # ── 設定 (環境変数で上書き可能、ハードコード禁止) ────────────────────────────
 _DEFAULT_BASE_URL = "http://192.168.10.104:8765/transcribe"
@@ -155,7 +172,7 @@ def _get_ffmpeg_restart_backoff_sec() -> float:
 # ── RTSP URL 組み立て / マスク ─────────────────────────────────────────────
 
 
-def _get_rtsp_url() -> Optional[str]:
+def _get_rtsp_url() -> str | None:
     """STT_RTSP_URL が設定されていればそれを優先、未設定なら CAMERA_* から組み立て。
 
     優先順:
@@ -357,11 +374,12 @@ def _build_ffmpeg_rtsp_cmd(
     ]
 
 
-def _parse_silencedetect_line(line: str) -> Optional[dict]:
+def _parse_silencedetect_line(line: str) -> _SilenceEvent | None:
     """ffmpeg stderr 1 行を見て silence_start / silence_end を抽出。
 
     Returns:
-        マッチした場合: ``{"event": "start"|"end", "time": float, "duration": float|None}``
+        マッチした場合: ``_SilenceEvent`` TypedDict
+        (``{"event": "start"|"end", "time": float, "duration": float|None}``)。
         マッチしなければ None。
     """
     if not line:
@@ -374,7 +392,7 @@ def _parse_silencedetect_line(line: str) -> Optional[dict]:
         t = float(m.group(2))
     except (TypeError, ValueError):
         return None
-    duration: Optional[float] = None
+    duration: float | None = None
     if m.group(3):
         try:
             duration = float(m.group(3))
@@ -539,8 +557,8 @@ async def _run_one_ffmpeg_session(
 
     pcm_buffer = bytearray()
     flush_event = asyncio.Event()
-    pcm_task: Optional[asyncio.Task] = None
-    err_task: Optional[asyncio.Task] = None
+    pcm_task: asyncio.Task[None] | None = None
+    err_task: asyncio.Task[None] | None = None
     try:
         assert proc.stdout is not None and proc.stderr is not None
         pcm_task = asyncio.create_task(
@@ -631,12 +649,12 @@ async def _subscription_loop(
 
 async def start_rtsp_subscription(
     on_speech: Callable[[str], Awaitable[None]],
-    rtsp_url: Optional[str] = None,
+    rtsp_url: str | None = None,
     *,
     vad_threshold: float = 0.5,
     min_silence_ms: int = 500,
     chunk_duration_ms: int = 30,
-) -> asyncio.Task:
+) -> asyncio.Task[None]:
     """Tapo C210 RTSP 音声トラックを連続購読し、発話単位で transcribe を呼ぶ常駐タスクを起動。
 
     Phase C-4 で本実装。ffmpeg silencedetect を VAD として使い、無音区間で

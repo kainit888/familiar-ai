@@ -45,12 +45,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Literal, TypeAlias
 from urllib.parse import quote, urlencode
 
 import aiohttp
 from loguru import logger
+
+# ── 型エイリアス ──────────────────────────────────────────────────────────
+# 感情 dict は ``{"valence": 0.0-1.0, "arousal": 0.0-1.0, ...}`` 形式。
+# Phase E (感情 3 値実装) で具体的なキーを TypedDict 化する想定。
+EmotionDict: TypeAlias = dict[str, float]
+
+# speak() の target 値域 (再生先メタ情報、実再生は呼び出し側責務)。
+SpeakTarget: TypeAlias = Literal["discord_vc", "local_speaker"]
+
+# play_with_fallback() の target 値域 (フォールバックチェーン選択用)。
+PlayTarget: TypeAlias = Literal["auto", "tapo_speaker", "main_pc", "rpi5"]
+
+# バックエンド (WAV bytes を受け取り再生成否を bool で返す async コーラブル)。
+_BackendCallable: TypeAlias = Callable[[bytes], Awaitable[bool]]
 
 # ── 設定 (環境変数で上書き可能、ハードコード禁止) ────────────────────────────
 _DEFAULT_BASE_URL = "http://192.168.10.104:5000"
@@ -214,7 +229,7 @@ def _split_chunks(text: str) -> list[str]:
 # ── emotion → style_weight ────────────────────────────────────────────────
 
 
-def _emotion_to_style_weight(emotion: dict[str, Any] | None) -> float:
+def _emotion_to_style_weight(emotion: EmotionDict | None) -> float:
     """emotion dict から SBV2 の style_weight (-1.0〜+1.0 目安) を導出。
 
     Phase C-3 では保守的デフォルト (valence のみ参照、arousal は将来用)。
@@ -235,7 +250,7 @@ def _emotion_to_style_weight(emotion: dict[str, Any] | None) -> float:
 def _build_query(
     text: str,
     speaker_id: int,
-    emotion: dict[str, Any] | None,
+    emotion: EmotionDict | None,
 ) -> str:
     """SBV2 GET /voice 用クエリ文字列を組み立てる。
 
@@ -324,8 +339,8 @@ async def _warmup_once() -> None:
 async def speak(
     text: str,
     speaker_id: int = 0,
-    emotion: dict[str, Any] | None = None,
-    target: str = "discord_vc",
+    emotion: EmotionDict | None = None,
+    target: SpeakTarget | str = "discord_vc",
 ) -> bytes:
     """テキストを Style-BERT-VITS2 に投げて WAV bytes を返す (設計書 7-2 章)。
 
@@ -337,6 +352,8 @@ async def speak(
             ``None`` のときは中立。
         target: 再生先のメタ情報 (``"discord_vc"`` または ``"local_speaker"``)。
             実際の再生は呼び出し側 (Phase D Discord bridge) の責務。
+            型は ``SpeakTarget`` リテラルだが、後方互換のため未知の str も受理し、
+            その場合は ``"discord_vc"`` にフォールバックする。
 
     Returns:
         連結された WAV bytes。失敗時は空 bytes (例外は投げない)。
@@ -635,7 +652,7 @@ async def _play_via_go2rtc(wav_bytes: bytes) -> bool:
                 pass
 
 
-_BACKENDS: dict[str, Any] = {
+_BACKENDS: dict[str, _BackendCallable] = {
     "tapo_speaker": _play_via_go2rtc,
     "main_pc": _play_via_main_pc,
     "rpi5": _play_via_rpi5,
@@ -647,9 +664,9 @@ _BACKENDS: dict[str, Any] = {
 
 async def play_with_fallback(
     text: str,
-    target: str = "auto",
+    target: PlayTarget | str = "auto",
     speaker_id: int = 0,
-    emotion: dict[str, Any] | None = None,
+    emotion: EmotionDict | None = None,
 ) -> tuple[bool, str]:
     """WAV bytes 取得 + 物理再生まで実行し、フォールバックチェーンを回す。
 
@@ -660,6 +677,8 @@ async def play_with_fallback(
         target: 再生先指定。
             ``"tapo_speaker"`` / ``"main_pc"`` / ``"rpi5"``: 単一バックエンド試行。
             ``"auto"``: tapo_speaker → main_pc → rpi5 の順に試行。
+            型は ``PlayTarget`` リテラルだが、後方互換のため未知の str も受理し、
+            その場合は ``"auto"`` チェーンにフォールバックする。
         speaker_id: SBV2 speaker ID。
         emotion: 感情 dict (valence/arousal)。
 
