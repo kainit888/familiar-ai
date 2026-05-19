@@ -7,7 +7,76 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
-## [Unreleased] — Stage 2 Phase C-1 完了 + 外出期間 (2026-05-21 帰宅予定時点)
+## [Unreleased] — Stage 2 Phase C-4 完了 (2026-05-19)
+
+### Added (Phase C-4)
+
+- `src/pico_agent/adapters/stt_kotoba.py`: `start_rtsp_subscription()` を
+  **ffmpeg silencedetect ベースで本実装**。Phase C-1 のスケルトン (no-op) を置換。
+  - VAD バックエンド: planner 確定で ffmpeg silencedetect 採用 (Phase C-3 で確定した
+    `/usr/bin/ffmpeg` v7.1.3 をそのまま使う、追加 uv add 不要)
+  - 1 ffmpeg プロセスから 2 出力フォーク: stdout に PCM s16le、stderr に silencedetect
+  - `silence_end` イベントで PCM バッファを flush → `_wrap_pcm_to_wav` で WAV にラップ
+    → `transcribe()` で書き起こし → `on_speech` callback 呼び出し
+  - `STT_VAD_MAX_SEGMENT_SEC` (default 15s) 超過は強制 flush
+  - `STT_VAD_MIN_SEGMENT_SEC` (default 0.3s) 未満は捨てる (ノイズ扱い)
+  - ffmpeg 異常終了は `STT_FFMPEG_RESTART_BACKOFF_SEC` (default 5s) 待って再接続
+  - cancel 時は ffmpeg を terminate → 3 秒待って kill、残った PCM は最後に 1 回 emit
+  - RTSP URL: `STT_RTSP_URL` 優先、未設定なら `CAMERA_*` から組み立て、パスワードは URL-encode
+  - ログ用 `_mask_rtsp_url()` で `rtsp://***@host/path` にマスク
+
+### Changed (Phase C-4)
+
+- 既存テスト 2 件を Phase C-4 の挙動に合わせて置換 (件数は据え置き):
+  - `..._no_vad_returns_noop_task` → `..._no_vad_backend_returns_noop_task`
+    (silero-vad monkeypatch → `STT_VAD_BACKEND=disabled` に変更)
+  - `..._all_deps_present_still_noop` → `..._invokes_implementation_when_deps_present`
+    ("no-op で抜ける" → "本実装が走り on_speech が呼ばれる" に変更)
+- `_silero_vad_available()` は薄いラッパとして残し、現 VAD バックエンドの可用性を返す
+  (Phase C-1 を直接 monkeypatch する既存テストの後方互換維持)
+- 既存テストファイル全体に `autouse` fixture `_clean_rtsp_env` を追加し、
+  シェル環境変数の `CAMERA_*` 混入から守る
+
+### Tests (Phase C-4)
+
+- `tests/test_adapter_stt_kotoba.py`: 33 件 → 74 件 (+41 件、内 2 件はリネーム+中身置換)
+  - `_build_ffmpeg_rtsp_cmd` (5 件): コマンド構成検証
+  - `_parse_silencedetect_line` (6 件): silencedetect 出力パース検証
+  - `_wrap_pcm_to_wav` (3 件): WAV ヘッダ生成検証
+  - `_emit_segment` (5 件): セグメント emit + silent fail 検証
+  - env 値 (10 件): デフォルト・上書き・無効値フォールバック
+  - RTSP URL 組み立て (4 件): CAMERA_* / STT_RTSP_URL 優先 / 部分 env / 記号 encode
+  - URL マスク (2 件): 認証情報マスク / 認証なし URL は素通し
+  - VAD backend (2 件): ffmpeg 可用性 / 未知バックエンドは False
+  - `_subscription_loop` シナリオ (5 件): silence_end emit / 強制 flush / 短セグメント drop / cancel terminate / EOF 再起動
+
+- pytest 件数: 1217 → 1258 (+41 件、グリーン維持)
+
+### Configuration (Phase C-4)
+
+- `.env.example` に新規 7 キー追記 (`.env` 本体への書き込みは禁止):
+  - `STT_RTSP_URL` (完全上書き用)
+  - `STT_VAD_BACKEND` (default: `ffmpeg`)
+  - `STT_VAD_NOISE_DB` (default: `-30dB`)
+  - `STT_VAD_MIN_SILENCE_SEC` (default: `0.5`)
+  - `STT_VAD_MAX_SEGMENT_SEC` (default: `15.0`)
+  - `STT_VAD_MIN_SEGMENT_SEC` (default: `0.3`)
+  - `STT_FFMPEG_RESTART_BACKOFF_SEC` (default: `5.0`)
+
+### Documentation (Phase C-4)
+
+- `docs/phase_c4_migration_notes.md`: 移行ノート新規追加
+- `docs/test_baseline.md`: 件数 1258 件に更新
+
+### Deferred (Phase D へ持ち越し)
+
+- `react_loop.py` / `agent.py` から `start_rtsp_subscription` を呼ぶ結線処理は
+  Phase D で別チケット。Phase C-4 では adapter 層と関連テストのみ。
+- systemd 再起動チェック (`pico_v3.service` restart) はカイニット帰宅後手動実施。
+
+---
+
+## [Pre-Phase-C-4] — Stage 2 Phase C-3 完了 (2026-05-19)
 
 ### Added (新規追加)
 
