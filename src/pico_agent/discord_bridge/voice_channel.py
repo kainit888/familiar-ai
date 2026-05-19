@@ -18,7 +18,33 @@ from .availability import DiscordDisabledError, is_discord_available
 class VoiceChannelState(Enum):
     """VC リスナの状態遷移。
 
-    DISCONNECTED → JOINING → LISTENING → SPEAKING ⇆ LISTENING → LEAVING
+    ::
+
+        ┌──────────────┐
+        │ DISCONNECTED │ ◄──────────────────────────────┐
+        └──────┬───────┘                                │
+               │ join(channel_id, client)               │
+               ▼                                        │
+        ┌──────────────┐                                │
+        │   JOINING    │ ── 失敗 ──────────────────────►┤
+        └──────┬───────┘                                │
+               │ channel.connect() 成功                 │
+               ▼                                        │
+        ┌──────────────┐  ─── speak(text) ───►  ┌──────────────┐
+        │  LISTENING   │                        │   SPEAKING   │
+        └──────┬───────┘  ◄── finally ────────  └──────────────┘
+               │ leave()
+               ▼
+        ┌──────────────┐
+        │   LEAVING    │ ── disconnect 完了 ────────────┐
+        └──────────────┘                                │
+                                                        ▼
+                                                (DISCONNECTED へ戻る)
+
+    遷移の不変条件:
+        - LISTENING ⇆ SPEAKING は ``speak()`` の try/finally で必ず復元される
+        - LEAVING は ``leave()`` 内のごく短期 (disconnect の await 中) でのみ滞在
+        - JOINING で失敗した場合は直接 DISCONNECTED に戻す (LEAVING は経由しない)
     """
 
     DISCONNECTED = "disconnected"
@@ -72,6 +98,10 @@ class VoiceChannelListener:
             channel_id: 接続先 Discord VC チャンネル ID。
             client: discord.Client インスタンス (PicoBot._client を渡す想定)。
                 None なら DiscordDisabledError。
+                型は ``Any`` だが、これは discord.py が **lazy import** されるため
+                discord.Client を import 時点で参照できないことに起因する。実体は
+                ``discord.Client`` (Phase D で uv add 済み)。Phase D 本実装で
+                ``TYPE_CHECKING`` ブロック付きの Protocol 化を検討する。
 
         Returns:
             参加成功なら True、チャンネル取得失敗なら False。
@@ -147,6 +177,13 @@ class VoiceChannelListener:
 
         voice_client が接続済みなら discord.FFmpegPCMAudio で再生。
         VAD 受信や送信中バッファ等の詳細は帰宅後の本番接続テストで詰める。
+
+        状態遷移:
+            前提: ``self._state == LISTENING`` でないと早期 return False
+                  (ピコが既に喋っている / VC 未参加なら新規再生は受け付けない)。
+            遷移: ``LISTENING → SPEAKING`` を try 開始直後にセットし、
+                  ``finally`` で必ず ``SPEAKING → LISTENING`` に戻す。
+                  TTS 失敗 / 再生失敗の例外パスでも復帰は保証される。
 
         Returns:
             再生成功なら True、VC 未接続 / TTS 失敗 / 再生失敗で False。
@@ -230,6 +267,14 @@ class VoiceChannelListener:
 
         Phase C-1 では「stt_callable を呼んで on_speech_detected を呼ぶ」
         フローのテストだけ可能。
+
+        Phase D 持ち越し範囲 (本実装で追加するもの):
+            - discord-ext-voice-recv による PCM chunk 受信フックの実装
+              (この関数を呼び出す側)。現状は単体テストから直接 await して
+              フローを検証するのみ。
+            - user_id 別バッファリング (複数人 VC 想定、現状は単一発話前提)。
+            - VAD (silero / webrtcvad) と無音判定 (stt_kotoba と共通化検討)。
+            - 同一発話中の重複転写抑制 (50% overlap window 等)。
         """
         if self.stt_callable is None:
             logger.warning("voice_channel._on_audio_chunk: stt_callable not configured")

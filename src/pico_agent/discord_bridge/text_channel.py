@@ -114,11 +114,20 @@ def incoming_message_from_discord(msg: Any) -> IncomingMessage:
     Raises:
         AttributeError: 必要な属性が欠けている場合。
     """
+    # author.id: discord.User.id (Snowflake int)。OWNER_ID 照合の主キー。
     author_id = int(msg.author.id)
+    # author.bot: discord.User.bot。bot 同士の発話ループを防ぐためここで分離する。
+    # 属性欠落時は False (安全側、ピコは通常ユーザー扱いで処理)。
     author_is_bot = bool(getattr(msg.author, "bot", False))
+    # guild: DM (1 対 1) の場合は None になる。DM はピコの応答対象外なので
+    # guild_id=None として TextChannelHandler.should_handle 側で弾く。
     guild = getattr(msg, "guild", None)
     guild_id = int(guild.id) if guild is not None else None
+    # channel.id: 応答送信先 (PicoBot.send_message) と紐づけるためのキー。
+    # TextChannel / VoiceChannel どちらも .id を持つので channel 種別問わず取れる。
     channel_id = int(msg.channel.id)
+    # content: MESSAGE_CONTENT privileged intent が無効だと空文字になる。
+    # ``or ""`` で None 防御 (Embed-only メッセージで None を返す実装に対する保険)。
     content = str(getattr(msg, "content", "") or "")
 
     return IncomingMessage(

@@ -79,10 +79,18 @@ def _build_intents() -> Any:
     import discord  # type: ignore
 
     intents = discord.Intents.default()
-    intents.message_content = True  # MESSAGE CONTENT INTENT (Privileged)
+    # message_content: テキストメッセージの本文を読み取る (privileged intent;
+    # Developer Portal の "MESSAGE CONTENT INTENT" を有効化しないと無効)。
+    intents.message_content = True
+    # guilds: 所属サーバ (Guild) 情報の購読。GUILD_ID フィルタでピコの応答対象
+    # サーバを限定するために必要。
     intents.guilds = True
+    # voice_states: VC 入退室 (on_voice_state_update) を検出する。Phase D voice
+    # channel ハンドラがピコの VC 自動参加判定に使う。
     intents.voice_states = True
-    intents.members = True  # OWNER 判定のため
+    # members: サーバメンバー情報の購読 (privileged intent)。OWNER_ID と
+    # message.author.id を照合する boundary 判定に必要。
+    intents.members = True
     return intents
 
 
@@ -107,6 +115,11 @@ def _build_client(intents: Any, on_ready: Callable[[], Awaitable[None]]) -> Any:
 
     client = discord.Client(intents=intents)
 
+    # TODO(phase-d-prod): _build_client は Phase D 本実装で `PicoBot._attach_event_handlers`
+    # に統合する想定。現状は on_ready ハンドラを 1 段ネスト関数 (on_ready_handler) で
+    # ラップしているため mypy が `name "on_ready" already defined` を 1 件出す
+    # (ベースラインに含まれている既知エラー)。Phase D 本実装でこのファクトリ関数自体を
+    # PicoBot.start() に吸収するため、ここでは構造を変えずベースラインを維持する。
     @client.event  # type: ignore[misc]
     async def on_ready() -> None:  # noqa: D401
         """Discord 接続完了時のハンドラ (内部実装)。"""
@@ -146,9 +159,16 @@ class PicoBot:
         self.token = _load_bot_token()
         self.owner_id = _load_owner_id()
         self.guild_id = _load_guild_id()
+        # 状態遷移: False (初期) → True (on_ready 受信) → False (start() 終了 or stop())。
         self._is_running = False
-        self._client: Any = None  # discord.Client インスタンス (start 時に設定)
+        # discord.Client インスタンス。start() で生成、stop() で None に戻す。
+        # 未起動 (None) のときに send_message 等を呼ぶと DiscordDisabledError。
+        self._client: Any = None
+        # text 受信のハンドラ (boundary + on_text_message 呼び出し)。
+        # __init__ 引数で渡されなければ _ensure_text_handler() で遅延構築。
         self._text_channel_handler = text_channel_handler
+        # start_in_background() で生成する asyncio.Task。
+        # None | 実行中 Task | 完了済み Task の 3 状態。
         self._start_task: asyncio.Task | None = None
 
     @property
@@ -187,6 +207,10 @@ class PicoBot:
         """
         from .text_channel import incoming_message_from_discord
 
+        # discord.py の @client.event デコレータは関数を直接登録するため、
+        # ハンドラ内から PicoBot インスタンスを参照したい場合はクロージャ経由になる。
+        # `self` を直接書くと型推論で discord.Client メソッド扱いされるケースを避けるため、
+        # 明示的に bot_self 別名にバインドしてから参照する。
         bot_self = self
 
         @client.event  # type: ignore[misc]
@@ -304,9 +328,13 @@ class PicoBot:
             logger.warning("PicoBot.send_message: empty content, skipping")
             return False
         try:
+            # まずローカルキャッシュから引く (同期 API、HTTP 不要)。
+            # 直近 on_message 等で扱ったチャンネルなら 99% こちらでヒットする。
             channel = self._client.get_channel(channel_id)
             if channel is None:
-                # キャッシュにない時は fetch_channel
+                # キャッシュ未ヒット時のみ Discord REST API に問い合わせる
+                # (HTTP 1 往復のコストがあるためフォールバックに留める)。
+                # 自律発話 (heartbeat) など長時間ピコが沈黙したケースで必要になる。
                 channel = await self._client.fetch_channel(channel_id)
             await channel.send(content)
             return True
