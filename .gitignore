@@ -4,6 +4,10 @@ ME.md
 # Environment & secrets
 .env
 *.env
+.env.before_*
+
+# Personal/session logs (do not commit)
+docs/birthday_*.log
 
 # Python
 __pycache__/
