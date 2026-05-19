@@ -20,6 +20,7 @@ from pico_agent.discord_bridge import (
     VoiceChannelListener,
     is_discord_available,
 )
+from pico_agent.discord_bridge.availability import last_import_error
 from pico_agent.discord_bridge.text_channel import IncomingMessage
 from pico_agent.discord_bridge.voice_channel import VoiceChannelState
 
@@ -42,6 +43,26 @@ def test_discord_disabled_error_has_default_message():
     """例外を引数なしで上げた時にデフォルトメッセージが入る。"""
     e = DiscordDisabledError()
     assert "Phase D" in str(e) or "discord.py" in str(e)
+
+
+def test_discord_disabled_error_accepts_custom_message():
+    """例外コンストラクタに任意メッセージを渡せる (Phase D で接続失敗詳細を載せる前提)。"""
+    e = DiscordDisabledError("custom: voice client missing")
+    assert "custom: voice client missing" in str(e)
+
+
+def test_last_import_error_consistent_with_availability():
+    """last_import_error() は is_discord_available() の直近結果と整合する。
+
+    - 利用可能なら None、利用不可なら非空 str (どちらも本実装で許容)。
+    - 公開診断 API として例外を投げず一貫した型を返すことを保証。
+    """
+    available = is_discord_available()
+    err = last_import_error()
+    if available:
+        assert err is None
+    else:
+        assert isinstance(err, str) and len(err) > 0
 
 
 # ── PicoBot ─────────────────────────────────────────────────────────────
