@@ -45,6 +45,8 @@ DEFAULT_TTS_CHUNK_DELAY_MS = 0
 DEFAULT_TTS_PLAYBACK_STABLE_THRESHOLD = 3
 DEFAULT_TTS_PLAYBACK_MAX_WAIT_MS = 10000
 DEFAULT_TTS_PLAYBACK_POLL_INTERVAL_MS = 100
+DEFAULT_TTS_PLAYBACK_GRACE_MS = 800
+DEFAULT_TTS_PLAYBACK_FINAL_GRACE_MS = 1200
 _TTS_PUNCT = "。、！？!?.,"
 
 
@@ -74,6 +76,37 @@ def _extract_consumers(payload: object, stream_name: str) -> list[dict] | None:
     return None
 
 
+def _extract_consumers_with_pattern(
+    payload: object, stream_name: str
+) -> tuple[list[dict] | None, str]:
+    """``_extract_consumers`` と同じだが、ヒットしたパターン名も返す (debug 用)。
+
+    pattern: "direct" | "streams_map" | "top_level_map" | "missing" | "invalid_root"
+    """
+    if not isinstance(payload, dict):
+        return None, "invalid_root"
+    if "consumers" in payload:
+        c = payload.get("consumers")
+        if isinstance(c, list):
+            return c, "direct"
+        return None, "direct_invalid"
+    streams = payload.get("streams")
+    if isinstance(streams, dict) and stream_name in streams:
+        inner = streams[stream_name]
+        if isinstance(inner, dict):
+            c = inner.get("consumers")
+            if isinstance(c, list):
+                return c, "streams_map"
+            return None, "streams_map_invalid"
+    inner = payload.get(stream_name)
+    if isinstance(inner, dict):
+        c = inner.get("consumers")
+        if isinstance(c, list):
+            return c, "top_level_map"
+        return None, "top_level_map_invalid"
+    return None, "missing"
+
+
 def _sum_sender_bytes(consumers: list[dict]) -> int:
     """全 consumer の senders[i].bytes を合計。bytes が無い/int で無い sender は 0 扱い。"""
     total = 0
@@ -101,8 +134,22 @@ async def _wait_for_playback_done(
     max_wait_ms: int,
     stable_threshold: int,
     poll_interval_ms: int,
-) -> bool:
-    """go2rtc /api/streams?src=<stream_name> を GET ポーリングして再生完了を待つ。"""
+) -> tuple[bool, str]:
+    """go2rtc /api/streams?src=<stream_name> を GET ポーリングして再生完了を待つ。
+
+    Returns:
+        ``(done, reason)`` のタプル。
+
+        - ``done``: ``True`` なら「これ以上待つ必要なし」、``False`` は timeout (= 強制終了)。
+        - ``reason``: 終了理由を表す文字列。以下のいずれか:
+
+          * ``"timeout"``         — ``max_wait_ms`` 経過 (done=False)
+          * ``"http_error"``      — go2rtc が HTTP non-200 を返した
+          * ``"exception"``       — リクエストが例外を投げた
+          * ``"consumers_none"``  — レスポンスから consumers を抽出できなかった
+          * ``"consumers_empty"`` — consumers リストが空 = 再生完了
+          * ``"stable"``          — bytes が stable_threshold 回連続不変 = 完了
+    """
     api_url = (
         f"{go2rtc_base_url.rstrip('/')}/api/streams"
         f"?src={quote(stream_name)}"
@@ -111,14 +158,34 @@ async def _wait_for_playback_done(
     initial_sleep_ms = min(poll_interval_ms, 200)
     await asyncio.sleep(initial_sleep_ms / 1000.0)
 
-    deadline = time.monotonic() + max_wait_ms / 1000.0
+    start_time = time.monotonic()
+    deadline = start_time + max_wait_ms / 1000.0
     get_timeout = aiohttp.ClientTimeout(total=2.0)
     prev_bytes: int | None = None
     stable_count = 0
+    iter_n = 0
+
+    logger.debug(
+        "wait[start] stream={} max_wait_ms={} stable_threshold={} "
+        "poll_interval_ms={} initial_sleep_ms={}",
+        stream_name,
+        max_wait_ms,
+        stable_threshold,
+        poll_interval_ms,
+        initial_sleep_ms,
+    )
 
     while True:
+        iter_n += 1
+        elapsed_ms = (time.monotonic() - start_time) * 1000.0
         if time.monotonic() >= deadline:
-            return False
+            logger.debug(
+                "wait[end] reason=timeout stream={} iter={} elapsed_ms={:.0f}",
+                stream_name,
+                iter_n,
+                elapsed_ms,
+            )
+            return (False, "timeout")
         try:
             async with session.get(api_url, timeout=get_timeout) as resp:
                 if resp.status != 200:
@@ -127,23 +194,75 @@ async def _wait_for_playback_done(
                         resp.status,
                         api_url,
                     )
-                    return True
+                    logger.debug(
+                        "wait[end] reason=http_error stream={} status={} iter={}",
+                        stream_name,
+                        resp.status,
+                        iter_n,
+                    )
+                    return (True, "http_error")
                 payload = await resp.json()
         except Exception as e:
             logger.warning("_wait_for_playback_done: request failed: {}", e)
-            return True
+            logger.debug(
+                "wait[end] reason=exception stream={} err={!r} iter={}",
+                stream_name,
+                e,
+                iter_n,
+            )
+            return (True, "exception")
 
-        consumers = _extract_consumers(payload, stream_name)
-        if consumers is None or len(consumers) == 0:
-            return True
+        consumers, pattern = _extract_consumers_with_pattern(payload, stream_name)
+        elapsed_ms = (time.monotonic() - start_time) * 1000.0
+        if consumers is None:
+            logger.debug(
+                "wait[end] reason=consumers_none stream={} pattern={} iter={} "
+                "elapsed_ms={:.0f}",
+                stream_name,
+                pattern,
+                iter_n,
+                elapsed_ms,
+            )
+            return (True, "consumers_none")
+        if len(consumers) == 0:
+            logger.debug(
+                "wait[end] reason=consumers_empty stream={} pattern={} iter={} "
+                "elapsed_ms={:.0f}",
+                stream_name,
+                pattern,
+                iter_n,
+                elapsed_ms,
+            )
+            return (True, "consumers_empty")
 
         current = _sum_sender_bytes(consumers)
         if prev_bytes is not None and current == prev_bytes:
             stable_count += 1
             if stable_count >= stable_threshold:
-                return True
+                logger.debug(
+                    "wait[end] reason=stable stream={} bytes={} iter={} "
+                    "elapsed_ms={:.0f}",
+                    stream_name,
+                    prev_bytes,
+                    iter_n,
+                    elapsed_ms,
+                )
+                return (True, "stable")
         else:
             stable_count = 0
+        logger.debug(
+            "wait[iter={}] stream={} pattern={} consumers_len={} current_bytes={} "
+            "prev_bytes={} stable_count={}/{} elapsed_ms={:.0f}",
+            iter_n,
+            stream_name,
+            pattern,
+            len(consumers),
+            current,
+            prev_bytes,
+            stable_count,
+            stable_threshold,
+            elapsed_ms,
+        )
         prev_bytes = current
 
         await asyncio.sleep(poll_interval_ms / 1000.0)
@@ -337,6 +456,24 @@ async def speak_to_tapo(
         )
     except ValueError:
         poll_interval_ms = DEFAULT_TTS_PLAYBACK_POLL_INTERVAL_MS
+    try:
+        grace_ms = int(
+            os.environ.get(
+                "TTS_PLAYBACK_GRACE_MS",
+                str(DEFAULT_TTS_PLAYBACK_GRACE_MS),
+            )
+        )
+    except ValueError:
+        grace_ms = DEFAULT_TTS_PLAYBACK_GRACE_MS
+    try:
+        final_grace_ms = int(
+            os.environ.get(
+                "TTS_PLAYBACK_FINAL_GRACE_MS",
+                str(DEFAULT_TTS_PLAYBACK_FINAL_GRACE_MS),
+            )
+        )
+    except ValueError:
+        final_grace_ms = DEFAULT_TTS_PLAYBACK_FINAL_GRACE_MS
 
     chunks = _split_text_for_tts(text, max_chars=max_chars)
     if not chunks:
@@ -345,62 +482,84 @@ async def speak_to_tapo(
 
     timeout = aiohttp.ClientTimeout(total=DEFAULT_TTS_TIMEOUT)
     all_ok = True
+    last_reason: str | None = None
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for index, chunk in enumerate(chunks):
-                voice_url = (
-                    f"{tts_base_url.rstrip('/')}/voice"
-                    f"?text={quote(chunk)}&model_name={quote(tts_model)}"
-                )
-                src = f"ffmpeg:{voice_url}#audio=pcma_pico#input=file"
-                api_url = (
-                    f"{go2rtc_base_url.rstrip('/')}/api/streams"
-                    f"?dst={quote(stream_name)}&src={quote(src)}"
-                )
-                chunk_post_ok = False
-                try:
-                    async with session.post(api_url) as resp:
-                        if resp.status >= 400:
-                            body = await resp.text()
-                            logger.warning(
-                                "speak_to_tapo: chunk {}/{} HTTP {} body={!r} text={!r}",
-                                index + 1,
-                                len(chunks),
+                with logger.contextualize(chunk_index=index, chunk_total=len(chunks)):
+                    voice_url = (
+                        f"{tts_base_url.rstrip('/')}/voice"
+                        f"?text={quote(chunk)}&model_name={quote(tts_model)}"
+                    )
+                    src = f"ffmpeg:{voice_url}#audio=pcma_pico#input=file"
+                    api_url = (
+                        f"{go2rtc_base_url.rstrip('/')}/api/streams"
+                        f"?dst={quote(stream_name)}&src={quote(src)}"
+                    )
+                    logger.debug(
+                        "speak[chunk] text={!r} api_url={}",
+                        chunk[:20],
+                        api_url,
+                    )
+                    chunk_post_ok = False
+                    try:
+                        async with session.post(api_url) as resp:
+                            if resp.status >= 400:
+                                body = await resp.text()
+                                logger.warning(
+                                    "speak_to_tapo: chunk {}/{} HTTP {} body={!r} text={!r}",
+                                    index + 1,
+                                    len(chunks),
+                                    resp.status,
+                                    body[:200],
+                                    chunk,
+                                )
+                                all_ok = False
+                            else:
+                                chunk_post_ok = True
+                            logger.debug(
+                                "speak[chunk] post_status={} chunk_post_ok={}",
                                 resp.status,
-                                body[:200],
-                                chunk,
+                                chunk_post_ok,
                             )
-                            all_ok = False
-                        else:
-                            chunk_post_ok = True
-                except Exception as e:
-                    logger.warning(
-                        "speak_to_tapo: chunk {}/{} request failed: {} text={!r}",
-                        index + 1,
-                        len(chunks),
-                        e,
-                        chunk,
-                    )
-                    all_ok = False
-
-                if chunk_post_ok:
-                    done = await _wait_for_playback_done(
-                        session,
-                        go2rtc_base_url=go2rtc_base_url,
-                        stream_name=stream_name,
-                        max_wait_ms=max_wait_ms,
-                        stable_threshold=stable_threshold,
-                        poll_interval_ms=poll_interval_ms,
-                    )
-                    if not done:
+                    except Exception as e:
                         logger.warning(
-                            "speak_to_tapo: chunk {}/{} playback wait timed out",
+                            "speak_to_tapo: chunk {}/{} request failed: {} text={!r}",
                             index + 1,
                             len(chunks),
+                            e,
+                            chunk,
                         )
+                        all_ok = False
 
-                if delay_ms > 0 and index < len(chunks) - 1:
-                    await asyncio.sleep(delay_ms / 1000.0)
+                    if chunk_post_ok:
+                        done, reason = await _wait_for_playback_done(
+                            session,
+                            go2rtc_base_url=go2rtc_base_url,
+                            stream_name=stream_name,
+                            max_wait_ms=max_wait_ms,
+                            stable_threshold=stable_threshold,
+                            poll_interval_ms=poll_interval_ms,
+                        )
+                        last_reason = reason
+                        if reason == "stable" and grace_ms > 0:
+                            await asyncio.sleep(grace_ms / 1000.0)
+                        logger.debug(
+                            "speak[chunk] wait_done={} reason={}", done, reason
+                        )
+                        if not done:
+                            logger.warning(
+                                "speak_to_tapo: chunk {}/{} playback wait timed out",
+                                index + 1,
+                                len(chunks),
+                            )
+
+                    if delay_ms > 0 and index < len(chunks) - 1:
+                        logger.debug("speak[chunk] inter_chunk_sleep_ms={}", delay_ms)
+                        await asyncio.sleep(delay_ms / 1000.0)
+            if last_reason == "stable" and final_grace_ms > 0:
+                logger.debug("speak[final_grace] sleep_ms={}", final_grace_ms)
+                await asyncio.sleep(final_grace_ms / 1000.0)
     except Exception as e:
         logger.warning("speak_to_tapo: session failed: {}", e)
         return False
@@ -478,6 +637,14 @@ async def _conversation_loop(
 
 async def _amain() -> None:
     load_dotenv()
+
+    log_level = os.environ.get("LOGURU_LEVEL", "INFO")
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=log_level,
+        format="{time:HH:mm:ss.SSS} | {level} | {message} | {extra}",
+    )
 
     rtsp_url = os.environ.get("STT_RTSP_URL", "")
     stt_url = os.environ.get("STT_BASE_URL", "")

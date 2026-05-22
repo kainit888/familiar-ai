@@ -29,6 +29,8 @@ def _clean_tts_chunk_env(monkeypatch):
         "TTS_PLAYBACK_STABLE_THRESHOLD",
         "TTS_PLAYBACK_MAX_WAIT_MS",
         "TTS_PLAYBACK_POLL_INTERVAL_MS",
+        "TTS_PLAYBACK_GRACE_MS",
+        "TTS_PLAYBACK_FINAL_GRACE_MS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -462,6 +464,25 @@ def test_extract_consumers_invalid_types_return_none():
     assert voice_chat._extract_consumers({"streams": "not_dict"}, "s1") is None
 
 
+@pytest.mark.parametrize(
+    "payload,expected_consumers,expected_pattern",
+    [
+        ({"consumers": [{"id": 1}]}, [{"id": 1}], "direct"),
+        ({"streams": {"s1": {"consumers": [{"id": 2}]}}}, [{"id": 2}], "streams_map"),
+        ({"s1": {"consumers": [{"id": 3}]}}, [{"id": 3}], "top_level_map"),
+        ({"producers": []}, None, "missing"),
+        ("not a dict", None, "invalid_root"),
+    ],
+)
+def test_extract_consumers_with_pattern_returns_consumers_and_pattern(
+    payload, expected_consumers, expected_pattern
+):
+    """`_extract_consumers` と同じパターンを判別、かつパターン名を返す。"""
+    consumers, pattern = voice_chat._extract_consumers_with_pattern(payload, "s1")
+    assert consumers == expected_consumers
+    assert pattern == expected_pattern
+
+
 # ── _sum_sender_bytes 単体テスト ─────────────────────────────────────────────
 
 
@@ -525,7 +546,7 @@ async def test_wait_for_playback_done_returns_true_when_consumers_empty(monkeypa
     monkeypatch.setattr(voice_chat.asyncio, "sleep", AsyncMock())
     session, _ = _build_session_with_get_sequence([{"consumers": []}])
 
-    done = await voice_chat._wait_for_playback_done(
+    done, reason = await voice_chat._wait_for_playback_done(
         session,
         go2rtc_base_url="http://y:1984",
         stream_name="tapo_c210",
@@ -535,6 +556,7 @@ async def test_wait_for_playback_done_returns_true_when_consumers_empty(monkeypa
     )
 
     assert done is True
+    assert reason == "consumers_empty"
 
 
 @pytest.mark.asyncio
@@ -546,7 +568,7 @@ async def test_wait_for_playback_done_returns_true_on_stable_bytes(monkeypatch):
     ]
     session, calls = _build_session_with_get_sequence(payloads)
 
-    done = await voice_chat._wait_for_playback_done(
+    done, reason = await voice_chat._wait_for_playback_done(
         session,
         go2rtc_base_url="http://y:1984",
         stream_name="tapo_c210",
@@ -556,6 +578,7 @@ async def test_wait_for_playback_done_returns_true_on_stable_bytes(monkeypatch):
     )
 
     assert done is True
+    assert reason == "stable"
     # 5 回目までで判定 (1: 比較対象なし → prev_bytes=100, 2: 200 != 100 reset, 3: 300!=200, 4: 300==300 count=1, 5: 300==300 count=2 → 仕様: prev_bytes 初回スキップなので count は 4 と 5 で 1,2,さらに 6 回目で 3 になる)
     # 厳密には A) consumers empty 経由でも True になり得るが、本テストは bytes 安定の流れを確認
     assert calls["n"] >= 4
@@ -577,7 +600,7 @@ async def test_wait_for_playback_done_resets_stable_count_when_bytes_grow(monkey
     payloads.append({"consumers": []})
     session, calls = _build_session_with_get_sequence(payloads)
 
-    done = await voice_chat._wait_for_playback_done(
+    done, reason = await voice_chat._wait_for_playback_done(
         session,
         go2rtc_base_url="http://y:1984",
         stream_name="tapo_c210",
@@ -587,6 +610,7 @@ async def test_wait_for_playback_done_resets_stable_count_when_bytes_grow(monkey
     )
 
     assert done is True
+    assert reason == "consumers_empty"
     assert calls["n"] == 6
 
 
@@ -609,7 +633,7 @@ async def test_wait_for_playback_done_times_out(monkeypatch):
     ]
     session, _ = _build_session_with_get_sequence(payloads)
 
-    done = await voice_chat._wait_for_playback_done(
+    done, reason = await voice_chat._wait_for_playback_done(
         session,
         go2rtc_base_url="http://y:1984",
         stream_name="tapo_c210",
@@ -619,6 +643,7 @@ async def test_wait_for_playback_done_times_out(monkeypatch):
     )
 
     assert done is False
+    assert reason == "timeout"
 
 
 @pytest.mark.asyncio
@@ -627,7 +652,7 @@ async def test_wait_for_playback_done_http_error_returns_true(monkeypatch):
     monkeypatch.setattr(voice_chat.asyncio, "sleep", AsyncMock())
     session, _ = _build_session_with_get_sequence([{}], get_statuses=[500])
 
-    done = await voice_chat._wait_for_playback_done(
+    done, reason = await voice_chat._wait_for_playback_done(
         session,
         go2rtc_base_url="http://y:1984",
         stream_name="tapo_c210",
@@ -637,6 +662,7 @@ async def test_wait_for_playback_done_http_error_returns_true(monkeypatch):
     )
 
     assert done is True
+    assert reason == "http_error"
 
 
 @pytest.mark.asyncio
@@ -650,7 +676,7 @@ async def test_wait_for_playback_done_request_exception_returns_true(monkeypatch
     mock_session = MagicMock()
     mock_session.get = MagicMock(side_effect=boom)
 
-    done = await voice_chat._wait_for_playback_done(
+    done, reason = await voice_chat._wait_for_playback_done(
         mock_session,
         go2rtc_base_url="http://y:1984",
         stream_name="tapo_c210",
@@ -660,6 +686,7 @@ async def test_wait_for_playback_done_request_exception_returns_true(monkeypatch
     )
 
     assert done is True
+    assert reason == "exception"
 
 
 @pytest.mark.asyncio
@@ -702,7 +729,8 @@ async def test_speak_to_tapo_calls_wait_for_each_chunk():
     session, _ = _build_capturing_session([200, 200, 200])
 
     with patch("voice_chat.aiohttp.ClientSession", return_value=session), patch(
-        "voice_chat._wait_for_playback_done", new=AsyncMock(return_value=True)
+        "voice_chat._wait_for_playback_done",
+        new=AsyncMock(return_value=(True, "stable")),
     ) as wait_mock:
         ok = await voice_chat.speak_to_tapo(
             "一つ目。二つ目。三つ目。",
@@ -722,7 +750,8 @@ async def test_speak_to_tapo_calls_wait_after_last_chunk():
     session, _ = _build_capturing_session([200])
 
     with patch("voice_chat.aiohttp.ClientSession", return_value=session), patch(
-        "voice_chat._wait_for_playback_done", new=AsyncMock(return_value=True)
+        "voice_chat._wait_for_playback_done",
+        new=AsyncMock(return_value=(True, "stable")),
     ) as wait_mock:
         ok = await voice_chat.speak_to_tapo(
             "やあ。",
@@ -742,7 +771,8 @@ async def test_speak_to_tapo_skips_wait_when_chunk_post_fails():
     session, _ = _build_capturing_session([200, 500, 200])
 
     with patch("voice_chat.aiohttp.ClientSession", return_value=session), patch(
-        "voice_chat._wait_for_playback_done", new=AsyncMock(return_value=True)
+        "voice_chat._wait_for_playback_done",
+        new=AsyncMock(return_value=(True, "stable")),
     ) as wait_mock:
         ok = await voice_chat.speak_to_tapo(
             "一つ目。二つ目。三つ目。",
@@ -762,7 +792,8 @@ async def test_speak_to_tapo_wait_timeout_does_not_fail_function():
     session, _ = _build_capturing_session([200, 200])
 
     with patch("voice_chat.aiohttp.ClientSession", return_value=session), patch(
-        "voice_chat._wait_for_playback_done", new=AsyncMock(return_value=False)
+        "voice_chat._wait_for_playback_done",
+        new=AsyncMock(return_value=(False, "timeout")),
     ):
         ok = await voice_chat.speak_to_tapo(
             "一つ目。二つ目。",
@@ -781,7 +812,8 @@ async def test_speak_to_tapo_respects_tts_playback_max_wait_ms_env(monkeypatch):
     session, _ = _build_capturing_session([200])
 
     with patch("voice_chat.aiohttp.ClientSession", return_value=session), patch(
-        "voice_chat._wait_for_playback_done", new=AsyncMock(return_value=True)
+        "voice_chat._wait_for_playback_done",
+        new=AsyncMock(return_value=(True, "stable")),
     ) as wait_mock:
         await voice_chat.speak_to_tapo(
             "やあ。",
@@ -802,7 +834,8 @@ async def test_speak_to_tapo_invalid_env_falls_back_to_default(monkeypatch):
     session, _ = _build_capturing_session([200])
 
     with patch("voice_chat.aiohttp.ClientSession", return_value=session), patch(
-        "voice_chat._wait_for_playback_done", new=AsyncMock(return_value=True)
+        "voice_chat._wait_for_playback_done",
+        new=AsyncMock(return_value=(True, "stable")),
     ) as wait_mock:
         await voice_chat.speak_to_tapo(
             "やあ。",
@@ -815,3 +848,191 @@ async def test_speak_to_tapo_invalid_env_falls_back_to_default(monkeypatch):
     _, kwargs = wait_mock.await_args
     assert kwargs["max_wait_ms"] == voice_chat.DEFAULT_TTS_PLAYBACK_MAX_WAIT_MS
     assert kwargs["max_wait_ms"] == 10000
+
+
+# ── TTS playback grace (v4.3 サイクル 4: チャンクドロップ bug 修正) ─────────
+
+
+@pytest.mark.asyncio
+async def test_speak_to_tapo_inserts_grace_after_stable_reason(monkeypatch):
+    """reason='stable' で wait が抜けたとき、grace_ms 分の sleep が挟まる。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "500")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "0")  # final_grace は別テスト
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        voice_chat,
+        "_wait_for_playback_done",
+        AsyncMock(return_value=(True, "stable")),
+    )
+    session, _ = _build_capturing_session([200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        ok = await voice_chat.speak_to_tapo(
+            "やあ。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    assert ok is True
+    sleep_args = [c.args[0] for c in sleep_mock.call_args_list if c.args]
+    assert 0.5 in sleep_args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["consumers_empty", "consumers_none", "http_error", "exception"],
+)
+async def test_speak_to_tapo_skips_grace_for_non_stable_reasons(monkeypatch, reason):
+    """stable 以外の reason では grace_ms の sleep が呼ばれない。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "500")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "0")
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        voice_chat,
+        "_wait_for_playback_done",
+        AsyncMock(return_value=(True, reason)),
+    )
+    session, _ = _build_capturing_session([200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        await voice_chat.speak_to_tapo(
+            "やあ。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    sleep_args = [c.args[0] for c in sleep_mock.call_args_list if c.args]
+    assert 0.5 not in sleep_args
+
+
+@pytest.mark.asyncio
+async def test_speak_to_tapo_appends_final_grace_after_last_chunk(monkeypatch):
+    """3 chunk 全 stable のとき、grace_ms × 3 + final_grace_ms × 1 が sleep される。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "500")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "900")
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        voice_chat,
+        "_wait_for_playback_done",
+        AsyncMock(return_value=(True, "stable")),
+    )
+    session, _ = _build_capturing_session([200, 200, 200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        await voice_chat.speak_to_tapo(
+            "一つ目。二つ目。三つ目。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    sleep_args = [c.args[0] for c in sleep_mock.call_args_list if c.args]
+    assert sleep_args.count(0.5) == 3
+    assert sleep_args.count(0.9) == 1
+
+
+@pytest.mark.asyncio
+async def test_speak_to_tapo_skips_final_grace_when_last_chunk_not_stable(monkeypatch):
+    """最終 chunk が stable 以外の reason なら final_grace は入らない。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "0")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "900")
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        voice_chat,
+        "_wait_for_playback_done",
+        AsyncMock(return_value=(True, "consumers_empty")),
+    )
+    session, _ = _build_capturing_session([200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        await voice_chat.speak_to_tapo(
+            "やあ。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    sleep_args = [c.args[0] for c in sleep_mock.call_args_list if c.args]
+    assert 0.9 not in sleep_args
+
+
+@pytest.mark.asyncio
+async def test_speak_to_tapo_respects_tts_playback_grace_ms_env(monkeypatch):
+    """TTS_PLAYBACK_GRACE_MS=1234 → 1.234 秒の sleep が入る。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "1234")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "0")
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        voice_chat,
+        "_wait_for_playback_done",
+        AsyncMock(return_value=(True, "stable")),
+    )
+    session, _ = _build_capturing_session([200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        await voice_chat.speak_to_tapo(
+            "やあ。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    sleep_args = [c.args[0] for c in sleep_mock.call_args_list if c.args]
+    assert 1.234 in sleep_args
+
+
+@pytest.mark.asyncio
+async def test_speak_to_tapo_respects_tts_playback_final_grace_ms_env(monkeypatch):
+    """TTS_PLAYBACK_FINAL_GRACE_MS=2345 → 2.345 秒の sleep が入る (single chunk)。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "0")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "2345")
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        voice_chat,
+        "_wait_for_playback_done",
+        AsyncMock(return_value=(True, "stable")),
+    )
+    session, _ = _build_capturing_session([200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        await voice_chat.speak_to_tapo(
+            "やあ。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    sleep_args = [c.args[0] for c in sleep_mock.call_args_list if c.args]
+    assert 2.345 in sleep_args
+
+
+@pytest.mark.asyncio
+async def test_speak_to_tapo_grace_is_after_wait_not_before(monkeypatch):
+    """grace sleep は wait の "後" に呼ばれる。逆順 (前) になっていると検知。"""
+    monkeypatch.setenv("TTS_PLAYBACK_GRACE_MS", "500")
+    monkeypatch.setenv("TTS_PLAYBACK_FINAL_GRACE_MS", "0")
+    call_order: list[str] = []
+
+    async def fake_sleep(s):
+        if s == 0.5:
+            call_order.append("grace")
+
+    async def fake_wait(*a, **kw):
+        call_order.append("wait")
+        return (True, "stable")
+
+    monkeypatch.setattr(voice_chat.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(voice_chat, "_wait_for_playback_done", fake_wait)
+    session, _ = _build_capturing_session([200])
+    with patch("voice_chat.aiohttp.ClientSession", return_value=session):
+        await voice_chat.speak_to_tapo(
+            "やあ。",
+            tts_base_url="http://x",
+            tts_model="m",
+            go2rtc_base_url="http://y",
+            stream_name="z",
+        )
+    assert call_order == ["wait", "grace"]
