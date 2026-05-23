@@ -85,6 +85,38 @@ def test_system_prompt_has_suppress_meta_reasoning_constraint() -> None:
     assert "ToM" in forward
 
 
+def test_system_prompt_uses_look_direction_form() -> None:
+    """look_left / look_right / etc. (non-existent tools) must not appear in SYSTEM_PROMPT.
+
+    Only the real tool name `look(direction=...)` should be referenced. The agent
+    sees these and would otherwise try to call non-existent tools.
+    """
+    forbidden = [
+        "look_left",
+        "look_right",
+        "look_up",
+        "look_down",
+        "look_center",
+        "look_*",
+    ]
+    for f in forbidden:
+        assert f not in FORMATTED, f"obsolete tool name '{f}' still in SYSTEM_PROMPT"
+
+
+def test_system_prompt_has_action_precedence_constraint() -> None:
+    """The action-precedence constraint must guide the model to call look()
+    when asked to move its gaze, instead of just promising verbally."""
+    assert "look(direction" in FORMATTED
+    # action-precedence section must exist (id marker)
+    assert "action-precedence" in FORMATTED
+    # Should contain a strong-language framing against language without action
+    assert (
+        "broken promise" in FORMATTED
+        or "language without action" in FORMATTED
+        or "alongside" in FORMATTED.lower()
+    )
+
+
 def test_system_prompt_no_all_caps_critical() -> None:
     """Old CRITICAL / IMPORTANT markers should be replaced by (constraint :priority critical)."""
     # The word CRITICAL should only appear in the S-expression form, not as a standalone word

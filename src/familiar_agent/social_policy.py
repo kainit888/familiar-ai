@@ -9,7 +9,17 @@ from .interoception import InteroceptivePressure
 from .mental_state import AffectiveState
 
 _ADVICE_PATTERNS = [r"どう", r"教えて", r"advice", r"should i", r"どうしたら"]
-_ACTION_PATTERNS = [r"して", r"やって", r"run", r"fix", r"please do", r"頼む"]
+_ACTION_PATTERNS = [
+    r"して",
+    r"やって",
+    r"run",
+    r"fix",
+    r"please do",
+    r"頼む",
+    r"向け",
+    r"向いて",
+    r"見て",
+]
 _REPAIR_PATTERNS = [r"hurt", r"傷つ", r"前の返事", r"つらかった", r"きつかった"]
 _DELIGHT_PATTERNS = [r"やった", r"嬉し", r"うれし", r"最高", r"できた", r"happy", r"yay"]
 _VENTING_PATTERNS = [r"むかつ", r"最悪", r"つらい", r"しんど", r"疲れ", r"ugh"]

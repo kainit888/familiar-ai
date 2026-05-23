@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import pytest
+
 from familiar_agent.appraisal import AppraisalContext, AppraisalEngine
 from familiar_agent.interoception import InteroceptivePressure
 from familiar_agent.meta_monitor import MetaMonitor
-from familiar_agent.social_policy import SocialPolicyEngine
+from familiar_agent.social_policy import (
+    _ACTION_PATTERNS,
+    _matches,
+    SocialPolicyEngine,
+)
 
 
 def _pressure(*, quiet: bool = False, need_rest: float = 0.2, frustration_bias: float = 0.2):
@@ -149,3 +155,47 @@ def test_user_correction_prefers_plain_clarification_without_extra_inference() -
     assert decision.response_mode == "clarify"
     assert decision.should_use_tom is False
     assert decision.avoid_problem_solving is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "右向いて",
+        "まっすぐ向いて",
+        "上向け",
+        "カメラ見て",
+        "あっち見て",
+    ],
+)
+def test_action_patterns_match_camera_gaze_requests(text: str) -> None:
+    """Gaze / look requests should be detected by _ACTION_PATTERNS so the
+    policy classifies them as request_for_action and the agent gets a
+    nudge toward calling the look() tool."""
+    assert _matches(text, _ACTION_PATTERNS), (
+        f"expected '{text}' to match _ACTION_PATTERNS but it did not"
+    )
+
+
+def test_camera_gaze_request_classified_as_request_for_action() -> None:
+    """End-to-end: 「右向いて」 should land in primary_act='request_for_action'
+    so the agent knows it has to act, not just talk."""
+    appraisal = AppraisalEngine()
+    policy_engine = SocialPolicyEngine()
+    text = "右向いて"
+    affect = appraisal.appraise(
+        AppraisalContext(
+            user_text=text,
+            companion_mood="engaged",
+            interoception=_pressure(),
+        )
+    )
+    decision = policy_engine.decide(
+        user_text=text,
+        affect=affect,
+        trust=0.6,
+        intimacy=0.6,
+        interoception=_pressure(),
+    )
+    assert decision.primary_act == "request_for_action"
+    assert decision.response_mode == "act_or_explain"
+    assert decision.avoid_problem_solving is False
