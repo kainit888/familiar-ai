@@ -199,6 +199,13 @@ class AgentConfig:
     utility_timeout_s: float = field(
         default_factory=lambda: float(_env_value("UTILITY_TIMEOUT_S", default="180") or "180")
     )
+    # Maximum seconds to wait for fire-and-forget background tasks (e.g. mid-session
+    # self-narrative writes) during agent shutdown before cancelling them.
+    self_narrative_shutdown_wait_s: float = field(
+        default_factory=lambda: float(
+            _env_value("SELF_NARRATIVE_SHUTDOWN_WAIT_S", default="30") or "30"
+        )
+    )
 
     # ── Scene backend (optional) ────────────────────────────────────────
     # Separate backend for scene entity extraction — cheaper/local model.

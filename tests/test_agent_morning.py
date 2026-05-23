@@ -29,6 +29,7 @@ def _make_agent():
     agent._session_output_tokens = 0
     agent._last_context_tokens = 0
     agent._post_compact = False
+    agent._background_tasks = set()
     agent._started_at = 0.0
     agent.messages = []
     agent._me_md = ""
@@ -337,5 +338,176 @@ async def test_self_narrative_timeout_logs_explicitly(caplog):
             emotion="moved",
             is_desire_turn=False,
         )
+        # Mid-session self-narrative is now fire-and-forget; drain background
+        # tasks so the timeout warning lands in caplog before we assert.
+        await _asyncio.gather(*agent._background_tasks, return_exceptions=True)
 
     assert any("timeout after 12.0s" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# B-1: fire-and-forget mid-session self-narrative
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_self_narrative_runs_in_background():
+    """_maybe_update_self_narrative must return immediately even if the backend stalls."""
+    import asyncio as _asyncio
+    import time
+
+    agent = _make_agent()
+    agent._SALIENT_NARRATIVE_EMOTIONS = {"moved"}
+    agent._decayed_mood = MagicMock(return_value=("neutral", 0.0))
+    agent._prediction = MagicMock()
+    agent._prediction.last_signal = MagicMock(return_value=None)
+
+    async def slow_complete(*_args, **_kwargs):
+        await _asyncio.sleep(10)
+        return "never"
+
+    agent._utility_backend = MagicMock()
+    agent._utility_backend.complete = slow_complete
+
+    start = time.perf_counter()
+    await agent._maybe_update_self_narrative(
+        user_input="hi",
+        final_text="response",
+        emotion="moved",
+        is_desire_turn=False,
+    )
+    elapsed = time.perf_counter() - start
+
+    try:
+        assert elapsed < 0.1, f"_maybe_update_self_narrative blocked for {elapsed:.3f}s"
+        assert len(agent._background_tasks) == 1
+    finally:
+        for task in list(agent._background_tasks):
+            task.cancel()
+        await _asyncio.gather(*agent._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_self_narrative_completes_in_background():
+    """When the backend returns, the write happens via the background task after drain."""
+    import asyncio as _asyncio
+
+    agent = _make_agent()
+    agent._SALIENT_NARRATIVE_EMOTIONS = {"moved"}
+    agent._decayed_mood = MagicMock(return_value=("neutral", 0.0))
+    agent._prediction = MagicMock()
+    agent._prediction.last_signal = MagicMock(return_value=None)
+
+    agent._utility_backend = MagicMock()
+    agent._utility_backend.complete = AsyncMock(return_value="私は静かに過ごした")
+    agent._self_narrative = MagicMock()
+
+    await agent._maybe_update_self_narrative(
+        user_input="hi",
+        final_text="response",
+        emotion="moved",
+        is_desire_turn=False,
+    )
+
+    assert len(agent._background_tasks) == 1
+    await _asyncio.gather(*agent._background_tasks, return_exceptions=True)
+
+    agent._self_narrative.write.assert_called_once()
+    call_kwargs = agent._self_narrative.write.call_args.kwargs
+    assert call_kwargs["trigger"] == "salient_turn"
+    assert call_kwargs["mood"] == "moved"
+
+
+@pytest.mark.asyncio
+async def test_self_narrative_timeout_in_background_logs_only(caplog):
+    """Backend timeout in background: no exception propagates, warning logged, no write."""
+    import asyncio as _asyncio
+
+    agent = _make_agent()
+    agent._SALIENT_NARRATIVE_EMOTIONS = {"moved"}
+    agent._decayed_mood = MagicMock(return_value=("neutral", 0.0))
+    agent._prediction = MagicMock()
+    agent._prediction.last_signal = MagicMock(return_value=None)
+
+    async def raise_timeout(*_args, **_kwargs):
+        raise _asyncio.TimeoutError()
+
+    agent._utility_backend = MagicMock()
+    agent._utility_backend.complete = AsyncMock(return_value="should not be used")
+    agent._self_narrative = MagicMock()
+
+    with (
+        patch("familiar_agent.agent.asyncio.wait_for", side_effect=raise_timeout),
+        caplog.at_level("WARNING", logger="familiar_agent.agent"),
+    ):
+        # Must not raise.
+        await agent._maybe_update_self_narrative(
+            user_input="hi",
+            final_text="response",
+            emotion="moved",
+            is_desire_turn=False,
+        )
+        await _asyncio.gather(*agent._background_tasks, return_exceptions=True)
+
+    assert any("timeout after 12.0s" in rec.message for rec in caplog.records)
+    agent._self_narrative.write.assert_not_called()
+
+
+def _prepare_agent_for_close(agent):
+    """close() を呼ぶ際に必要な最小限の依存をモック。"""
+    agent._camera = None
+    agent._mcp = None
+    agent._write_today_narrative = AsyncMock()
+    worker = MagicMock()
+    worker.stop = AsyncMock()
+    agent._memory_worker = worker
+    agent._memory.close = MagicMock()
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_self_narrative_tasks():
+    """close() must propagate self_narrative_shutdown_wait_s to the drain step."""
+    import asyncio as _asyncio
+
+    agent = _prepare_agent_for_close(_make_agent())
+    agent.config.self_narrative_shutdown_wait_s = 5.0
+
+    completed = _asyncio.Event()
+
+    async def quick_task():
+        await _asyncio.sleep(0.2)
+        completed.set()
+
+    task = _asyncio.create_task(quick_task(), name="self_narrative_midsession")
+    agent._background_tasks.add(task)
+
+    await agent.close()
+
+    assert task.done()
+    assert completed.is_set()
+    assert not task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_stuck_self_narrative_tasks(caplog):
+    """close() must cancel background tasks that exceed the configured wait budget."""
+    import asyncio as _asyncio
+
+    agent = _prepare_agent_for_close(_make_agent())
+    agent.config.self_narrative_shutdown_wait_s = 0.5
+
+    async def stuck_task():
+        await _asyncio.sleep(5)
+
+    task = _asyncio.create_task(stuck_task(), name="self_narrative_midsession")
+    agent._background_tasks.add(task)
+
+    with caplog.at_level("WARNING", logger="familiar_agent.agent"):
+        await agent.close()
+
+    assert task.cancelled()
+    assert any(
+        "Cancelling" in rec.message and "self_narrative_midsession" in rec.message
+        for rec in caplog.records
+    )

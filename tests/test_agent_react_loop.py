@@ -637,6 +637,8 @@ async def test_maybe_update_self_narrative_uses_agency_error_trigger():
         emotion="neutral",
         is_desire_turn=False,
     )
+    # Mid-session capture is fire-and-forget; drain the spawned task before asserting.
+    await asyncio.gather(*agent._background_tasks, return_exceptions=True)
 
     agent._self_narrative.write.assert_called_once()
     assert agent._self_narrative.write.call_args.kwargs["trigger"] == "agency_error"

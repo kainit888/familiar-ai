@@ -790,15 +790,22 @@ class EmbodiedAgent:
 
         task.add_done_callback(_done)
 
-    async def _drain_background_tasks(self, timeout: float = 6.0) -> None:
-        """Wait briefly for background work to finish during shutdown."""
+    async def _drain_background_tasks(self, timeout: float | None = None) -> None:
+        """Wait for background work to finish during shutdown.
+
+        ``timeout=None`` keeps the historical default (6.0s) for backwards
+        compatibility with existing callers. ``close()`` passes a configurable
+        wait so that mid-session self-narrative tasks can be given enough time
+        to complete before being cancelled.
+        """
         tasks = getattr(self, "_background_tasks", None)
         if not tasks:
             return
         pending = {task for task in tasks if not task.done()}
         if not pending:
             return
-        done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        effective_timeout = 6.0 if timeout is None else timeout
+        done, still_pending = await asyncio.wait(pending, timeout=effective_timeout)
         for task in done:
             try:
                 task.result()
@@ -807,6 +814,13 @@ class EmbodiedAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Background task failed during drain: %s", exc)
         if still_pending:
+            names = sorted({task.get_name() for task in still_pending})
+            logger.warning(
+                "Cancelling %d background task(s) after drain timeout (%.1fs): %s",
+                len(still_pending),
+                effective_timeout,
+                ", ".join(names) if names else "(unnamed)",
+            )
             for task in still_pending:
                 task.cancel()
             await asyncio.gather(*still_pending, return_exceptions=True)
@@ -2087,7 +2101,12 @@ class EmbodiedAgent:
         emotion: str,
         is_desire_turn: bool,
     ) -> None:
-        """Capture salient within-session self-narrative moments."""
+        """Capture salient within-session self-narrative moments.
+
+        The guard logic runs synchronously on the response critical path; the
+        utility-backend call itself is dispatched as a fire-and-forget task so
+        that a slow or hung backend cannot stall the user-facing turn.
+        """
         if not final_text or final_text == "(no response)":
             return
 
@@ -2112,6 +2131,23 @@ class EmbodiedAgent:
             f"agency_error: {agency_error:.2f}\n"
             "条件: 一人称は『私』。60文字以内。説明や前置きは禁止。"
         )
+        self._spawn_background_task(
+            self._run_self_narrative_background(
+                prompt=prompt,
+                reason=reason,
+                emotion=emotion,
+            ),
+            name="self_narrative_midsession",
+        )
+
+    async def _run_self_narrative_background(
+        self,
+        *,
+        prompt: str,
+        reason: str,
+        emotion: str,
+    ) -> None:
+        """Background body for mid-session self-narrative capture."""
         try:
             text = await asyncio.wait_for(
                 self._utility_backend.complete(prompt, max_tokens=120),
@@ -2120,7 +2156,11 @@ class EmbodiedAgent:
             if text and text.strip():
                 mood = emotion if emotion != "neutral" else self._decayed_mood()[0]
                 self._self_narrative.write(text.strip(), mood=mood, trigger=reason)
-                logger.info("Self-narrative moment captured (%s): %s", reason, text.strip()[:60])
+                logger.info(
+                    "Self-narrative moment captured (%s): %s",
+                    reason,
+                    text.strip()[:60],
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "Could not update self narrative mid-session: timeout after 12.0s"
@@ -2315,7 +2355,9 @@ class EmbodiedAgent:
         if self._camera:
             await self._camera.close()
 
-        await self._drain_background_tasks()
+        await self._drain_background_tasks(
+            timeout=self.config.self_narrative_shutdown_wait_s
+        )
 
         # Write today's self-narrative before shutting down.
         await self._write_today_narrative()
