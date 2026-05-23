@@ -785,3 +785,68 @@ async def test_post_response_pipeline_updates_self_continuity_state():
 
     agent._concerns.update_from_turn.assert_called_once()
     agent._self_state.apply_turn_context.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# B-4: Empty-text LLM response observability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_logs_warning_when_llm_returns_empty_text(caplog):
+    """LLM が text="" + end_turn を返したとき "LLM returned empty text" warning が出る。
+
+    B-4 デバッグ計装: result.text or "(no response)" でセンチネル化される直前に
+    根本観察ログを残し、どの backend / どの状況で空応答が来たかを追える。
+    """
+    import logging
+
+    agent = _make_agent()
+    # text="" で end_turn (= LLM が何も生成しなかったケース)
+    agent.backend.stream_turn = AsyncMock(
+        return_value=(_turn("end_turn", text=""), "")
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="familiar_agent.agent"):
+            result = await agent.run("hello")
+    finally:
+        for p in ps:
+            p.stop()
+
+    # センチネル化された応答 (= 既存挙動の維持) と warning ログ両方を確認
+    assert result == "(no response)"
+    matching = [
+        rec for rec in caplog.records if "LLM returned empty text" in rec.getMessage()
+    ]
+    assert matching, f"expected empty-text warning, got: {[r.getMessage() for r in caplog.records]}"
+    assert matching[0].levelno == logging.WARNING
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_warn_when_llm_returns_text(caplog):
+    """正常応答 (text 非空) のとき "LLM returned empty text" warning は出ない (regression guard)。"""
+    import logging
+
+    agent = _make_agent()
+    agent.backend.stream_turn = AsyncMock(
+        return_value=(_turn("end_turn", text="ok"), "ok")
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="familiar_agent.agent"):
+            await agent.run("hello")
+    finally:
+        for p in ps:
+            p.stop()
+
+    matching = [
+        rec for rec in caplog.records if "LLM returned empty text" in rec.getMessage()
+    ]
+    assert not matching, "warning must not fire when LLM returns non-empty text"

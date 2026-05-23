@@ -619,8 +619,17 @@ async def _conversation_loop(
             traceback.print_exc()
             continue
 
-        if not response or not response.strip():
-            logger.warning("conversation_loop: empty response from agent")
+        # Treat literal "(no response)" sentinel as empty (agent.py emits this
+        # when the LLM returns empty text). Don't synthesize it to speech.
+        if (
+            not response
+            or not response.strip()
+            or response.strip() == "(no response)"
+        ):
+            logger.warning(
+                "conversation_loop: empty/sentinel response from agent (got {!r}), skipping TTS",
+                response,
+            )
             continue
         print(f"  🤖 pico: {response}")
 

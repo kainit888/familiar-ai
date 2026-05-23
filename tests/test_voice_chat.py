@@ -1036,3 +1036,137 @@ async def test_speak_to_tapo_grace_is_after_wait_not_before(monkeypatch):
             stream_name="z",
         )
     assert call_order == ["wait", "grace"]
+
+
+# ── _conversation_loop: (no response) sentinel guard ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_conversation_loop_skips_no_response_sentinel(monkeypatch):
+    """agent.run が "(no response)" を返したとき speak_to_tapo は呼ばれずスキップされる。
+
+    B-4 修正の核心: agent.py の `final_text = result.text or "(no response)"`
+    がリテラル化したセンチネルを TTS に流さないことを保証する。
+    """
+    # 2 回目の Enter で StopAsyncIteration して loop を抜ける
+    enter_count = {"n": 0}
+
+    async def fake_run_in_executor(executor, fn, *args):
+        enter_count["n"] += 1
+        if enter_count["n"] >= 2:
+            raise KeyboardInterrupt  # break out of while True
+        return ""
+
+    loop_mock = MagicMock()
+    loop_mock.run_in_executor = fake_run_in_executor
+    monkeypatch.setattr(voice_chat.asyncio, "get_event_loop", lambda: loop_mock)
+
+    # record_from_tapo / transcribe を mock し、まともな入力を作る
+    monkeypatch.setattr(
+        voice_chat, "record_from_tapo", AsyncMock(return_value=b"WAVDATA")
+    )
+    monkeypatch.setattr(voice_chat, "transcribe", AsyncMock(return_value="hello"))
+
+    speak_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(voice_chat, "speak_to_tapo", speak_mock)
+
+    agent = MagicMock()
+    agent.run = AsyncMock(return_value="(no response)")
+
+    with pytest.raises(KeyboardInterrupt):
+        await voice_chat._conversation_loop(
+            agent,
+            rtsp_url="rtsp://x",
+            stt_url="http://stt",
+            tts_base_url="http://tts",
+            tts_model="m",
+            go2rtc_base_url="http://g",
+            stream_name="z",
+            record_seconds=1.0,
+        )
+
+    agent.run.assert_awaited_once()
+    speak_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conversation_loop_skips_empty_response(monkeypatch):
+    """空文字列 / 空白のみの応答も従来通りスキップされる (regression guard)。"""
+    enter_count = {"n": 0}
+
+    async def fake_run_in_executor(executor, fn, *args):
+        enter_count["n"] += 1
+        if enter_count["n"] >= 2:
+            raise KeyboardInterrupt
+        return ""
+
+    loop_mock = MagicMock()
+    loop_mock.run_in_executor = fake_run_in_executor
+    monkeypatch.setattr(voice_chat.asyncio, "get_event_loop", lambda: loop_mock)
+    monkeypatch.setattr(
+        voice_chat, "record_from_tapo", AsyncMock(return_value=b"WAVDATA")
+    )
+    monkeypatch.setattr(voice_chat, "transcribe", AsyncMock(return_value="hi"))
+
+    speak_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(voice_chat, "speak_to_tapo", speak_mock)
+
+    agent = MagicMock()
+    agent.run = AsyncMock(return_value="   ")
+
+    with pytest.raises(KeyboardInterrupt):
+        await voice_chat._conversation_loop(
+            agent,
+            rtsp_url="rtsp://x",
+            stt_url="http://stt",
+            tts_base_url="http://tts",
+            tts_model="m",
+            go2rtc_base_url="http://g",
+            stream_name="z",
+            record_seconds=1.0,
+        )
+
+    speak_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conversation_loop_speaks_normal_response(monkeypatch):
+    """非空・非センチネルの応答は speak_to_tapo に渡される (positive control)。"""
+    enter_count = {"n": 0}
+
+    async def fake_run_in_executor(executor, fn, *args):
+        enter_count["n"] += 1
+        if enter_count["n"] >= 2:
+            raise KeyboardInterrupt
+        return ""
+
+    loop_mock = MagicMock()
+    loop_mock.run_in_executor = fake_run_in_executor
+    monkeypatch.setattr(voice_chat.asyncio, "get_event_loop", lambda: loop_mock)
+    monkeypatch.setattr(
+        voice_chat, "record_from_tapo", AsyncMock(return_value=b"WAVDATA")
+    )
+    monkeypatch.setattr(voice_chat, "transcribe", AsyncMock(return_value="hi"))
+
+    speak_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(voice_chat, "speak_to_tapo", speak_mock)
+
+    agent = MagicMock()
+    agent.run = AsyncMock(return_value="こんにちは")
+
+    with pytest.raises(KeyboardInterrupt):
+        await voice_chat._conversation_loop(
+            agent,
+            rtsp_url="rtsp://x",
+            stt_url="http://stt",
+            tts_base_url="http://tts",
+            tts_model="m",
+            go2rtc_base_url="http://g",
+            stream_name="z",
+            record_seconds=1.0,
+        )
+
+    speak_mock.assert_awaited_once()
+    # 第1引数 (text) が応答そのもの
+    called_args, _ = speak_mock.await_args
+    assert called_args[0] == "こんにちは"

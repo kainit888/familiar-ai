@@ -2889,6 +2889,12 @@ class EmbodiedAgent:
 
                 if result.stop_reason == "end_turn":
                     self.messages.append(self.backend.make_assistant_message(result, raw_content))
+                    if not result.text:
+                        logger.warning(
+                            "LLM returned empty text — stop_reason=%s, tool_calls=%d",
+                            result.stop_reason,
+                            len(result.tool_calls or []),
+                        )
                     final_text = result.text or "(no response)"
 
                     gate_method = getattr(self._meta_monitor, "gate_response", None)

@@ -1094,6 +1094,7 @@ class GeminiBackend:
         text_chunks: list[str] = []
         tool_calls: list[ToolCall] = []
         raw_parts: list = []
+        finish_reason: Any = None
 
         async for chunk in await self._client.aio.models.generate_content_stream(
             model=self.model,
@@ -1102,7 +1103,10 @@ class GeminiBackend:
         ):
             if not chunk.candidates:
                 continue
-            content = chunk.candidates[0].content
+            candidate = chunk.candidates[0]
+            if getattr(candidate, "finish_reason", None) is not None:
+                finish_reason = candidate.finish_reason
+            content = candidate.content
             if content is None or content.parts is None:
                 continue
             for part in content.parts:
@@ -1124,6 +1128,11 @@ class GeminiBackend:
                     )
 
         text = "".join(text_chunks)
+        if not text and not tool_calls:
+            logger.warning(
+                "GeminiBackend: empty turn — finish_reason=%s",
+                finish_reason,
+            )
         stop = "tool_use" if tool_calls else "end_turn"
         raw_assistant = {"role": "model", "parts": raw_parts}
         return TurnResult(stop_reason=stop, text=text, tool_calls=tool_calls), raw_assistant
