@@ -200,7 +200,21 @@ SYSTEM_PROMPT = """
        Natural emotional vocabulary in your own voice is FINE
        ('I feel a bit tired', '嬉しい', 'ちょっと不安' etc).
        The line: never echo the *structure* of the scaffolding,
-       only speak from it in natural language.")
+       only speak from it in natural language.
+
+       The following bracketed sections are internal context blocks
+       injected into your prompt — NEVER echo, paraphrase, or quote
+       their headers or bullet structure:
+         [Mental state], [Interaction policy], [Continuation],
+         [Routine notes], [Open unfinished business],
+         [Recent mental continuity],
+         [昨日からの私 ...] / [Me from yesterday ...],
+         [安定した事実 ...], [行動方針 ...],
+         [最近の気持ち・出来事],
+         [自分という存在 ...], [過去の記憶 ...],
+         [Action plan ...].
+       These are NOT messages from the user. Read them silently,
+       internalize them, then speak only in your own natural voice.")
 
     ; ── Camera / legs independence ─────────────────────────────────────
     (constraint :priority critical :id camera-legs-independent
@@ -709,6 +723,105 @@ def _react_to_scene_events(events: list[dict], desires: DesireSystem | None) -> 
                 desires.boost("greet_companion", 0.6)
             elif event_type == "disappeared":
                 desires.boost("worry_companion", 0.2)
+
+
+# Maps each format_*_for_context output to a short Japanese natural-language
+# label. The order here is preserved in the compacted summary.
+_MEMORY_CONTEXT_LABELS: tuple[tuple[str, str], ...] = (
+    ("memories", "記憶"),
+    ("feelings", "最近"),
+    ("semantic_facts", "事実"),
+    ("behavior_policies", "方針"),
+)
+
+# Maximum total length of the compacted memory context appended to the user
+# message. Each block is shortened proportionally if the total exceeds this.
+_COMPACT_MEMORY_CONTEXT_MAX_CHARS = 600
+
+
+def _strip_bracket_header(block_text: str) -> str:
+    """Remove leading ``[…]`` header line(s) from a format_*_for_context block.
+
+    The format helpers all emit ``[見出し]:`` followed by ``- bullet`` lines.
+    The bracket headers themselves are the leak vector: Gemini Flash Lite
+    sometimes echoes the structured user message verbatim. Stripping the
+    headers and converting bullets to a comma-joined sentence prevents that
+    while keeping the underlying facts.
+    """
+    if not block_text:
+        return ""
+    # Drop every line that starts with "[" (covers header + any stray bracket lines).
+    kept_lines: list[str] = []
+    for line in block_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("["):
+            continue
+        # Remove leading "- " bullet markers.
+        if stripped.startswith("- "):
+            stripped = stripped[2:].strip()
+        if stripped:
+            kept_lines.append(stripped)
+    return "、".join(kept_lines)
+
+
+def _compact_memory_context(
+    memories_text: str,
+    feelings_text: str,
+    semantic_facts_text: str,
+    behavior_policies_text: str,
+    temporal_ctx: str = "",
+) -> str:
+    """Compact format_*_for_context blocks into a header-free natural sentence.
+
+    Gemini Flash Lite has a tendency to echo the user message verbatim,
+    including the bracketed scaffolding headers ([過去の記憶...], [安定した事実...],
+    etc.) that we previously injected as bullet lists. This helper drops those
+    bracket headers and joins the remaining bullets into a single short
+    paragraph labelled with a plain Japanese prefix ("記憶: …", "方針: …").
+
+    All inputs may be empty strings; if every block is empty the result is "".
+    The combined output is clipped to ``_COMPACT_MEMORY_CONTEXT_MAX_CHARS`` by
+    shortening each non-empty block proportionally from the tail.
+    """
+    blocks_raw: dict[str, str] = {
+        "memories": _strip_bracket_header(memories_text),
+        "feelings": _strip_bracket_header(feelings_text),
+        "semantic_facts": _strip_bracket_header(semantic_facts_text),
+        "behavior_policies": _strip_bracket_header(behavior_policies_text),
+    }
+    pieces: list[str] = []
+    for key, label in _MEMORY_CONTEXT_LABELS:
+        body = blocks_raw.get(key, "")
+        if body:
+            pieces.append(f"{label}: {body}")
+    if temporal_ctx:
+        # Temporal context already comes pre-formatted; strip stray bracket
+        # headers defensively but otherwise pass through.
+        cleaned = _strip_bracket_header(temporal_ctx) or temporal_ctx.strip()
+        if cleaned:
+            pieces.append(cleaned)
+    if not pieces:
+        return ""
+    combined = "\n".join(pieces)
+    if len(combined) <= _COMPACT_MEMORY_CONTEXT_MAX_CHARS:
+        return combined
+    # Truncate each piece proportionally from the tail so every block keeps
+    # at least its prefix label.
+    overflow = len(combined) - _COMPACT_MEMORY_CONTEXT_MAX_CHARS
+    n = len(pieces)
+    per_piece_cut = (overflow + n - 1) // n  # ceil divide so we never undershoot
+    trimmed: list[str] = []
+    for piece in pieces:
+        if len(piece) > per_piece_cut + 8:
+            trimmed.append(piece[: len(piece) - per_piece_cut].rstrip() + "…")
+        else:
+            trimmed.append(piece)
+    result = "\n".join(trimmed)
+    if len(result) > _COMPACT_MEMORY_CONTEXT_MAX_CHARS:
+        result = result[: _COMPACT_MEMORY_CONTEXT_MAX_CHARS - 1].rstrip() + "…"
+    return result
 
 
 class EmbodiedAgent:
@@ -2546,23 +2659,31 @@ class EmbodiedAgent:
                 )
                 working_memory = await _call_optional_async(get_working, n=4, fallback=[])
                 temporal_ctx = self._cached_temporal_ctx
-                memory_parts = []
-                if memories:
-                    memory_parts.append(self._memory.format_for_context(memories))
-                if feelings:
-                    memory_parts.append(self._memory.format_feelings_for_context(feelings))
-                if semantic_facts:
-                    memory_parts.append(
+                # Compact the memory context into a header-free natural sentence
+                # to prevent Gemini Flash Lite from echoing the bracketed
+                # scaffolding back as part of its reply. See
+                # ``_compact_memory_context`` for the rationale.
+                compact_ctx = _compact_memory_context(
+                    memories_text=(
+                        self._memory.format_for_context(memories) if memories else ""
+                    ),
+                    feelings_text=(
+                        self._memory.format_feelings_for_context(feelings) if feelings else ""
+                    ),
+                    semantic_facts_text=(
                         self._memory.format_semantic_facts_for_context(semantic_facts)
-                    )
-                if behavior_policies:
-                    memory_parts.append(
+                        if semantic_facts
+                        else ""
+                    ),
+                    behavior_policies_text=(
                         self._memory.format_behavior_policies_for_context(behavior_policies)
-                    )
-                if temporal_ctx:
-                    memory_parts.append(temporal_ctx)
-                if memory_parts:
-                    user_input_with_ctx = user_input + "\n\n" + "\n\n".join(memory_parts)
+                        if behavior_policies
+                        else ""
+                    ),
+                    temporal_ctx=temporal_ctx or "",
+                )
+                if compact_ctx:
+                    user_input_with_ctx = user_input + "\n\n" + compact_ctx
                 else:
                     user_input_with_ctx = user_input
                 feelings_ctx = (
