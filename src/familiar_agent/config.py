@@ -194,6 +194,11 @@ class AgentConfig:
     # OpenAI-compatible エンドポイント上書き (Ollama 等のローカル backend 向け)。
     # 未指定時は公式 OpenAI エンドポイントにフォールバック。
     utility_base_url: str = field(default_factory=lambda: os.environ.get("UTILITY_BASE_URL", ""))
+    # Timeout (seconds) for utility-backend calls such as day summaries and
+    # today's self-narrative. Default 180s to accommodate slower local models.
+    utility_timeout_s: float = field(
+        default_factory=lambda: float(_env_value("UTILITY_TIMEOUT_S", default="180") or "180")
+    )
 
     # ── Scene backend (optional) ────────────────────────────────────────
     # Separate backend for scene entity extraction — cheaper/local model.

@@ -412,6 +412,7 @@ Good examples:
 Response:
 {text}
 
+Write in {lang}.
 Write just the sentence. If nothing meaningful is revealed, write "nothing"."""
 
 # Companion mood prompt — classify companion's emotional state from their message
@@ -1968,6 +1969,14 @@ class EmbodiedAgent:
         if self._utility_backend is self.backend:
             logger.debug("Backfill skipped: no separate utility backend configured")
             return
+        skip_env = os.environ.get("FAMILIAR_SKIP_BACKFILL_ON_STARTUP", "1").strip().lower()
+        if skip_env not in ("0", "false", "no", "off"):
+            logger.info(
+                "Backfill skipped (FAMILIAR_SKIP_BACKFILL_ON_STARTUP=%s); "
+                "use scheduled_jobs Phase G to backfill",
+                skip_env or "<unset>",
+            )
+            return
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             all_dates = await asyncio.to_thread(self._memory.get_dates_with_observations, 7)
@@ -2013,7 +2022,7 @@ class EmbodiedAgent:
                     ),
                     max_tokens=400,
                 ),
-                timeout=30.0,
+                timeout=self.config.utility_timeout_s,
             )
             if summary:
                 await self._memory.save_async(
@@ -2036,7 +2045,11 @@ class EmbodiedAgent:
             else:
                 logger.warning("Day summary for %s: LLM returned empty response", date)
         except asyncio.TimeoutError:
-            logger.warning("Day summary for %s timed out (30s)", date)
+            logger.warning(
+                "Day summary for %s timed out (%.0fs)",
+                date,
+                self.config.utility_timeout_s,
+            )
         except Exception as e:
             logger.warning("Failed to generate day summary for %s: %s", date, e)
 
@@ -2050,7 +2063,7 @@ class EmbodiedAgent:
             return
         try:
             insight = await self._utility_backend.complete(
-                _SELF_MODEL_PROMPT.format(text=final_text[:400]),
+                _SELF_MODEL_PROMPT.format(text=final_text[:400], lang=_t("summary_lang")),
                 max_tokens=80,
             )
             if insight and insight.lower() != "nothing":
@@ -2108,8 +2121,14 @@ class EmbodiedAgent:
                 mood = emotion if emotion != "neutral" else self._decayed_mood()[0]
                 self._self_narrative.write(text.strip(), mood=mood, trigger=reason)
                 logger.info("Self-narrative moment captured (%s): %s", reason, text.strip()[:60])
-        except Exception as e:
-            logger.warning("Could not update self narrative mid-session: %s", e)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Could not update self narrative mid-session: timeout after 12.0s"
+            )
+        except Exception:
+            logger.warning(
+                "Could not update self narrative mid-session", exc_info=True
+            )
 
     async def _maybe_adapt_values(
         self,
@@ -2283,7 +2302,7 @@ class EmbodiedAgent:
             )
             text = await asyncio.wait_for(
                 self._utility_backend.complete(prompt, max_tokens=120),
-                timeout=15.0,
+                timeout=self.config.utility_timeout_s,
             )
             if text and text.strip():
                 self._self_narrative.write(text.strip(), mood=mood)
