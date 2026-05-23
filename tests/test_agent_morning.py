@@ -314,6 +314,79 @@ async def test_update_self_model_passes_lang():
     assert _t("summary_lang") in sent_prompt
 
 
+def test_self_model_prompt_starts_with_lang_directive():
+    """_SELF_MODEL_PROMPT must surface the lang directive at the very top of the prompt.
+
+    qwen-class models are sensitive to where the language constraint appears; placing
+    it only at the tail leaves a long English example window that primes English output.
+    """
+    from familiar_agent.agent import _SELF_MODEL_PROMPT
+
+    rendered = _SELF_MODEL_PROMPT.format(text="x", lang="日本語")
+    # First 30 chars should already contain the locale name.
+    assert "日本語" in rendered[:30]
+
+
+def test_self_model_prompt_has_no_english_examples():
+    """Legacy English example sentences must be replaced with localized examples.
+
+    The English exemplars were correlated with qwen falling back to English (and
+    occasionally Korean) output. Examples are now in Japanese.
+    """
+    from familiar_agent.agent import _SELF_MODEL_PROMPT
+
+    rendered = _SELF_MODEL_PROMPT.format(text="x", lang="日本語")
+    # These were the three English exemplar fragments in the previous prompt.
+    assert "I get drawn to" not in rendered
+    assert "I notice time" not in rendered
+    assert "When a stranger" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_update_self_model_discards_non_japanese_response(caplog):
+    """qwen multilingual fallback (e.g. an English reply) must be discarded under ja locale.
+
+    When the utility backend returns an ASCII-heavy string while _LANG == "ja", the
+    validate helper should drop the insight and skip the memory write, with a warning.
+    """
+    import familiar_agent.agent as agent_mod
+
+    agent = _make_agent()
+    agent._memory_dedupe_key = MagicMock(return_value="key")
+    agent._utility_backend = MagicMock()
+    agent._utility_backend.complete = AsyncMock(
+        return_value="I notice time passing through the sky more than through clocks."
+    )
+
+    with (
+        patch.object(agent_mod, "_LANG", "ja"),
+        caplog.at_level("WARNING", logger="familiar_agent.agent"),
+    ):
+        await agent._update_self_model("today felt strange", emotion="moved")
+
+    assert agent._memory.save_async.await_count == 0
+    assert any(
+        ("non-localized" in rec.message or "discarding" in rec.message)
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_self_model_accepts_japanese_response():
+    """A well-formed Japanese insight must still be persisted (regression guard)."""
+    import familiar_agent.agent as agent_mod
+
+    agent = _make_agent()
+    agent._memory_dedupe_key = MagicMock(return_value="key")
+    agent._utility_backend = MagicMock()
+    agent._utility_backend.complete = AsyncMock(return_value="私は静かな夜が好きだ。")
+
+    with patch.object(agent_mod, "_LANG", "ja"):
+        await agent._update_self_model("today felt strange", emotion="moved")
+
+    assert agent._memory.save_async.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_self_narrative_timeout_logs_explicitly(caplog):
     """asyncio.TimeoutError in _maybe_update_self_narrative must log the explicit timeout message."""

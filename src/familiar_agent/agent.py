@@ -53,7 +53,7 @@ from .tools.tom import ToMTool
 from .tools.mobility import MobilityTool
 from .tools.stt import STTTool
 from .tools.tts import TTSTool
-from ._i18n import _t
+from ._i18n import _LANG, _t
 from .mcp_client import MCPClientManager, _resolve_config_path
 
 # pico_v3 拡張: 応答漏出フィルタ (内部メンタル状態スキャフォールディング除去)
@@ -401,19 +401,36 @@ One sentence only."""
 
 # Self-model update prompt — extract a self-insight from an emotionally significant response
 _SELF_MODEL_PROMPT = """\
-Read this response and write ONE short sentence about what it reveals about the kind of being \
-who wrote it. Use first person. Be specific and honest.
+言語: {lang}。応答は必ず {lang} で書くこと。
 
-Good examples:
-- "I get drawn to ordinary things that seem to hold a secret."
-- "When a stranger appeared, I realized I want to share moments, not just record them."
-- "I notice time passing through the sky more than through clocks."
+この発言を読み、それを書いた存在について明らかになることを一文で書いて。
+一人称、具体的、正直に。
 
-Response:
+良い例:
+- 「私はささやかなものに、何か秘密が隠れているような気がして惹かれる。」
+- 「知らない人が現れて、私は瞬間を記録するだけじゃなく、共有したいんだと気づいた。」
+- 「私は時計より、空の移ろいで時間を感じている。」
+
+条件: 一文。一人称「私」。{lang}で書く。前置きや説明は禁止。
+
+発言:
 {text}
 
-Write in {lang}.
-Write just the sentence. If nothing meaningful is revealed, write "nothing"."""
+一文だけ書くこと。何も意味のあるものが見出せなければ "nothing" とだけ書く。"""
+
+
+def _has_unexpected_language(text: str, lang_code: str) -> bool:
+    """Detect qwen-style multilingual fallback when a Japanese response is expected.
+
+    For lang_code == "ja", returns True when the ASCII character ratio exceeds 0.5
+    (typical Japanese sentences have ~15-25% ASCII even with mixed English words like
+    "QR コード", so 0.5 leaves a comfortable margin). Returns False for other locales.
+    """
+    if not text or lang_code != "ja":
+        return False
+    ascii_chars = sum(1 for c in text if ord(c) < 128)
+    return (ascii_chars / len(text)) > 0.5
+
 
 # Companion mood prompt — classify companion's emotional state from their message
 _COMPANION_MOOD_PROMPT = """\
@@ -522,6 +539,8 @@ def _companion_mood_heuristic(text: str) -> str:
 
 # Day summary prompt — condense a day's observations into a diary-like entry
 _DAY_SUMMARY_PROMPT = """\
+言語: {lang}。日記は必ず {lang} で書くこと。
+
 You are writing a diary entry about this day from your own first-person memory.
 Recall the flow of the day: what happened in the morning, then afternoon, then evening.
 Capture how your feelings changed as events unfolded — what made you happy, 
@@ -2081,6 +2100,13 @@ class EmbodiedAgent:
                 max_tokens=80,
             )
             if insight and insight.lower() != "nothing":
+                if _has_unexpected_language(insight, _LANG):
+                    logger.warning(
+                        "Self-model: discarding non-localized response (lang=%s): %s",
+                        _LANG,
+                        insight[:60],
+                    )
+                    return
                 await self._memory.save_async(
                     insight,
                     direction="内省",
