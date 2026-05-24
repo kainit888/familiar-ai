@@ -68,30 +68,20 @@ async def test_say_calls_elevenlabs_api():
     """say() は pico_agent.adapters.tts_sbv2.speak() を経由する (Phase C-1)。
 
     旧テスト名 (elevenlabs_api) は互換性のため維持。中身は adapter mock。
+    Phase C-5 (v5) で speak() は None 返却、target="tapo_speaker" 固定。
     """
     tool = _make_tts(api_key="test-api-key")
 
-    fake_speak = AsyncMock(return_value=b"FAKE_WAV_BYTES")
+    fake_speak = AsyncMock(return_value=None)
 
-    with (
-        patch("pico_agent.adapters.tts_sbv2.speak", fake_speak),
-        patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
-        patch("builtins.open", MagicMock()),
-        patch("os.unlink"),
-        patch("tempfile.NamedTemporaryFile") as mock_tmp,
-    ):
-        tmp_file = MagicMock()
-        tmp_file.__enter__ = MagicMock(return_value=tmp_file)
-        tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.wav"
-        mock_tmp.return_value = tmp_file
-
+    with patch("pico_agent.adapters.tts_sbv2.speak", fake_speak):
         await tool.say("hello world")
 
-    # adapter が呼ばれたことを検証 (text 引数チェック)。
+    # adapter が呼ばれたことを検証 (text + target=tapo_speaker)
     fake_speak.assert_awaited_once()
     awaited_args = fake_speak.await_args
     assert awaited_args.args[0] == "hello world"
+    assert awaited_args.kwargs.get("target") == "tapo_speaker"
 
 
 @pytest.mark.asyncio
@@ -104,20 +94,9 @@ async def test_say_truncates_long_text():
 
     async def capture_speak(text, *_args, **_kwargs):
         sent_texts.append(text)
-        return b"FAKE_WAV_BYTES"
+        return None
 
-    with (
-        patch("pico_agent.adapters.tts_sbv2.speak", side_effect=capture_speak),
-        patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
-        patch("os.unlink"),
-        patch("tempfile.NamedTemporaryFile") as mock_tmp,
-    ):
-        tmp_file = MagicMock()
-        tmp_file.__enter__ = MagicMock(return_value=tmp_file)
-        tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.wav"
-        mock_tmp.return_value = tmp_file
-
+    with patch("pico_agent.adapters.tts_sbv2.speak", side_effect=capture_speak):
         await tool.say(long_text)
 
     assert sent_texts, "adapter was never called"
@@ -127,14 +106,19 @@ async def test_say_truncates_long_text():
 
 
 @pytest.mark.asyncio
-async def test_say_returns_error_on_api_failure():
-    """adapter が空 bytes を返した時、say() はエラー文字列を返す。"""
+async def test_say_returns_success_message_even_on_adapter_failure():
+    """adapter が None 返却 (失敗 = silent fail) でも say() は送出した旨を返す。
+
+    v5 で speak() は失敗時無音 + warning。say() からは adapter ログ依存となる
+    ので、ここでは送出した旨だけ返す (二層分離維持)。
+    """
     tool = _make_tts()
 
-    with patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"")):
+    with patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=None)):
         result = await tool.say("hello")
 
-    assert "failed" in result.lower()
+    # v5: 成否は adapter ログ依存。say() は送出した旨だけ返す。
+    assert "tapo_speaker" in result or "Said" in result
 
 
 @pytest.mark.asyncio
@@ -143,18 +127,7 @@ async def test_say_notifies_voice_guard_on_success():
     tool = _make_tts()
     tool._voice_guard = MagicMock()
 
-    with (
-        patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"FAKE_WAV")),
-        patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
-        patch("os.unlink"),
-        patch("tempfile.NamedTemporaryFile") as mock_tmp,
-    ):
-        tmp_file = MagicMock()
-        tmp_file.__enter__ = MagicMock(return_value=tmp_file)
-        tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.wav"
-        mock_tmp.return_value = tmp_file
-
+    with patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=None)):
         await tool.say("hello world")
 
     tool._voice_guard.on_tts_start.assert_called_once_with("hello world")
@@ -162,69 +135,52 @@ async def test_say_notifies_voice_guard_on_success():
 
 
 @pytest.mark.asyncio
-async def test_say_remote_delegates_to_play_with_fallback():
-    """Cycle 8 (E-a): output='remote' は adapter の play_with_fallback に委譲する。
+async def test_say_remote_delegates_to_speak_tapo_speaker():
+    """Phase C-5 (v5): output='remote' は ``speak(target='tapo_speaker')`` に委譲する。
 
-    本体の壊れた _play_via_go2rtc (localhost:1984) ではなく、フルフォールバック
-    チェーン (target='auto') を回す adapter 経路を使うことを検証。remote 成功時は
-    ローカル再生 (speak/_play_local) にフォールバックしない。
+    v5 でフォールバックチェーン (play_with_fallback) は撤廃。output パラメータは
+    deprecated 扱いで無視され、常に tapo_speaker 単一経路に送出される。
     """
     tool = _make_tts()
     tool.output = "remote"
 
-    fake_pwf = AsyncMock(return_value=(True, "tapo_speaker"))
-    fake_speak = AsyncMock(return_value=b"FAKE_WAV")
+    fake_speak = AsyncMock(return_value=None)
 
-    with (
-        patch("pico_agent.adapters.tts_sbv2.play_with_fallback", fake_pwf),
-        patch("pico_agent.adapters.tts_sbv2.speak", fake_speak),
-        patch(
-            "familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)
-        ) as mock_local,
-    ):
+    with patch("pico_agent.adapters.tts_sbv2.speak", fake_speak):
         result = await tool.say("hello")
 
-    fake_pwf.assert_awaited_once()
-    assert fake_pwf.await_args.args[0] == "hello"
-    assert fake_pwf.await_args.kwargs.get("target") == "auto"
-    # remote 成功時はローカルへフォールバックしない (二重再生・二重 fetch 回避)。
-    mock_local.assert_not_called()
-    fake_speak.assert_not_awaited()
+    fake_speak.assert_awaited_once()
+    assert fake_speak.await_args.args[0] == "hello"
+    assert fake_speak.await_args.kwargs.get("target") == "tapo_speaker"
     assert "tapo_speaker" in result
 
 
 @pytest.mark.asyncio
-async def test_say_remote_failure_falls_through_to_local():
-    """E-2 バグ修正: remote 再生が失敗したらローカル再生にフォールスルーする。
+async def test_say_remote_failure_no_fallback():
+    """v5 (Phase C-5): adapter speak() 失敗時もフォールスルーせず無音で終わる。
 
-    旧コードは TTS_OUTPUT=remote かつ go2rtc 失敗時に早期 return して無音だった。
-    play_with_fallback が (False, ...) を返した場合、ローカル再生を試みること。
+    旧コードでは remote 失敗時 → local フォールバックしていたが、v5 (14-5-11) で
+    フォールバック自体撤廃。失敗時は adapter 内で warning のみ、say() は
+    voice_guard を通常通り閉じて送出した旨だけ返す (adapter ログ依存)。
     """
     tool = _make_tts()
     tool.output = "remote"
 
-    fake_pwf = AsyncMock(return_value=(False, "all_failed"))
+    # speak() が例外を投げず None 返却 (silent fail)
+    fake_speak = AsyncMock(return_value=None)
 
     with (
-        patch("pico_agent.adapters.tts_sbv2.play_with_fallback", fake_pwf),
-        patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"FAKE_WAV")),
+        patch("pico_agent.adapters.tts_sbv2.speak", fake_speak),
+        # _play_local など旧フォールバック先は呼ばれない (dead code)
         patch(
             "familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)
         ) as mock_local,
-        patch("os.unlink"),
-        patch("tempfile.NamedTemporaryFile") as mock_tmp,
     ):
-        tmp_file = MagicMock()
-        tmp_file.__enter__ = MagicMock(return_value=tmp_file)
-        tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.wav"
-        mock_tmp.return_value = tmp_file
+        await tool.say("hello")
 
-        result = await tool.say("hello")
-
-    fake_pwf.assert_awaited_once()
-    mock_local.assert_called_once()  # 無音にならずローカルへフォールスルー
-    assert "local" in result
+    fake_speak.assert_awaited_once()
+    # v5: ローカル再生フォールバックは発生しない
+    mock_local.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -232,18 +188,7 @@ async def test_say_serializes_concurrent_calls():
     """Concurrent say() calls must be serialized (lock prevents overlap)."""
     tool = _make_tts()
 
-    with (
-        patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"FAKE_WAV")),
-        patch("familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)),
-        patch("os.unlink"),
-        patch("tempfile.NamedTemporaryFile") as mock_tmp,
-    ):
-        tmp_file = MagicMock()
-        tmp_file.__enter__ = MagicMock(return_value=tmp_file)
-        tmp_file.__exit__ = MagicMock(return_value=False)
-        tmp_file.name = "/tmp/fake.wav"
-        mock_tmp.return_value = tmp_file
-
+    with patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=None)):
         # Launch two say() calls concurrently
         results = await asyncio.gather(
             tool.say("first"),

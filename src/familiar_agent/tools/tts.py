@@ -135,27 +135,24 @@ class TTSTool:
     async def say(self, text: str, output: str | None = None) -> str:
         """Speak text aloud (pico_v3: routed through Style-BERT-VITS2 adapter).
 
-        output: "local" = PC speaker, "remote" = camera speaker (go2rtc), "both" = both.
-                Defaults to self.output when not specified.
+        output: 互換性のため signature は維持するが、v5 (設計書 14-5-11) では
+                deprecated 扱いで無視され、常に ``target="tapo_speaker"`` で
+                go2rtc HTTP API → Tapo C210 経路に送出される。フォールバック
+                チェーン (素案 14-5-11 の tapo→main_pc→rpi5) は v5 で撤廃。
 
         Concurrent calls are serialized via self._lock so audio never overlaps.
 
-        Phase C-1 で pico_agent.adapters.tts_sbv2 経由に差し替え。ElevenLabs
-        直叩きコードは dead-code として残置 (上流マージコンフリクト最小化)。
-
-        Cycle 8 (E-a): remote/both の go2rtc 再生は本体オリジナルの
-        ``_play_via_go2rtc`` (``localhost:1984`` 固定で Pi からは到達不能) では
-        なく adapter の ``tts_sbv2.play_with_fallback`` に委譲する。これで
-        ``GO2RTC_BASE_URL`` / ``TAPO_STREAM_NAME`` / ``GO2RTC_ENABLED`` /
-        ffmpeg 前処理 / フォールバックチェーン (tapo→main_pc→rpi5) が設計通り
-        効く。本体側の ``_play_via_go2rtc`` / ``go2rtc_url`` / ``go2rtc_stream``
-        は say() からは未使用となり退役候補。
+        Phase C-1 で pico_agent.adapters.tts_sbv2 経由に差し替え。
+        Phase C-5 (v5) で ``play_with_fallback`` を撤廃し ``speak()`` 単一経路に
+        統一。本体側の ``_play_via_go2rtc`` / ``go2rtc_url`` / ``go2rtc_stream``
+        / ``_play_local`` 系は say() からは未使用となり dead code 化
+        (上流マージ性維持のため削除はしない、二層分離原則)。
         """
         # NOTE: aiohttp 直叩きは pico_v3 で停止 (adapter 経由に統一)。
         from pico_agent.adapters import tts_sbv2
 
-        if output is None:
-            output = self.output
+        # output パラメータは v5 で deprecated。受け取るだけで使わない。
+        del output
         if len(text) > 200:
             text = text[:197] + "..."
 
@@ -174,45 +171,18 @@ class TTSTool:
             if voice_guard is None:
                 voice_guard = get_shared_voice_guard()
                 self._voice_guard = voice_guard
-            played_via: list[str] = []
-            tmp_path: str | None = None
             voice_guard.on_tts_start(text)
+            played = False
             try:
-                # ── remote / both: カメラ (Tapo C210) 再生は adapter に委譲 ──
-                # remote はフルフォールバックチェーン (auto = tapo→main_pc→rpi5)、
-                # both はローカルを下で明示再生するのでカメラのみ (tapo_speaker)。
-                if output in ("remote", "both"):
-                    pwf_target = "auto" if output == "remote" else "tapo_speaker"
-                    ok, via = await tts_sbv2.play_with_fallback(text, target=pwf_target)
-                    if ok:
-                        played_via.append(via)
-                    else:
-                        logger.warning("tts_sbv2.play_with_fallback failed: %s", via)
-
-                # ── local PC スピーカー ──
-                # local/both は常に、remote は adapter が何も鳴らせなかった時のみ
-                # (E-2 の無音バグ修正: remote 失敗時はローカルへフォールスルー)。
-                if output in ("local", "both") or (output == "remote" and not played_via):
-                    # SBV2 adapter は WAV bytes を返す (失敗時は空 bytes)。
-                    audio_data = await tts_sbv2.speak(text, target="local_speaker")
-                    if audio_data:
-                        # SBV2 は WAV を返すので tmp に書き出して既存再生経路を再利用。
-                        tmp_path = _write_tmp_audio(audio_data, suffix=".wav")
-                        if await _play_local(tmp_path):
-                            played_via.append("local")
-                    elif not played_via:
-                        return "TTS API failed (adapter returned empty bytes)"
-
-                if not played_via:
-                    return "TTS playback failed (no working audio player found)"
-                return f"Said: {text[:50]}... (via {', '.join(played_via)})"
+                # v5 14-5-11: 常に target="tapo_speaker" で go2rtc HTTP API 経由。
+                # 失敗時は無音 (adapter 内で warning 済、フォールバックなし)。
+                await tts_sbv2.speak(text, target="tapo_speaker")
+                # speak() は None 返却、成否は adapter ログを参照。
+                # 二層分離維持のため、ここでは "送出した" 旨だけ返す。
+                played = True
+                return f"Said: {text[:50]}... (via tapo_speaker)"
             finally:
-                voice_guard.on_tts_end(text, played=bool(played_via))
-                if tmp_path is not None:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+                voice_guard.on_tts_end(text, played=played)
 
     def get_tool_definitions(self) -> list[dict]:
         return [

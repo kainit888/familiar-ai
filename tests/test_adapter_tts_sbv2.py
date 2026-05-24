@@ -1,14 +1,21 @@
-"""Tests for pico_agent.adapters.tts_sbv2 (Phase C-1 + C-3)。
+"""Tests for pico_agent.adapters.tts_sbv2 (Phase C-5 v5 単一経路版)。
 
 Style-BERT-VITS2 公式 API は GET /voice?text=...&model_name=... を返す
 WAV bytes を返す前提 (Phase C-3 でカイニットの実機検証により確定) で、
 aiohttp HTTP を mock 検証する。
 
 go2rtc 連携は POST /api/streams?dst=...&src=ffmpeg:... 形式 (Phase C-3 確定)。
+
+v5 (2026-05-24) で ``play_with_fallback`` (tapo → main_pc → rpi5 の 3 段
+フォールバック) を撤廃。``speak(text, target="tapo_speaker")`` の単一経路
+(go2rtc HTTP API → Tapo C210) に統一。``speak()`` は失敗時無音 (None 返却)、
+フォールバックは設けない (設計書 14-5-11 / 14-5-12)。
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,7 +42,7 @@ def _reset_warmup_state(monkeypatch, tmp_path):
 
 
 def _make_mock_session(status: int = 200, audio: bytes = b"FAKE_WAV_BYTES", text_body: str = ""):
-    """aiohttp.ClientSession の async context を組み立てて返す。"""
+    """aiohttp.ClientSession の async context を組み立てて返す (GET 用)。"""
     mock_resp = MagicMock()
     mock_resp.status = status
     mock_resp.read = AsyncMock(return_value=audio)
@@ -50,71 +57,179 @@ def _make_mock_session(status: int = 200, audio: bytes = b"FAKE_WAV_BYTES", text
     return mock_session
 
 
+def _patch_go2rtc_chain(monkeypatch, tmp_path, post_status: int = 200):
+    """tapo_speaker 経路の ffmpeg 前処理と go2rtc POST を mock する。
+
+    Returns:
+        captured dict: ``url`` / ``method`` (post/put) / ``post_count`` を記録する。
+    """
+    pre_path = str(tmp_path / "preprocessed.wav")
+    (tmp_path / "preprocessed.wav").write_bytes(b"PREPROCESSED")
+
+    async def fake_preprocess(_src):
+        return pre_path
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+    )
+
+    captured: dict = {"urls": [], "method": None, "post_count": 0}
+
+    class _MockResp:
+        status = post_status
+
+        async def text(self):
+            return "ok" if post_status < 400 else "error"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class _MockSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, url, data=None, headers=None):
+            captured["urls"].append(url)
+            captured["method"] = "post"
+            captured["post_count"] += 1
+            return _MockResp()
+
+        def put(self, url, data=None, headers=None):
+            captured["method"] = "put"
+            return _MockResp()
+
+        def get(self, url):
+            # 暖機が動いた場合に備えて (本テストでは事前に _WARMUP_DONE=True)
+            resp = MagicMock()
+            resp.status = 200
+            resp.read = AsyncMock(return_value=b"WAV")
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession
+    )
+    return captured
+
+
+# ── speak() 基本動作 ────────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_speak_returns_wav_bytes_on_success():
-    """正常系: WAV bytes が返る。"""
-    mock_session = _make_mock_session(status=200, audio=b"RIFF\x24\x00\x00\x00WAVE")
-
-    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
-        audio = await tts_sbv2.speak("こんにちは")
-
-    assert audio == b"RIFF\x24\x00\x00\x00WAVE"
-    mock_session.get.assert_called_once()
+async def test_speak_returns_none(monkeypatch, tmp_path):
+    """正常系: speak() は None を返す (v5 で bytes 返却から変更)。"""
+    _patch_go2rtc_chain(monkeypatch, tmp_path)
+    result = await tts_sbv2.speak("こんにちは", target="tapo_speaker")
+    assert result is None
 
 
 @pytest.mark.asyncio
-async def test_speak_empty_text_returns_empty_bytes():
-    """空テキストは silent fail で空 bytes (raise しない)。"""
-    audio = await tts_sbv2.speak("")
-    assert audio == b""
-
-    audio = await tts_sbv2.speak("   ")
-    assert audio == b""
+async def test_speak_empty_text_returns_silently():
+    """空テキストは silent fail で None (raise しない)。"""
+    assert await tts_sbv2.speak("") is None
+    assert await tts_sbv2.speak("   ") is None
 
 
 @pytest.mark.asyncio
-async def test_speak_http_error_returns_empty_bytes():
-    """500 等は silent fail で空 bytes。"""
+async def test_speak_http_error_returns_silently(monkeypatch, tmp_path):
+    """SBV2 が 500 を返したら silent fail で None (フォールバックなし)。"""
+    # ffmpeg は呼ばれない (SBV2 で失敗するので)
+    pre_called: list = []
+
+    async def fake_preprocess(_src):
+        pre_called.append("called")
+        return None
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+    )
     mock_session = _make_mock_session(status=500, text_body="server error")
-
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
-        audio = await tts_sbv2.speak("hello")
-
-    assert audio == b""
+        result = await tts_sbv2.speak("hello", target="tapo_speaker")
+    assert result is None
+    assert pre_called == []
 
 
 @pytest.mark.asyncio
-async def test_speak_network_exception_returns_empty_bytes():
-    """接続失敗も silent fail。"""
+async def test_speak_network_exception_returns_silently():
+    """接続失敗も silent fail で None。"""
     with patch(
         "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession",
         side_effect=Exception("connection refused"),
     ):
-        audio = await tts_sbv2.speak("hi")
-
-    assert audio == b""
+        result = await tts_sbv2.speak("hi", target="tapo_speaker")
+    assert result is None
 
 
 @pytest.mark.asyncio
-async def test_speak_splits_long_text_into_multiple_requests():
+async def test_speak_splits_long_text_into_multiple_requests(monkeypatch, tmp_path):
     """100 文字超は句読点で分割 → 複数 GET になる。"""
-    # 句読点ありで合計 250 文字程度。
+    _patch_go2rtc_chain(monkeypatch, tmp_path)
+
     long_text = ("こんにちは。今日は良い天気ですね。" + "ピコは元気です、ええ、本当に元気です。") * 5
     mock_session = _make_mock_session(status=200, audio=b"WAV")
 
-    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
-        audio = await tts_sbv2.speak(long_text)
+    # _post_to_go2rtc は _patch_go2rtc_chain で別 session を使うので、GET 専用に
+    # ClientSession を差し替える必要がある (両方の呼び出しを 1 つでカバー)
+    captured: dict = {"get_count": 0, "post_count": 0, "post_urls": []}
 
-    # 複数チャンクに分かれ、それぞれ b"WAV" が連結される。
-    call_count = mock_session.get.call_count
-    assert call_count >= 2, f"expected >=2 requests for long text, got {call_count}"
-    assert audio == b"WAV" * call_count
+    class _CountingSession:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get(self, url):
+            captured["get_count"] += 1
+            resp = MagicMock()
+            resp.status = 200
+            resp.read = AsyncMock(return_value=b"WAV")
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        def post(self, url, data=None, headers=None):
+            captured["post_count"] += 1
+            captured["post_urls"].append(url)
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CountingSession
+    )
+    del mock_session  # noqa: F841 - keep for symmetry
+
+    await tts_sbv2.speak(long_text, target="tapo_speaker")
+    # 複数チャンクに分かれて GET される。
+    assert captured["get_count"] >= 2, f"expected >=2 GET requests, got {captured['get_count']}"
+    # 単一の go2rtc POST (連結 WAV を一括送出)
+    assert captured["post_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_speak_passes_speaker_id_to_query():
+async def test_speak_passes_speaker_id_to_query(monkeypatch, tmp_path):
     """speaker_id=3 が URL クエリに含まれる。"""
-    captured: dict = {}
+    captured: dict = {"get_url": None, "post_url": None}
 
     class _CapturingSession:
         def __init__(self, *_args, **_kwargs):
@@ -127,7 +242,7 @@ async def test_speak_passes_speaker_id_to_query():
             return False
 
         def get(self, url):
-            captured["url"] = url
+            captured["get_url"] = url
             resp = MagicMock()
             resp.status = 200
             resp.read = AsyncMock(return_value=b"WAV")
@@ -136,20 +251,36 @@ async def test_speak_passes_speaker_id_to_query():
             resp.__aexit__ = AsyncMock(return_value=False)
             return resp
 
-    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
-        audio = await tts_sbv2.speak("hi", speaker_id=3)
+        def post(self, url, data=None, headers=None):
+            captured["post_url"] = url
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
 
-    assert audio == b"WAV"
-    assert "speaker_id=3" in captured["url"]
-    assert "text=hi" in captured["url"]
+    async def fake_preprocess(_src):
+        return str(tmp_path / "pre.wav")
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+    )
+    (tmp_path / "pre.wav").write_bytes(b"PRE")
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
+        await tts_sbv2.speak("hi", target="tapo_speaker", speaker_id=3)
+
+    assert captured["get_url"] is not None
+    assert "speaker_id=3" in captured["get_url"]
+    assert "text=hi" in captured["get_url"]
     # Phase C-3: model_name=jvnv-F1-jp が URL に含まれる
-    assert "model_name=jvnv-F1-jp" in captured["url"]
+    assert "model_name=jvnv-F1-jp" in captured["get_url"]
 
 
 @pytest.mark.asyncio
-async def test_speak_emotion_affects_style_weight():
+async def test_speak_emotion_affects_style_weight(monkeypatch, tmp_path):
     """emotion={'valence': 1.0} → style_weight=1.0 (高揚) がクエリに乗る。"""
-    captured: dict = {}
+    captured: dict = {"get_url": None}
 
     class _CapturingSession:
         def __init__(self, *_args, **_kwargs):
@@ -162,7 +293,7 @@ async def test_speak_emotion_affects_style_weight():
             return False
 
         def get(self, url):
-            captured["url"] = url
+            captured["get_url"] = url
             resp = MagicMock()
             resp.status = 200
             resp.read = AsyncMock(return_value=b"WAV")
@@ -171,761 +302,294 @@ async def test_speak_emotion_affects_style_weight():
             resp.__aexit__ = AsyncMock(return_value=False)
             return resp
 
+        def post(self, url, data=None, headers=None):
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+    async def fake_preprocess(_src):
+        return str(tmp_path / "pre.wav")
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+    )
+    (tmp_path / "pre.wav").write_bytes(b"PRE")
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
-        await tts_sbv2.speak("happy!", emotion={"valence": 1.0, "arousal": 0.5})
+        await tts_sbv2.speak("happy!", target="tapo_speaker", emotion={"valence": 1.0, "arousal": 0.5})
 
-    assert "style_weight=1.00" in captured["url"]
-
-
-@pytest.mark.asyncio
-async def test_speak_invalid_target_falls_back_silently():
-    """不正な target は warning だけ出して discord_vc にフォールバック。"""
-    mock_session = _make_mock_session(status=200, audio=b"WAV")
-
-    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
-        audio = await tts_sbv2.speak("hi", target="bogus")
-
-    # raise せず WAV を返す。
-    assert audio == b"WAV"
-
-
-# ── v4.2 14-5: play_with_fallback() のテスト ──────────────────────────
+    assert captured["get_url"] is not None
+    assert "style_weight=1.00" in captured["get_url"]
 
 
 @pytest.mark.asyncio
-async def test_play_with_fallback_empty_text():
-    """空テキストは即 False を返す。"""
-    ok, via = await tts_sbv2.play_with_fallback("")
-    assert ok is False
-    assert via == "empty_text"
+async def test_speak_invalid_target_returns_silently_no_post(monkeypatch, tmp_path):
+    """不正な target は warning だけ出して silently return (POST しない)。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
+    result = await tts_sbv2.speak("hi", target="bogus")
+    assert result is None
+    assert captured["post_count"] == 0
+
+
+# ── speak() target ごとのスタブ動作 (v5 14-5-11) ────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_play_with_fallback_no_audio_from_sbv2():
-    """SBV2 が空 bytes を返したら no_audio を返す。"""
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b""),
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi")
-    assert ok is False
-    assert via == "no_audio"
+async def test_speak_discord_vc_is_stub(monkeypatch, tmp_path):
+    """target=discord_vc は warning + return (Phase D 未実装、SBV2 GET も POST も不発)。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
+    get_called: list = []
+
+    def _no_session(*_a, **_kw):
+        get_called.append("called")
+        raise AssertionError("ClientSession must not be called for discord_vc stub")
+
+    # SBV2 GET 経路も発火しないことを確認
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", side_effect=_no_session):
+        result = await tts_sbv2.speak("hi", target="discord_vc")
+
+    assert result is None
+    assert get_called == []
+    assert captured["post_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_play_with_fallback_auto_tries_tapo_first():
-    """target=auto では tapo_speaker → main_pc → rpi5 の順で試行する。"""
-    call_order: list[str] = []
+async def test_speak_obs_audio_is_stub(monkeypatch, tmp_path):
+    """target=obs_audio は warning + return (Phase K 未実装)。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
+    get_called: list = []
 
-    async def fake_tapo(audio):
-        call_order.append("tapo")
-        return False  # tapo は失敗
+    def _no_session(*_a, **_kw):
+        get_called.append("called")
+        raise AssertionError("ClientSession must not be called for obs_audio stub")
 
-    async def fake_main_pc(audio):
-        call_order.append("main_pc")
-        return True  # main_pc で成功
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", side_effect=_no_session):
+        result = await tts_sbv2.speak("hi", target="obs_audio")
 
-    async def fake_rpi5(audio):
-        call_order.append("rpi5")
-        return True
+    assert result is None
+    assert get_called == []
+    assert captured["post_count"] == 0
 
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": fake_tapo, "main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="auto")
 
-    assert ok is True
-    assert via == "main_pc"
-    # 確認: rpi5 までは到達しない (main_pc で成功したので)
-    assert call_order == ["tapo", "main_pc"]
+# ── mutation 検知用 (v5 設計の中核) ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_play_with_fallback_auto_all_failed():
-    """全 backend が失敗したら all_failed を返す。"""
-
-    async def always_fail(audio):
-        return False
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {
-            "tapo_speaker": always_fail,
-            "main_pc": always_fail,
-            "rpi5": always_fail,
-        },
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="auto")
-
-    assert ok is False
-    assert via == "all_failed"
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_explicit_target_no_chain():
-    """target を明示指定したらフォールバックなし (その backend のみ試行)。"""
-    call_order: list[str] = []
-
-    async def fake_main_pc(audio):
-        call_order.append("main_pc")
-        return False
-
-    async def fake_rpi5(audio):
-        call_order.append("rpi5")
-        return True
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="main_pc")
-
-    # main_pc 単独試行 → 失敗で all_failed
-    assert ok is False
-    assert via == "all_failed"
-    assert call_order == ["main_pc"]
-    # rpi5 にはフォールバックしない
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_unknown_target_falls_back_to_auto():
-    """未知の target は warning 後 auto チェーンにフォールバック。"""
-    call_order: list[str] = []
-
-    async def fake_tapo(audio):
-        call_order.append("tapo")
-        return True
-
-    async def fake_main_pc(audio):
-        call_order.append("main_pc")
-        return True
-
-    async def fake_rpi5(audio):
-        call_order.append("rpi5")
-        return True
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": fake_tapo, "main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="bogus_target")
-
-    assert ok is True
-    assert via == "tapo_speaker"  # auto チェーンで tapo 最初
-    assert call_order == ["tapo"]
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_backend_raising_exception_skipped():
-    """backend が例外を投げても次の backend に移る (silent fail)。"""
-
-    async def fake_tapo(audio):
-        raise RuntimeError("simulated backend crash")
-
-    async def fake_main_pc(audio):
-        return True
-
-    async def fake_rpi5(audio):
-        return False
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": fake_tapo, "main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="auto")
-
-    assert ok is True
-    assert via == "main_pc"
-
-
-@pytest.mark.asyncio
-async def test_play_via_go2rtc_skipped_when_disabled(monkeypatch):
-    """GO2RTC_ENABLED が設定されていない時、_play_via_go2rtc は何もせず False。"""
-    monkeypatch.delenv("GO2RTC_ENABLED", raising=False)
-    result = await tts_sbv2._play_via_go2rtc(b"WAV")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_go2rtc_empty_bytes_returns_false():
-    """空 bytes は GO2RTC_ENABLED に関わらず False を返す。"""
-    result = await tts_sbv2._play_via_go2rtc(b"")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_main_pc_no_player_returns_false(monkeypatch):
-    """mpv/ffplay のどちらも PATH になければ False。"""
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", lambda name: None)
-    result = await tts_sbv2._play_via_main_pc(b"WAV")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_rpi5_no_player_returns_false(monkeypatch):
-    """aplay/paplay のどちらも PATH になければ False。"""
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", lambda name: None)
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.sys.platform", "linux")
-    result = await tts_sbv2._play_via_rpi5(b"WAV")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_rpi5_non_linux_skipped(monkeypatch):
-    """非 Linux プラットフォームでは _play_via_rpi5 は即 False。"""
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.sys.platform", "darwin")
-    result = await tts_sbv2._play_via_rpi5(b"WAV")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_main_pc_empty_bytes_returns_false():
-    """空 bytes はバックエンド呼び出し前に False を返す。"""
-    result = await tts_sbv2._play_via_main_pc(b"")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_rpi5_empty_bytes_returns_false():
-    """空 bytes はバックエンド呼び出し前に False を返す。"""
-    result = await tts_sbv2._play_via_rpi5(b"")
-    assert result is False
-
-
-# ── 外出期間タスク B: TTS フォールバックチェーン詳細テスト ─────────────
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_full_chain_tapo_then_main_pc_then_rpi5():
-    """tapo → main_pc → rpi5 の完全フォールバック (rpi5 だけ成功)。"""
-    call_order: list[str] = []
-
-    async def fake_tapo(audio):
-        call_order.append("tapo")
-        return False
-
-    async def fake_main_pc(audio):
-        call_order.append("main_pc")
-        return False
-
-    async def fake_rpi5(audio):
-        call_order.append("rpi5")
-        return True
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": fake_tapo, "main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="auto")
-
-    assert ok is True
-    assert via == "rpi5"
-    # 順序の厳密検証: tapo → main_pc → rpi5
-    assert call_order == ["tapo", "main_pc", "rpi5"]
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_tapo_succeeds_no_fallback_attempted():
-    """tapo が成功したら、main_pc と rpi5 は呼ばれない。"""
-    call_order: list[str] = []
-
-    async def fake_tapo(audio):
-        call_order.append("tapo")
-        return True
-
-    async def fake_main_pc(audio):
-        call_order.append("main_pc")
-        return True
-
-    async def fake_rpi5(audio):
-        call_order.append("rpi5")
-        return True
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": fake_tapo, "main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="auto")
-
-    assert ok is True
-    assert via == "tapo_speaker"
-    assert call_order == ["tapo"]
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_text_propagated_to_speak():
-    """play_with_fallback の text 引数が speak() にそのまま渡る。"""
-    speak_mock = AsyncMock(return_value=b"WAV")
-
-    async def fake_backend(audio):
-        return True
-
-    with patch("pico_agent.adapters.tts_sbv2.speak", new=speak_mock), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS", {"main_pc": fake_backend}
-    ):
-        await tts_sbv2.play_with_fallback("こんにちは、ピコだよ", target="main_pc")
-
-    speak_mock.assert_awaited_once()
-    # call_args.kwargs に text が含まれる (キーワード渡し)
-    assert speak_mock.call_args.kwargs["text"] == "こんにちは、ピコだよ"
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_speaker_id_propagated_to_speak():
-    """play_with_fallback の speaker_id が speak() にそのまま渡る。"""
-    speak_mock = AsyncMock(return_value=b"WAV")
-
-    async def fake_backend(audio):
-        return True
-
-    with patch("pico_agent.adapters.tts_sbv2.speak", new=speak_mock), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS", {"main_pc": fake_backend}
-    ):
-        await tts_sbv2.play_with_fallback("hi", target="main_pc", speaker_id=7)
-
-    assert speak_mock.call_args.kwargs["speaker_id"] == 7
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_emotion_propagated_to_speak():
-    """play_with_fallback の emotion dict が speak() にそのまま渡る。"""
-    speak_mock = AsyncMock(return_value=b"WAV")
-
-    async def fake_backend(audio):
-        return True
-
-    emo = {"valence": 0.85, "arousal": 0.3}
-    with patch("pico_agent.adapters.tts_sbv2.speak", new=speak_mock), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS", {"main_pc": fake_backend}
-    ):
-        await tts_sbv2.play_with_fallback("hi", target="main_pc", emotion=emo)
-
-    assert speak_mock.call_args.kwargs["emotion"] == emo
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_audio_bytes_passed_to_backend():
-    """backend に SBV2 から取得した WAV bytes が正しく渡される。"""
-    received: list[bytes] = []
-
-    async def capturing_backend(audio):
-        received.append(audio)
-        return True
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"FAKE_WAV_BYTES_12345"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS", {"main_pc": capturing_backend}
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="main_pc")
-
-    assert ok is True
-    assert received == [b"FAKE_WAV_BYTES_12345"]
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_whitespace_only_text_returns_empty():
-    """空白のみのテキストも empty_text を返す。"""
-    ok, via = await tts_sbv2.play_with_fallback("   \n\t  ")
-    assert ok is False
-    assert via == "empty_text"
-
-
-@pytest.mark.asyncio
-async def test_play_with_fallback_target_none_treated_as_auto():
-    """target=None ではなく target='auto' でデフォルト動作 (default 値テスト)。
-
-    現実装の signature は target: str = "auto" なので None は型に違反。
-    ただし default 値で呼んだ時に auto と同じ挙動になることを確認。
+async def test_speak_tapo_speaker_uses_http_api_only(monkeypatch, tmp_path):
+    """mutation A 検知: tapo_speaker は go2rtc HTTP POST のみで、サブプロセス起動なし。
+
+    検証項目:
+        - SBV2 GET と go2rtc POST が呼ばれる
+        - posted URL に dst=tapo_c210 が含まれる
+        - subprocess.Popen / subprocess.run は呼ばれない (ローカル go2rtc バイナリ起動なし)
+        - URL に embodied-claude / .cache が混入しない
     """
-    call_order: list[str] = []
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
 
-    async def succ_backend(audio):
-        call_order.append("called")
-        return True
+    with patch.object(subprocess, "Popen") as mock_popen, patch.object(
+        subprocess, "run"
+    ) as mock_run:
+        await tts_sbv2.speak("テスト", target="tapo_speaker")
+
+    # go2rtc HTTP POST が 1 回呼ばれた
+    assert captured["post_count"] == 1
+    assert captured["method"] == "post"
+    posted_url = captured["urls"][0]
+    assert "dst=tapo_c210" in posted_url
+    # ローカル go2rtc バイナリ起動はゼロ
+    mock_popen.assert_not_called()
+    mock_run.assert_not_called()
+    # URL に embodied-claude / .cache の混入なし
+    for url in captured["urls"]:
+        assert "embodied-claude" not in url
+        assert ".cache" not in url
+
+
+@pytest.mark.asyncio
+async def test_speak_failure_returns_silently(monkeypatch):
+    """mutation B 検知: SBV2 失敗時に mpv/ffplay/aplay/paplay を呼ばない (フォールバックなし)。"""
+    mock_exec = AsyncMock()
 
     with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": succ_backend, "main_pc": succ_backend, "rpi5": succ_backend},
+        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession",
+        side_effect=Exception("connection refused"),
+    ), patch.object(subprocess, "Popen") as mock_popen, patch.object(
+        subprocess, "run"
+    ) as mock_run, patch(
+        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", mock_exec
     ):
-        ok, via = await tts_sbv2.play_with_fallback("hi")  # target 省略 = auto
+        result = await tts_sbv2.speak("テスト", target="tapo_speaker")
 
-    assert ok is True
-    assert via == "tapo_speaker"
-    assert call_order == ["called"]
+    assert result is None
+    mock_popen.assert_not_called()
+    mock_run.assert_not_called()
+    # mpv / ffplay / aplay / paplay へのフォールバック起動はゼロ
+    for call in mock_exec.call_args_list:
+        bin_name = os.path.basename(call.args[0]) if call.args else ""
+        assert bin_name not in ("mpv", "ffplay", "aplay", "paplay"), (
+            f"unexpected fallback binary {bin_name!r} invoked"
+        )
+
+
+@pytest.mark.asyncio
+async def test_speak_ffmpeg_failure_returns_silently(monkeypatch, tmp_path):
+    """ffmpeg 前処理が失敗したら go2rtc POST せず silently return。"""
+    # SBV2 は成功
+    captured: dict = {"post_count": 0}
+
+    class _MockSession:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get(self, url):
+            resp = MagicMock()
+            resp.status = 200
+            resp.read = AsyncMock(return_value=b"WAV")
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        def post(self, url, data=None, headers=None):
+            captured["post_count"] += 1
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    # ffmpeg 前処理が None を返す (失敗)
+    async def fake_preprocess(_src):
+        return None
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+    )
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession)
+
+    result = await tts_sbv2.speak("テスト", target="tapo_speaker")
+    assert result is None
+    assert captured["post_count"] == 0  # go2rtc POST は呼ばれない
+
+
+@pytest.mark.asyncio
+async def test_speak_go2rtc_post_failure_returns_silently(monkeypatch, tmp_path):
+    """go2rtc POST が 503 を返したら silently return (フォールバックなし)。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path, post_status=503)
+    mock_exec = AsyncMock()
+
+    with patch.object(subprocess, "Popen") as mock_popen, patch(
+        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", mock_exec
+    ):
+        result = await tts_sbv2.speak("テスト", target="tapo_speaker")
+
+    assert result is None
+    assert captured["post_count"] == 1  # POST は試行したが 503
+    mock_popen.assert_not_called()  # フォールバックでローカル再生はしない
+
+
+@pytest.mark.asyncio
+async def test_speak_no_fallback_to_main_pc_or_rpi5(monkeypatch, tmp_path):
+    """SBV2 失敗時に mpv/ffplay/aplay/paplay へのフォールバックは発生しない (v5)。"""
+    mock_exec = AsyncMock()
+
+    with patch(
+        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession",
+        side_effect=Exception("SBV2 down"),
+    ), patch(
+        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", mock_exec
+    ):
+        await tts_sbv2.speak("テスト", target="tapo_speaker")
+
+    # フォールバックバイナリは一度も呼ばれない
+    for call in mock_exec.call_args_list:
+        bin_name = os.path.basename(call.args[0]) if call.args else ""
+        assert bin_name not in ("mpv", "ffplay", "aplay", "paplay")
+
+
+@pytest.mark.asyncio
+async def test_speak_does_not_spawn_local_go2rtc_binary(monkeypatch, tmp_path):
+    """ローカル go2rtc バイナリ起動 (subprocess.Popen / ~/.cache URL 参照) は一切ない。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
+
+    with patch.object(subprocess, "Popen") as mock_popen, patch.object(
+        subprocess, "run"
+    ) as mock_run:
+        await tts_sbv2.speak("テスト", target="tapo_speaker")
+
+    mock_popen.assert_not_called()
+    mock_run.assert_not_called()
+    # 全 URL に embodied-claude / .cache / go2rtc バイナリのパスは含まれない
+    for url in captured["urls"]:
+        assert "embodied-claude" not in url
+        assert ".cache" not in url
+
+
+# ── ターゲット parametrize (env override 5 件) ───────────────────────────
 
 
 @pytest.mark.parametrize(
-    "target_name",
-    ["tapo_speaker", "main_pc", "rpi5"],
+    "base_url_env,stream_env,expected_host,expected_stream",
+    [
+        ("http://192.168.10.104:1984", "tapo_c210", "192.168.10.104:1984", "tapo_c210"),
+        ("http://10.0.0.1:2984", "my_stream", "10.0.0.1:2984", "my_stream"),
+        ("http://localhost:1984/", "stream_x", "localhost:1984", "stream_x"),  # 末尾 / は rstrip
+        ("http://example.com:9000", "alt_stream", "example.com:9000", "alt_stream"),
+        ("http://192.168.10.104:1984", "custom_c210", "192.168.10.104:1984", "custom_c210"),
+    ],
 )
 @pytest.mark.asyncio
-async def test_play_with_fallback_each_explicit_target(target_name: str):
-    """各 target を明示指定したら、その backend だけが呼ばれる。"""
-    call_log: list[str] = []
+async def test_speak_tapo_speaker_env_override(
+    monkeypatch, tmp_path, base_url_env, stream_env, expected_host, expected_stream
+):
+    """GO2RTC_BASE_URL / TAPO_STREAM_NAME の env 上書きが POST URL に反映される。"""
+    monkeypatch.setenv("GO2RTC_BASE_URL", base_url_env)
+    monkeypatch.setenv("TAPO_STREAM_NAME", stream_env)
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
 
-    async def make_backend(name: str):
-        async def _b(audio):
-            call_log.append(name)
-            return True
-        return _b
+    await tts_sbv2.speak("テスト", target="tapo_speaker")
 
-    backends = {
-        "tapo_speaker": await make_backend("tapo_speaker"),
-        "main_pc": await make_backend("main_pc"),
-        "rpi5": await make_backend("rpi5"),
-    }
+    assert captured["post_count"] == 1
+    posted_url = captured["urls"][0]
+    assert expected_host in posted_url
+    assert f"dst={expected_stream}" in posted_url
 
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS", backends
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target=target_name)
 
-    assert ok is True
-    assert via == target_name
-    # 他の backend は呼ばれない
-    assert call_log == [target_name]
+# ── _post_to_go2rtc 単体テスト ─────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_play_with_fallback_multiple_exceptions_skipped():
-    """複数 backend で例外が出ても、最終 backend で成功なら True を返す。"""
-
-    async def fake_tapo(audio):
-        raise RuntimeError("tapo error")
-
-    async def fake_main_pc(audio):
-        raise ValueError("main_pc error")
-
-    async def fake_rpi5(audio):
-        return True
-
-    with patch(
-        "pico_agent.adapters.tts_sbv2.speak",
-        new=AsyncMock(return_value=b"WAV"),
-    ), patch(
-        "pico_agent.adapters.tts_sbv2._BACKENDS",
-        {"tapo_speaker": fake_tapo, "main_pc": fake_main_pc, "rpi5": fake_rpi5},
-    ):
-        ok, via = await tts_sbv2.play_with_fallback("hi", target="auto")
-
-    assert ok is True
-    assert via == "rpi5"
-
-
-@pytest.mark.asyncio
-async def test_play_via_main_pc_uses_mpv_if_available(monkeypatch, tmp_path):
-    """mpv が PATH にあれば mpv が選ばれる (ffplay でなく)。"""
-
-    def _which_mpv(name: str):
-        return "/usr/bin/mpv" if name == "mpv" else None
-
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", _which_mpv)
-
-    captured_args: list = []
-
-    async def fake_exec(*args, **kwargs):
-        captured_args.append(args)
-        # subprocess は実行しない、即 mock proc を返す
-        from unittest.mock import MagicMock
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=0)
-        return proc
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", fake_exec
-    )
-    # tempfile 出力先を tmp_path 指定
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._write_tmp_wav",
-        lambda b: str(tmp_path / "fake.wav"),
-    )
-
-    result = await tts_sbv2._play_via_main_pc(b"WAV")
+async def test_post_to_go2rtc_success(monkeypatch, tmp_path):
+    """_post_to_go2rtc が POST に成功すれば True を返す。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
+    result = await tts_sbv2._post_to_go2rtc(str(tmp_path / "pre.wav"))
     assert result is True
-    # mpv バイナリが選ばれている
-    assert captured_args[0][0].endswith("mpv")
-    assert "--no-terminal" in captured_args[0]
+    assert captured["method"] == "post"
 
 
 @pytest.mark.asyncio
-async def test_play_via_main_pc_falls_back_to_ffplay(monkeypatch, tmp_path):
-    """mpv が無くて ffplay があれば ffplay が選ばれる。"""
-
-    def _which_ffplay(name: str):
-        if name == "mpv":
-            return None
-        if name == "ffplay":
-            return "/usr/bin/ffplay"
-        return None
-
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", _which_ffplay)
-
-    captured_args: list = []
-
-    async def fake_exec(*args, **kwargs):
-        captured_args.append(args)
-        from unittest.mock import MagicMock
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=0)
-        return proc
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", fake_exec
-    )
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._write_tmp_wav",
-        lambda b: str(tmp_path / "fake.wav"),
-    )
-
-    result = await tts_sbv2._play_via_main_pc(b"WAV")
-    assert result is True
-    assert captured_args[0][0].endswith("ffplay")
-    # ffplay のフラグが選ばれている
-    assert "-nodisp" in captured_args[0]
-    assert "-autoexit" in captured_args[0]
-
-
-@pytest.mark.asyncio
-async def test_play_via_main_pc_nonzero_exit_returns_false(monkeypatch, tmp_path):
-    """subprocess が non-zero exit したら False を返す。"""
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._which", lambda n: "/usr/bin/mpv"
-    )
-
-    async def fake_exec(*args, **kwargs):
-        from unittest.mock import MagicMock
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=1)  # non-zero
-        return proc
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", fake_exec
-    )
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._write_tmp_wav",
-        lambda b: str(tmp_path / "fake.wav"),
-    )
-
-    result = await tts_sbv2._play_via_main_pc(b"WAV")
+async def test_post_to_go2rtc_http_error_returns_false(monkeypatch, tmp_path):
+    """HTTP 4xx/5xx 応答なら False を返す。"""
+    _patch_go2rtc_chain(monkeypatch, tmp_path, post_status=503)
+    result = await tts_sbv2._post_to_go2rtc(str(tmp_path / "pre.wav"))
     assert result is False
 
 
 @pytest.mark.asyncio
-async def test_play_via_main_pc_exception_returns_false(monkeypatch):
-    """subprocess 生成で例外が出ても False を返す (silent fail)。"""
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._which", lambda n: "/usr/bin/mpv"
-    )
-
-    async def fake_exec(*args, **kwargs):
-        raise OSError("Permission denied")
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", fake_exec
-    )
-
-    result = await tts_sbv2._play_via_main_pc(b"WAV")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_rpi5_uses_aplay_first(monkeypatch, tmp_path):
-    """aplay が PATH にあれば aplay が選ばれる (paplay より優先)。"""
-
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.sys.platform", "linux")
-
-    def _which_aplay(name: str):
-        return f"/usr/bin/{name}" if name in ("aplay", "paplay") else None
-
-    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", _which_aplay)
-
-    captured_args: list = []
-
-    async def fake_exec(*args, **kwargs):
-        captured_args.append(args)
-        from unittest.mock import MagicMock
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=0)
-        return proc
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", fake_exec
-    )
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._write_tmp_wav",
-        lambda b: str(tmp_path / "fake.wav"),
-    )
-
-    result = await tts_sbv2._play_via_rpi5(b"WAV")
-    assert result is True
-    # aplay が優先
-    assert captured_args[0][0].endswith("aplay")
-
-
-@pytest.mark.asyncio
-async def test_play_via_go2rtc_enabled_makes_http_request(monkeypatch, tmp_path):
-    """GO2RTC_ENABLED=1 のとき POST /api/streams?dst=...&src=... が実行される (200 OK)。"""
-    monkeypatch.setenv("GO2RTC_ENABLED", "1")
-    monkeypatch.setenv("GO2RTC_BASE_URL", "http://fake-go2rtc:1984")
-    monkeypatch.setenv("TAPO_STREAM_NAME", "pico_test_stream")
-
-    # ffmpeg 前処理をスタブ (実 ffmpeg を呼ばない)
-    pre_path = str(tmp_path / "preprocessed.wav")
-    (tmp_path / "preprocessed.wav").write_bytes(b"PREPROCESSED")
-
-    async def fake_preprocess(_src):
-        return pre_path
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
-    )
-
-    captured: dict = {}
-
-    class _MockResp:
-        status = 200
-
-        async def text(self):
-            return "ok"
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
+async def test_post_to_go2rtc_network_exception_returns_false(monkeypatch):
+    """ネットワーク例外でも raise せず False を返す。"""
 
     class _MockSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def post(self, url, data=None, headers=None):
-            captured["url"] = url
-            captured["data"] = data
-            captured["headers"] = headers
-            return _MockResp()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession
-    )
-
-    result = await tts_sbv2._play_via_go2rtc(b"WAV_BYTES")
-    assert result is True
-    # POST URL の検証: /api/streams?dst=pico_test_stream&src=<URL-encoded ffmpeg ...>
-    assert "fake-go2rtc:1984" in captured["url"]
-    assert "/api/streams?" in captured["url"]
-    assert "dst=pico_test_stream" in captured["url"]
-    assert "src=" in captured["url"]
-    # src には ffmpeg:<path>#audio=pcma#input=file が URL エンコードされて入る
-    assert "ffmpeg" in captured["url"]
-
-
-@pytest.mark.asyncio
-async def test_play_via_go2rtc_http_error_returns_false(monkeypatch, tmp_path):
-    """GO2RTC_ENABLED=1 でも HTTP 4xx/5xx 応答なら False を返す。"""
-    monkeypatch.setenv("GO2RTC_ENABLED", "1")
-
-    pre_path = str(tmp_path / "preprocessed.wav")
-    (tmp_path / "preprocessed.wav").write_bytes(b"PREPROCESSED")
-
-    async def fake_preprocess(_src):
-        return pre_path
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
-    )
-
-    class _MockResp:
-        status = 503
-
-        async def text(self):
-            return "Service Unavailable"
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-    class _MockSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def post(self, url, data=None, headers=None):
-            return _MockResp()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession
-    )
-
-    result = await tts_sbv2._play_via_go2rtc(b"WAV")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_play_via_go2rtc_network_exception_returns_false(monkeypatch, tmp_path):
-    """ネットワーク例外でも raise せず False を返す (silent fail)。"""
-    monkeypatch.setenv("GO2RTC_ENABLED", "1")
-
-    pre_path = str(tmp_path / "preprocessed.wav")
-    (tmp_path / "preprocessed.wav").write_bytes(b"PREPROCESSED")
-
-    async def fake_preprocess(_src):
-        return pre_path
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
-    )
-
-    class _MockSession:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_a, **_kw):
             pass
 
         def post(self, url, data=None, headers=None):
@@ -934,65 +598,48 @@ async def test_play_via_go2rtc_network_exception_returns_false(monkeypatch, tmp_
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, *args):
+        async def __aexit__(self, *_a):
             return False
 
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession
-    )
-
-    result = await tts_sbv2._play_via_go2rtc(b"WAV")
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession)
+    result = await tts_sbv2._post_to_go2rtc("/tmp/fake.wav")
     assert result is False
 
 
-def test_go2rtc_url_env_override(monkeypatch):
-    """GO2RTC_BASE_URL 環境変数が _get_go2rtc_base_url() に反映される。"""
-    monkeypatch.setenv("GO2RTC_BASE_URL", "http://custom-host:5555")
-    assert tts_sbv2._get_go2rtc_base_url() == "http://custom-host:5555"
+@pytest.mark.asyncio
+async def test_post_to_go2rtc_uses_POST_not_PUT(monkeypatch, tmp_path):
+    """_post_to_go2rtc は POST を使う (PUT ではない)。"""
+    captured = _patch_go2rtc_chain(monkeypatch, tmp_path)
+    result = await tts_sbv2._post_to_go2rtc(str(tmp_path / "pre.wav"))
+    assert result is True
+    assert captured["method"] == "post"  # PUT ではない
 
 
-def test_go2rtc_url_default(monkeypatch):
-    """GO2RTC_BASE_URL 未設定なら 127.0.0.1:1984 がデフォルト。"""
-    monkeypatch.delenv("GO2RTC_BASE_URL", raising=False)
-    assert tts_sbv2._get_go2rtc_base_url() == "http://127.0.0.1:1984"
+# ── _fetch_wav_bytes 単体テスト ────────────────────────────────────────
 
 
-def test_go2rtc_stream_env_override(monkeypatch):
-    """TAPO_STREAM_NAME 環境変数が _get_tapo_stream_name() に反映される。"""
-    monkeypatch.setenv("TAPO_STREAM_NAME", "my_custom_stream")
-    assert tts_sbv2._get_tapo_stream_name() == "my_custom_stream"
+@pytest.mark.asyncio
+async def test_fetch_wav_bytes_returns_concatenated_bytes():
+    """_fetch_wav_bytes は SBV2 から取得した WAV bytes を返す。"""
+    mock_session = _make_mock_session(status=200, audio=b"RIFF\x00WAVE")
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
+        result = await tts_sbv2._fetch_wav_bytes("hi", speaker_id=0, emotion=None)
+    assert result == b"RIFF\x00WAVE"
 
 
-def test_go2rtc_stream_default(monkeypatch):
-    """TAPO_STREAM_NAME 未設定なら tapo_c210 がデフォルト。"""
-    monkeypatch.delenv("TAPO_STREAM_NAME", raising=False)
-    assert tts_sbv2._get_tapo_stream_name() == "tapo_c210"
-
-
-@pytest.mark.parametrize(
-    "env_value,expected",
-    [
-        ("1", True),
-        ("true", True),
-        ("yes", True),
-        ("0", False),
-        ("false", False),
-        ("", False),
-        ("anything-else", False),
-    ],
-)
-def test_is_go2rtc_enabled_env_parsing(monkeypatch, env_value, expected):
-    """GO2RTC_ENABLED の値が真偽値に正しく変換される。"""
-    if env_value:
-        monkeypatch.setenv("GO2RTC_ENABLED", env_value)
-    else:
-        monkeypatch.delenv("GO2RTC_ENABLED", raising=False)
-    assert tts_sbv2._is_go2rtc_enabled() is expected
+@pytest.mark.asyncio
+async def test_fetch_wav_bytes_failure_returns_empty():
+    """_fetch_wav_bytes は失敗時に空 bytes を返す (silent fail)。"""
+    with patch(
+        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession",
+        side_effect=Exception("connection refused"),
+    ):
+        result = await tts_sbv2._fetch_wav_bytes("hi", speaker_id=0, emotion=None)
+    assert result == b""
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Phase C-3: 新規 23 件テスト
-#   分割 (9) + ffmpeg (4) + 暖機 (4) + go2rtc URL (3) + model_name (2) + 旧キー廃止 (2) - 1 = 23
+# Phase C-3 (維持): 分割 / ffmpeg / 暖機 / go2rtc URL / model_name / 旧キー
 # ──────────────────────────────────────────────────────────────────────
 
 # ── 分割 9 件 ─────────────────────────────────────────────────────────
@@ -1261,60 +908,28 @@ def test_go2rtc_uses_env_overrides(monkeypatch):
     assert "dst=custom_stream" in url
 
 
-@pytest.mark.asyncio
-async def test_go2rtc_uses_POST_not_PUT(monkeypatch, tmp_path):
-    """_play_via_go2rtc は POST を使う (PUT ではない)。"""
-    monkeypatch.setenv("GO2RTC_ENABLED", "1")
+def test_go2rtc_url_env_override(monkeypatch):
+    """GO2RTC_BASE_URL 環境変数が _get_go2rtc_base_url() に反映される。"""
+    monkeypatch.setenv("GO2RTC_BASE_URL", "http://custom-host:5555")
+    assert tts_sbv2._get_go2rtc_base_url() == "http://custom-host:5555"
 
-    pre_path = str(tmp_path / "pre.wav")
-    (tmp_path / "pre.wav").write_bytes(b"PRE")
 
-    async def fake_preprocess(_src):
-        return pre_path
+def test_go2rtc_url_default(monkeypatch):
+    """GO2RTC_BASE_URL 未設定なら 127.0.0.1:1984 がデフォルト。"""
+    monkeypatch.delenv("GO2RTC_BASE_URL", raising=False)
+    assert tts_sbv2._get_go2rtc_base_url() == "http://127.0.0.1:1984"
 
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
-    )
 
-    method_called: list[str] = []
+def test_go2rtc_stream_env_override(monkeypatch):
+    """TAPO_STREAM_NAME 環境変数が _get_tapo_stream_name() に反映される。"""
+    monkeypatch.setenv("TAPO_STREAM_NAME", "my_custom_stream")
+    assert tts_sbv2._get_tapo_stream_name() == "my_custom_stream"
 
-    class _MockResp:
-        status = 200
 
-        async def text(self):
-            return "ok"
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-    class _MockSession:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def post(self, url, data=None, headers=None):
-            method_called.append("post")
-            return _MockResp()
-
-        def put(self, url, data=None, headers=None):
-            method_called.append("put")
-            return _MockResp()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-    monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession
-    )
-
-    result = await tts_sbv2._play_via_go2rtc(b"WAV")
-    assert result is True
-    assert method_called == ["post"]  # PUT は呼ばれない
+def test_go2rtc_stream_default(monkeypatch):
+    """TAPO_STREAM_NAME 未設定なら tapo_c210 がデフォルト。"""
+    monkeypatch.delenv("TAPO_STREAM_NAME", raising=False)
+    assert tts_sbv2._get_tapo_stream_name() == "tapo_c210"
 
 
 # ── model_name 2 件 ───────────────────────────────────────────────────
@@ -1322,7 +937,7 @@ async def test_go2rtc_uses_POST_not_PUT(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_model_name_query_includes_model_name(monkeypatch):
-    """speak() の URL に model_name クエリが必ず含まれる (env override 確認)。"""
+    """_fetch_wav_bytes の URL に model_name クエリが必ず含まれる (env override 確認)。"""
     monkeypatch.setenv("TTS_MODEL_NAME", "test_model_xyz")
     captured: dict = {}
 
@@ -1347,7 +962,7 @@ async def test_model_name_query_includes_model_name(monkeypatch):
             return resp
 
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
-        await tts_sbv2.speak("ピコ")
+        await tts_sbv2._fetch_wav_bytes("ピコ", speaker_id=0, emotion=None)
 
     assert "model_name=test_model_xyz" in captured["url"]
 
@@ -1374,3 +989,96 @@ def test_legacy_GO2RTC_STREAM_ignored(monkeypatch):
     monkeypatch.setenv("GO2RTC_STREAM", "legacy_stream_name")
     monkeypatch.delenv("TAPO_STREAM_NAME", raising=False)
     assert tts_sbv2._get_tapo_stream_name() == "tapo_c210"
+
+
+def test_legacy_GO2RTC_ENABLED_has_no_effect(monkeypatch):
+    """旧キー GO2RTC_ENABLED は v5 で完全廃止。env に書いても speak() の挙動に影響しない。
+
+    モジュールから ``_is_go2rtc_enabled`` / ``GO2RTC_ENABLED`` 参照が削除されていることを
+    モジュール属性レベルで検証 (mutation 検知)。
+    """
+    monkeypatch.setenv("GO2RTC_ENABLED", "1")
+    monkeypatch.setenv("GO2RTC_ENABLED", "true")
+    # モジュール内に _is_go2rtc_enabled 関数 / GO2RTC_ENABLED 定数が存在しない
+    assert not hasattr(tts_sbv2, "_is_go2rtc_enabled")
+
+
+def test_retired_play_with_fallback_removed():
+    """v5 で完全削除された旧 API がモジュールに残っていないこと。"""
+    assert not hasattr(tts_sbv2, "play_with_fallback")
+    assert not hasattr(tts_sbv2, "_play_via_go2rtc")
+    assert not hasattr(tts_sbv2, "_play_via_main_pc")
+    assert not hasattr(tts_sbv2, "_play_via_rpi5")
+    assert not hasattr(tts_sbv2, "_BACKENDS")
+    assert not hasattr(tts_sbv2, "_AUTO_FALLBACK_CHAIN")
+
+
+def test_valid_targets_constant():
+    """_VALID_TARGETS は v5 14-5-11 の 3 経路に再構成されている。"""
+    assert tts_sbv2._VALID_TARGETS == ("tapo_speaker", "discord_vc", "obs_audio")
+    # 旧 target (local_speaker / discord_vc 単独) が含まれないことを念のため
+    assert "local_speaker" not in tts_sbv2._VALID_TARGETS
+    assert "main_pc" not in tts_sbv2._VALID_TARGETS
+    assert "rpi5" not in tts_sbv2._VALID_TARGETS
+
+
+# ── env override parametrize (件数増 + mutation 検知補強) ─────────────
+
+
+@pytest.mark.parametrize(
+    "env_name,env_value,getter,expected",
+    [
+        ("TTS_BASE_URL", "http://sbv2-test:5000", "_get_base_url", "http://sbv2-test:5000"),
+        ("TTS_BASE_URL", "http://sbv2-test:5000/", "_get_base_url", "http://sbv2-test:5000"),
+        ("TTS_TIMEOUT_SEC", "30.5", "_get_timeout", 30.5),
+        ("TTS_TIMEOUT_SEC", "not_a_number", "_get_timeout", 60.0),
+        ("TTS_VOLUME", "0.7", "_get_tts_volume", 0.7),
+        ("TTS_VOLUME", "bad", "_get_tts_volume", 0.5),
+        ("TTS_PRE_RESAMPLE", "22050", "_get_tts_pre_resample", 22050),
+        ("TTS_PRE_RESAMPLE", "abc", "_get_tts_pre_resample", 16000),
+        ("TTS_TAIL_SILENCE", "1.5", "_get_tts_tail_silence", 1.5),
+        ("TTS_TAIL_SILENCE", "x", "_get_tts_tail_silence", 0.5),
+        ("TTS_CHUNK_MAX_CHARS", "50", "_get_chunk_max_chars", 50),
+        ("TTS_CHUNK_MAX_CHARS", "bad", "_get_chunk_max_chars", 30),
+        ("TTS_CHUNK_DELAY_MS", "100", "_get_chunk_delay_ms", 100),
+        ("TTS_CHUNK_DELAY_MS", "x", "_get_chunk_delay_ms", 0),
+        ("TTS_MODEL_NAME", "other_model", "_get_tts_model_name", "other_model"),
+    ],
+)
+def test_env_accessor_override_and_invalid_fallback(monkeypatch, env_name, env_value, getter, expected):
+    """環境変数アクセサは値を反映し、不正値はデフォルトにフォールバックする。"""
+    monkeypatch.setenv(env_name, env_value)
+    fn = getattr(tts_sbv2, getter)
+    assert fn() == expected
+
+
+@pytest.mark.parametrize(
+    "valence,expected_weight",
+    [
+        (1.0, 1.0),
+        (0.0, -1.0),
+        (0.5, 0.0),
+        (0.75, 0.5),
+        (0.25, -0.5),
+    ],
+)
+def test_emotion_to_style_weight_mapping(valence, expected_weight):
+    """valence 0.0-1.0 → style_weight -1.0〜+1.0 の線形マップ確認。"""
+    weight = tts_sbv2._emotion_to_style_weight({"valence": valence})
+    assert abs(weight - expected_weight) < 1e-6
+
+
+def test_emotion_to_style_weight_none_returns_neutral():
+    """emotion=None は style_weight=0.0 (中立)。"""
+    assert tts_sbv2._emotion_to_style_weight(None) == 0.0
+
+
+def test_emotion_to_style_weight_invalid_valence_neutral():
+    """valence が文字列等の不正型なら中立 (0.0) にフォールバック。"""
+    assert tts_sbv2._emotion_to_style_weight({"valence": "bad"}) == 0.0
+
+
+def test_emotion_to_style_weight_clamped_to_range():
+    """valence 範囲外 (1.5 / -0.5) でも style_weight は -1.0〜+1.0 にクランプされる。"""
+    assert tts_sbv2._emotion_to_style_weight({"valence": 1.5}) == 1.0
+    assert tts_sbv2._emotion_to_style_weight({"valence": -0.5}) == -1.0

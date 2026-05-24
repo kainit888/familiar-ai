@@ -7,7 +7,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
-## [Unreleased] — Stage 2 Phase C-4 完了 (2026-05-19)
+## [Unreleased] — Stage 2 Phase C-5 完了 (2026-05-24)
+
+### Phase C-5 (2026-05-24): TTS 単一経路化
+
+#### 侵入: familiar_agent/tools/tts.py::say()
+
+- `output` パラメータ (`"local"` / `"remote"` / `"both"`) を **deprecated 扱いで無視**、
+  常に `tts_sbv2.speak(text, target="tapo_speaker")` を呼ぶよう変更
+- 旧 `_play_local` / `_play_via_go2rtc` / `_write_tmp_audio` 系は
+  **dead code として残置** (二層分離原則で削除せず、上流マージ性を維持)
+- 設計書 v5 第 24-4 節「侵入点」表への該当行追加は将来判断 (本サイクルでは pico
+  独自層からの最小侵入のみ)
+
+#### pico_agent/adapters/tts_sbv2.py (独自層、丸ごと再設計)
+
+- `play_with_fallback` / `_play_via_go2rtc` / `_play_via_main_pc` / `_play_via_rpi5`
+  を **完全削除** (731 → 478 行、フォールバックチェーン撤廃)
+- 新 `speak(text, target="tapo_speaker"|"discord_vc"|"obs_audio") -> None` で
+  **HTTP API 単一経路** に再構成 (v5 14-5-11)
+- `discord_vc` / `obs_audio` は Phase D / Phase K へ向けたスタブ (現状 no-op + warning)
+- 失敗時は **無音 + `logger.warning`** で抜ける (例外を呼出側に漏らさない)
+- `subprocess.Popen` / `subprocess.run` 呼出ゼロ (ローカル go2rtc バイナリ起動なし)
+
+#### Phase C-1 由来 field の出自確認 (カイニット要求)
+
+- `familiar_agent/config.py::TTSConfig.go2rtc_url` / `go2rtc_stream` は **上流由来**
+  (commit `f952c18`, Kota Mizushima, 2026-02-22
+  `feat: play TTS via go2rtc camera speaker with local fallback`)。
+  **ピコ独自追加ではない**。
+- 二層分離原則により本サイクルでは残置。将来 v6 設計書改訂時の「不要 field 整理」
+  判断材料として記録。
+
+#### Tests (Phase C-5)
+
+- `tests/test_adapter_tts_sbv2.py`: 1376 → 1031 行、新 API テスト 80 件
+  - `speak()` 基本 / target ごとのスタブ動作 / 失敗時無音 / retired symbol 不在
+    assert / `Popen`/`run` 不呼出 assert を含む
+- `tests/test_tts.py`: `say()` の output 無視・deprecation 挙動を 10 件で網羅
+- pytest 件数: 1356 → **1359** (グリーン)
+
+#### Configuration (Phase C-5)
+
+- `.env.example`: `GO2RTC_ENABLED` を完全削除 (旧キーの存在自体を消す)。
+  旧キー `GO2RTC_URL` / `GO2RTC_STREAM` は Phase C-3 で廃止済 (注釈のみ残る)
+
+---
+
+## [Pre-Phase-C-5] — Stage 2 Phase C-4 完了 (2026-05-19)
 
 ### Added (Phase C-4)
 

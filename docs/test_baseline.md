@@ -1,8 +1,8 @@
 # pytest baseline (件数推移)
 
 **初版作成**: 2026-05-16 18:17 JST (Stage 1 Phase A 完了時)
-**最終更新**: 2026-05-19 (Phase C-4 完了)
-**ブランチ**: `pico-base` (`pico/pico-base` 同期、HEAD は Phase C-4 commit 後に更新)
+**最終更新**: 2026-05-24 (Phase C-5 完了、v5 単一経路化)
+**ブランチ**: `pico-base` (`pico/pico-base` 同期、HEAD は Phase C-5 commit 後に更新)
 **Python**: 3.11.15 (uv 自動取得)
 **環境**: RPi5 (aarch64), Linux 6.12.62
 
@@ -10,10 +10,10 @@
 
 | 項目 | 値 |
 |---|---|
-| **現在の総件数** | **1258 件** |
-| 結果 | 1258 passed, 0 failed |
-| 警告 | 6 件 (主に `AsyncMockMixin._execute_mock_call` coroutine never awaited、実害なし) |
-| 所要 | 約 26 秒 (Phase C-4 完了時、5/19) |
+| **現在の総件数** | **1359 件** |
+| 結果 | 1359 passed, 0 failed |
+| 警告 | 8 件 (主に `AsyncMockMixin._execute_mock_call` coroutine never awaited、実害なし) |
+| 所要 | 約 33 秒 (Phase C-5 完了時、5/24) |
 
 ## 2. コマンド
 
@@ -44,8 +44,9 @@ uv run pytest --cov=src --cov-report=term-missing
 | 2026-05-19 〜 5/20 | Day 2-3 (調査タスク中心) | **1170** | ±0 | 新規テストなし (調査と doc のみ) |
 | 2026-05-19 | Phase C-3 (tts_sbv2 本実装) | **1217** | +47 | tts_sbv2 分割 9 + ffmpeg 4 + 暖機 4 + go2rtc URL 3 + model_name 2 + 旧キー廃止 2 (= 新規 24)、加えて parametrize 展開分の +23 |
 | 2026-05-19 | Phase C-4 (stt_kotoba RTSP 本実装) | **1258** | +41 | _build_ffmpeg_rtsp_cmd 5 + parse_silencedetect 6 + wrap_pcm_to_wav 3 + _emit_segment 5 + env 値 10 + RTSP URL 組み立て 4 + URL マスク 2 + VAD backend 2 + _subscription_loop シナリオ 5 (2 件は既存リネーム + 中身置換、件数据え置き) |
+| 2026-05-24 | Phase C-5 (tts_sbv2 v5 単一経路化) | **1359** | +101 | tts_sbv2 削除 (play_with_fallback / _play_via_go2rtc / _play_via_main_pc / _play_via_rpi5 / _BACKENDS / GO2RTC_ENABLED 系 約 47 件) → 新 speak() API 用テスト 33 件 + parametrize 展開 (env 上書き 15 + 感情マッピング 5 + tapo_speaker 5)、test_tts.py 2 件書き換え。実差分 +101 |
 
-**累積**: 883 → **1258** (+375 件、グリーン維持)
+**累積**: 883 → **1359** (+476 件、グリーン維持)
 
 ## 4. テストファイル一覧 (Phase C-1 + Day 1-2 完了時点)
 

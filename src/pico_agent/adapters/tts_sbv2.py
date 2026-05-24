@@ -1,34 +1,37 @@
-"""TTS adapter (Style-BERT-VITS2) - 設計書 v4.0 第 7-2 章 / v4.2 第 14-5 章。
+"""TTS adapter (Style-BERT-VITS2) - 設計書 v5 第 14-5 章 (フォールバック撤廃版)。
 
 メイン PC で稼働中の Style-BERT-VITS2 サーバ (デフォルト 192.168.10.104:5000)
-に GET /voice?text=...&model_name=... を投げて WAV bytes を取得する。
+に GET /voice?text=...&model_name=... を投げて WAV bytes を取得し、
+メイン PC 上で常駐する go2rtc (192.168.10.104:1984) の HTTP API へ POST して
+Tapo C210 内蔵スピーカーから再生する。
 
-公開 I/F (設計書 7-2 章 + v4.2 14-5 章、Phase C-3 で固定):
+v5 (2026-05-24) で `play_with_fallback` (`tapo_speaker → main_pc → rpi5` の 3
+段フォールバック) を撤廃。実体のあるフォールバック先が存在しないため、
+失敗時は無音 + logger.warning で素直に終わる (設計書 14-5-11 / 14-5-12 節)。
+
+公開 I/F (設計書 v5 14-5-11 節):
     async def speak(
         text: str,
+        target: Target | str = "tapo_speaker",   # "tapo_speaker" | "discord_vc" | "obs_audio"
         speaker_id: int = 0,
-        emotion: dict | None = None,    # valence/arousal で声色変化
-        target: str = "discord_vc",     # 既存値域維持
-    ) -> bytes
-        "30 文字制限 → 句読点優先で分割 → 順次取得して連結"
+        emotion: EmotionDict | None = None,
+    ) -> None
+        "SBV2 で合成した TTS を指定 target に送出する (失敗時は無音)。"
 
-    async def play_with_fallback(
-        text: str,
-        target: str = "auto",  # "tapo_speaker" | "main_pc" | "rpi5" | "auto"
-        ...
-    ) -> tuple[bool, str]:
-        "WAV bytes 取得 + 物理再生まで実行、target 失敗時は順次フォールバック"
+    - target="tapo_speaker": go2rtc HTTP API → Tapo C210 (普段の会話、本実装)
+    - target="discord_vc":   Phase D で discord.py voice client 実装、現状スタブ
+    - target="obs_audio":    Phase K で OBS 音声入力実装、現状スタブ
 
 エラーハンドリング方針 (絶対遵守):
     - 例外を raise せず silent fail + logger.warning
-    - 失敗時は空 bytes を返す / play_with_fallback() は (False, 理由) を返す
-    - target=tapo_speaker は go2rtc POST /api/streams?dst=...&src=ffmpeg:... 方式
+    - 失敗時は無音 (None 返却)、フォールバックは設けない (v5 14-5-11)
 
-go2rtc 連携 (v4.2 14-5、カイニット実機検証で確定):
+go2rtc 連携 (v5 14-5-5 / 14-5-12 確定):
     - POST {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=<URL-encoded ffmpeg URL>
     - src 形式: ffmpeg:<wav_path>#audio=pcma#input=file
     - Body 空、Authorization なし、Content-Type なし
     - LAN 内認証なし (192.168.10.104:1984)
+    - **Pi 側に go2rtc バイナリを置かない** (HTTP API 単一経路)
 
 emotion マッピング (Phase E で再調整、保守的デフォルト):
     style_weight = (valence - 0.5) * 2  # -1.0〜+1.0
@@ -43,9 +46,7 @@ import asyncio
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal, TypeAlias
 from urllib.parse import quote, urlencode
@@ -58,14 +59,8 @@ from loguru import logger
 # Phase E (感情 3 値実装) で具体的なキーを TypedDict 化する想定。
 EmotionDict: TypeAlias = dict[str, float]
 
-# speak() の target 値域 (再生先メタ情報、実再生は呼び出し側責務)。
-SpeakTarget: TypeAlias = Literal["discord_vc", "local_speaker"]
-
-# play_with_fallback() の target 値域 (フォールバックチェーン選択用)。
-PlayTarget: TypeAlias = Literal["auto", "tapo_speaker", "main_pc", "rpi5"]
-
-# バックエンド (WAV bytes を受け取り再生成否を bool で返す async コーラブル)。
-_BackendCallable: TypeAlias = Callable[[bytes], Awaitable[bool]]
+# speak() の target 値域 (v5 で用途別 3 経路に再構成、14-5-11 節)。
+Target: TypeAlias = Literal["tapo_speaker", "discord_vc", "obs_audio"]
 
 # ── 設定 (環境変数で上書き可能、ハードコード禁止) ────────────────────────────
 _DEFAULT_BASE_URL = "http://192.168.10.104:5000"
@@ -87,7 +82,8 @@ _WARMUP_DONE: bool = False
 # 分割優先度: 「。」「！」「？」「、」「\n」の順
 _SPLIT_PRIORITY: tuple[str, ...] = ("。", "！", "？", "、", "\n")
 
-_VALID_TARGETS = ("discord_vc", "local_speaker")
+# speak() の target 値域 (実体は 3 つ、tapo_speaker のみ本実装)
+_VALID_TARGETS: tuple[str, ...] = ("tapo_speaker", "discord_vc", "obs_audio")
 
 
 # ── 環境変数アクセサ ──────────────────────────────────────────────────────
@@ -115,11 +111,6 @@ def _get_go2rtc_base_url() -> str:
 def _get_tapo_stream_name() -> str:
     """go2rtc ストリーム名 (Tapo C210) を取得 (環境変数 TAPO_STREAM_NAME)。"""
     return os.environ.get("TAPO_STREAM_NAME", _DEFAULT_TAPO_STREAM_NAME)
-
-
-def _is_go2rtc_enabled() -> bool:
-    """環境変数 GO2RTC_ENABLED=1/true/yes のときのみ go2rtc 再生を試みる。"""
-    return os.environ.get("GO2RTC_ENABLED", "").strip().lower() in ("1", "true", "yes")
 
 
 def _get_tts_model_name() -> str:
@@ -333,49 +324,32 @@ async def _warmup_once() -> None:
         # フラグは立てない、次回再試行
 
 
-# ── 公開 API: speak() ─────────────────────────────────────────────────────
+# ── SBV2 WAV bytes 取得 (旧 speak() の本体を helper 化) ───────────────────
 
 
-async def speak(
+async def _fetch_wav_bytes(
     text: str,
-    speaker_id: int = 0,
-    emotion: EmotionDict | None = None,
-    target: SpeakTarget | str = "discord_vc",
+    speaker_id: int,
+    emotion: EmotionDict | None,
 ) -> bytes:
-    """テキストを Style-BERT-VITS2 に投げて WAV bytes を返す (設計書 7-2 章)。
+    """テキストを 30 文字分割 → SBV2 GET → 連結した WAV bytes を返す (silent fail)。
 
     Args:
-        text: 読み上げ対象テキスト。30 文字 (TTS_CHUNK_MAX_CHARS) を超えると
-            句読点優先で分割される。
+        text: 読み上げ対象テキスト (空 / 空白のみは呼び出し側で除外済の前提)。
         speaker_id: SBV2 サーバ側の speaker ID (デフォルト 0)。
         emotion: ``{"valence": 0.0-1.0, "arousal": 0.0-1.0}`` 形式の感情 dict。
-            ``None`` のときは中立。
-        target: 再生先のメタ情報 (``"discord_vc"`` または ``"local_speaker"``)。
-            実際の再生は呼び出し側 (Phase D Discord bridge) の責務。
-            型は ``SpeakTarget`` リテラルだが、後方互換のため未知の str も受理し、
-            その場合は ``"discord_vc"`` にフォールバックする。
 
     Returns:
         連結された WAV bytes。失敗時は空 bytes (例外は投げない)。
     """
-    if not text or not text.strip():
-        logger.warning("tts_sbv2.speak: empty text")
-        return b""
-    if target not in _VALID_TARGETS:
-        logger.warning("tts_sbv2.speak: unknown target {!r}, defaulting to discord_vc", target)
-        target = "discord_vc"
-
-    await _warmup_once()
-
     chunks = _split_chunks(text.strip())
     if not chunks:
         return b""
 
     logger.debug(
-        "tts_sbv2.speak: text={!r} chunks={} target={} speaker_id={}",
+        "tts_sbv2._fetch_wav_bytes: text={!r} chunks={} speaker_id={}",
         text[:40],
         len(chunks),
-        target,
         speaker_id,
     )
 
@@ -392,19 +366,17 @@ async def speak(
                 if chunk_delay_ms > 0 and i < len(chunks) - 1:
                     await asyncio.sleep(chunk_delay_ms / 1000.0)
     except Exception as e:
-        logger.warning("tts_sbv2.speak: session-level failure: {}", e)
+        logger.warning("tts_sbv2._fetch_wav_bytes: session-level failure: {}", e)
         return b""
 
     if not audio_parts:
+        logger.warning("tts_sbv2._fetch_wav_bytes: empty WAV bytes after all chunks")
         return b""
 
     return b"".join(audio_parts)
 
 
-# ── v4.2 14-5: フォールバック再生チェーン ────────────────────────────────────
-
-
-_AUTO_FALLBACK_CHAIN: tuple[str, ...] = ("tapo_speaker", "main_pc", "rpi5")
+# ── 一時 WAV / ffmpeg 前処理 ──────────────────────────────────────────────
 
 
 def _write_tmp_wav(wav_bytes: bytes) -> str:
@@ -417,9 +389,6 @@ def _write_tmp_wav(wav_bytes: bytes) -> str:
 def _which(name: str) -> str | None:
     """shutil.which のラッパ (path にバイナリが存在すれば絶対パス、なければ None)。"""
     return shutil.which(name)
-
-
-# ── ffmpeg 前処理 (RPi5 ホスト側) ─────────────────────────────────────────
 
 
 def _build_ffmpeg_args(src: str, dst: str) -> list[str]:
@@ -497,87 +466,7 @@ async def _preprocess_wav_with_ffmpeg(src_path: str) -> str | None:
         return None
 
 
-# ── バックエンド: main_pc / rpi5 ─────────────────────────────────────────
-
-
-async def _play_via_main_pc(wav_bytes: bytes) -> bool:
-    """メイン PC のスピーカーで WAV を再生する (mpv / ffplay 経由)。
-
-    実装が走るマシン (RPi5 か別 PC) の音声出力デバイスで mpv / ffplay 再生を試みる。
-
-    Returns:
-        再生プロセスが exit code 0 で終わったら True、それ以外 False。
-    """
-    if not wav_bytes:
-        return False
-    bin_path = _which("mpv") or _which("ffplay")
-    if bin_path is None:
-        logger.warning("tts_sbv2._play_via_main_pc: neither mpv nor ffplay found in PATH")
-        return False
-
-    tmp_path = _write_tmp_wav(wav_bytes)
-    try:
-        if bin_path.endswith("mpv"):
-            args = [bin_path, "--no-terminal", "--really-quiet", tmp_path]
-        else:
-            args = [bin_path, "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path]
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        rc = await proc.wait()
-        return rc == 0
-    except Exception as e:
-        logger.warning("tts_sbv2._play_via_main_pc: failed: {}", e)
-        return False
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
-async def _play_via_rpi5(wav_bytes: bytes) -> bool:
-    """RPi5 のアナログ出力 (Anker Soundcore mini 3) で WAV を再生する。
-
-    aplay (ALSA) が標準で使えるはず。Linux 以外では失敗。
-
-    Returns:
-        再生プロセスが exit code 0 で終わったら True、それ以外 False。
-    """
-    if not wav_bytes:
-        return False
-    if sys.platform != "linux":
-        logger.warning("tts_sbv2._play_via_rpi5: not on Linux ({}); skipping", sys.platform)
-        return False
-    bin_path = _which("aplay") or _which("paplay")
-    if bin_path is None:
-        logger.warning("tts_sbv2._play_via_rpi5: neither aplay nor paplay found in PATH")
-        return False
-
-    tmp_path = _write_tmp_wav(wav_bytes)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            bin_path,
-            "-q",
-            tmp_path,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        rc = await proc.wait()
-        return rc == 0
-    except Exception as e:
-        logger.warning("tts_sbv2._play_via_rpi5: failed: {}", e)
-        return False
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
-# ── バックエンド: tapo_speaker (go2rtc 経由) ─────────────────────────────
+# ── go2rtc HTTP API POST (v5 14-5-5 / 14-5-12) ────────────────────────────
 
 
 def _build_go2rtc_url(wav_path: str) -> str:
@@ -597,51 +486,102 @@ def _build_go2rtc_url(wav_path: str) -> str:
     return f"{base_url}/api/streams?dst={quote(stream, safe='')}&src={src_encoded}"
 
 
-async def _play_via_go2rtc(wav_bytes: bytes) -> bool:
-    """go2rtc REST API 経由で Tapo C210 スピーカーに WAV を流す。
+async def _post_to_go2rtc(wav_path: str) -> bool:
+    """前処理済み WAV を go2rtc HTTP API へ POST する (silent fail)。
 
-    GO2RTC_ENABLED=1/true/yes でないと no-op (False)。
-    ffmpeg 前処理 → 一時 WAV → POST /api/streams?dst=...&src=ffmpeg:... を実行。
+    v5 14-5-5 仕様:
+        POST {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=ffmpeg:...
+        - body 空、Authorization なし、LAN 内認証なし
+        - Pi 側に go2rtc バイナリを置かない (HTTP API 単一経路)
 
     Returns:
-        - GO2RTC_ENABLED が偽 → False
-        - 空 bytes → False
-        - ffmpeg / HTTP 失敗 → False (silent fail)
-        - 成功 → True
+        成功時 True、HTTP / ネットワーク失敗時 False (例外は投げない)。
     """
-    if not wav_bytes:
-        return False
-    if not _is_go2rtc_enabled():
-        logger.debug("tts_sbv2._play_via_go2rtc: GO2RTC_ENABLED not set, skipping")
+    url = _build_go2rtc_url(wav_path)
+    timeout = aiohttp.ClientTimeout(total=_get_timeout())
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "tts_sbv2._post_to_go2rtc: HTTP {} from {} body={!r}",
+                        resp.status,
+                        url,
+                        body[:200],
+                    )
+                    return False
+                return True
+    except Exception as e:
+        logger.warning("tts_sbv2._post_to_go2rtc: request failed: {}", e)
         return False
 
-    # SBV2 出力を tmp に保存 → ffmpeg 前処理 → 結果を go2rtc に投げる
+
+# ── 公開 API: speak() ─────────────────────────────────────────────────────
+
+
+async def speak(
+    text: str,
+    target: Target | str = "tapo_speaker",
+    speaker_id: int = 0,
+    emotion: EmotionDict | None = None,
+) -> None:
+    """SBV2 で合成した TTS を指定 target に送出する (設計書 v5 14-5-11)。
+
+    Args:
+        text: 読み上げ対象テキスト。30 文字 (TTS_CHUNK_MAX_CHARS) を超えると
+            句読点優先で分割される。空 / 空白のみは silent fail。
+        target: 再生先。
+            ``"tapo_speaker"`` → go2rtc HTTP API → Tapo C210 (普段の会話、本実装)
+            ``"discord_vc"``   → discord.py voice client (Phase D で本実装、現状スタブ)
+            ``"obs_audio"``    → OBS 音声入力 (Phase K で本実装、現状スタブ)
+        speaker_id: SBV2 サーバ側の speaker ID (デフォルト 0)。
+        emotion: ``{"valence": 0.0-1.0, "arousal": 0.0-1.0}`` 形式の感情 dict。
+            ``None`` のときは中立。
+
+    Returns:
+        常に ``None``。例外は投げない (失敗時は無音 + logger.warning)。
+        v5 14-5-11 でフォールバックは撤廃。
+    """
+    if not text or not text.strip():
+        logger.warning("tts_sbv2.speak: empty text")
+        return
+    if target not in _VALID_TARGETS:
+        logger.warning("tts_sbv2.speak: unknown target {!r}, returning silently", target)
+        return
+
+    if target == "discord_vc":
+        logger.warning("tts_sbv2.speak: target=discord_vc is not implemented yet (Phase D)")
+        return
+    if target == "obs_audio":
+        logger.warning("tts_sbv2.speak: target=obs_audio is not implemented yet (Phase K)")
+        return
+
+    # target == "tapo_speaker": go2rtc HTTP API 経由で Tapo C210 へ送出
+    await _warmup_once()
+
+    wav_bytes = await _fetch_wav_bytes(text, speaker_id, emotion)
+    if not wav_bytes:
+        # _fetch_wav_bytes 内部で warning 済
+        return
+
     src_path = _write_tmp_wav(wav_bytes)
     pre_path: str | None = None
     try:
         pre_path = await _preprocess_wav_with_ffmpeg(src_path)
         if pre_path is None:
-            logger.warning("tts_sbv2._play_via_go2rtc: ffmpeg preprocess failed")
-            return False
+            # _preprocess_wav_with_ffmpeg 内部で warning 済
+            return
 
-        url = _build_go2rtc_url(pre_path)
-        timeout = aiohttp.ClientTimeout(total=_get_timeout())
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        logger.warning(
-                            "tts_sbv2._play_via_go2rtc: HTTP {} from {} body={!r}",
-                            resp.status,
-                            url,
-                            body[:200],
-                        )
-                        return False
-                    return True
-        except Exception as e:
-            logger.warning("tts_sbv2._play_via_go2rtc: request failed: {}", e)
-            return False
+        ok = await _post_to_go2rtc(pre_path)
+        if not ok:
+            # _post_to_go2rtc 内部で warning 済
+            return
+
+        logger.info(
+            "tts_sbv2.speak: played via tapo_speaker (text={!r})",
+            text[:40],
+        )
     finally:
         for p in (src_path, pre_path):
             if not p:
@@ -650,82 +590,3 @@ async def _play_via_go2rtc(wav_bytes: bytes) -> bool:
                 os.unlink(p)
             except OSError:
                 pass
-
-
-_BACKENDS: dict[str, _BackendCallable] = {
-    "tapo_speaker": _play_via_go2rtc,
-    "main_pc": _play_via_main_pc,
-    "rpi5": _play_via_rpi5,
-}
-
-
-# ── 公開 API: play_with_fallback() ────────────────────────────────────────
-
-
-async def play_with_fallback(
-    text: str,
-    target: PlayTarget | str = "auto",
-    speaker_id: int = 0,
-    emotion: EmotionDict | None = None,
-) -> tuple[bool, str]:
-    """WAV bytes 取得 + 物理再生まで実行し、フォールバックチェーンを回す。
-
-    設計書 v4.2 14-5 章の `speak(target=...)` インターフェース実装。
-
-    Args:
-        text: 読み上げ対象テキスト。
-        target: 再生先指定。
-            ``"tapo_speaker"`` / ``"main_pc"`` / ``"rpi5"``: 単一バックエンド試行。
-            ``"auto"``: tapo_speaker → main_pc → rpi5 の順に試行。
-            型は ``PlayTarget`` リテラルだが、後方互換のため未知の str も受理し、
-            その場合は ``"auto"`` チェーンにフォールバックする。
-        speaker_id: SBV2 speaker ID。
-        emotion: 感情 dict (valence/arousal)。
-
-    Returns:
-        ``(success, played_via)``。
-        - success=True なら played_via は使用されたバックエンド名 (例: "main_pc")
-        - success=False なら played_via は理由文字列 ("empty_text" / "no_audio" / "all_failed")
-    """
-    if not text or not text.strip():
-        return False, "empty_text"
-
-    audio = await speak(text=text, speaker_id=speaker_id, emotion=emotion)
-    if not audio:
-        return False, "no_audio"
-
-    if target == "auto":
-        chain: tuple[str, ...] = _AUTO_FALLBACK_CHAIN
-    elif target in _BACKENDS:
-        chain = (target,)
-    else:
-        logger.warning(
-            "tts_sbv2.play_with_fallback: unknown target {!r}, falling back to auto",
-            target,
-        )
-        chain = _AUTO_FALLBACK_CHAIN
-
-    for backend_name in chain:
-        backend = _BACKENDS[backend_name]
-        try:
-            ok = await backend(audio)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "tts_sbv2.play_with_fallback: backend {!r} raised: {}",
-                backend_name,
-                e,
-            )
-            ok = False
-        if ok:
-            logger.info(
-                "tts_sbv2.play_with_fallback: played via {} (text={!r})",
-                backend_name,
-                text[:40],
-            )
-            return True, backend_name
-        logger.debug(
-            "tts_sbv2.play_with_fallback: backend {!r} failed, trying next",
-            backend_name,
-        )
-
-    return False, "all_failed"
