@@ -162,6 +162,72 @@ async def test_say_notifies_voice_guard_on_success():
 
 
 @pytest.mark.asyncio
+async def test_say_remote_delegates_to_play_with_fallback():
+    """Cycle 8 (E-a): output='remote' は adapter の play_with_fallback に委譲する。
+
+    本体の壊れた _play_via_go2rtc (localhost:1984) ではなく、フルフォールバック
+    チェーン (target='auto') を回す adapter 経路を使うことを検証。remote 成功時は
+    ローカル再生 (speak/_play_local) にフォールバックしない。
+    """
+    tool = _make_tts()
+    tool.output = "remote"
+
+    fake_pwf = AsyncMock(return_value=(True, "tapo_speaker"))
+    fake_speak = AsyncMock(return_value=b"FAKE_WAV")
+
+    with (
+        patch("pico_agent.adapters.tts_sbv2.play_with_fallback", fake_pwf),
+        patch("pico_agent.adapters.tts_sbv2.speak", fake_speak),
+        patch(
+            "familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)
+        ) as mock_local,
+    ):
+        result = await tool.say("hello")
+
+    fake_pwf.assert_awaited_once()
+    assert fake_pwf.await_args.args[0] == "hello"
+    assert fake_pwf.await_args.kwargs.get("target") == "auto"
+    # remote 成功時はローカルへフォールバックしない (二重再生・二重 fetch 回避)。
+    mock_local.assert_not_called()
+    fake_speak.assert_not_awaited()
+    assert "tapo_speaker" in result
+
+
+@pytest.mark.asyncio
+async def test_say_remote_failure_falls_through_to_local():
+    """E-2 バグ修正: remote 再生が失敗したらローカル再生にフォールスルーする。
+
+    旧コードは TTS_OUTPUT=remote かつ go2rtc 失敗時に早期 return して無音だった。
+    play_with_fallback が (False, ...) を返した場合、ローカル再生を試みること。
+    """
+    tool = _make_tts()
+    tool.output = "remote"
+
+    fake_pwf = AsyncMock(return_value=(False, "all_failed"))
+
+    with (
+        patch("pico_agent.adapters.tts_sbv2.play_with_fallback", fake_pwf),
+        patch("pico_agent.adapters.tts_sbv2.speak", new=AsyncMock(return_value=b"FAKE_WAV")),
+        patch(
+            "familiar_agent.tools.tts._play_local", new=AsyncMock(return_value=True)
+        ) as mock_local,
+        patch("os.unlink"),
+        patch("tempfile.NamedTemporaryFile") as mock_tmp,
+    ):
+        tmp_file = MagicMock()
+        tmp_file.__enter__ = MagicMock(return_value=tmp_file)
+        tmp_file.__exit__ = MagicMock(return_value=False)
+        tmp_file.name = "/tmp/fake.wav"
+        mock_tmp.return_value = tmp_file
+
+        result = await tool.say("hello")
+
+    fake_pwf.assert_awaited_once()
+    mock_local.assert_called_once()  # 無音にならずローカルへフォールスルー
+    assert "local" in result
+
+
+@pytest.mark.asyncio
 async def test_say_serializes_concurrent_calls():
     """Concurrent say() calls must be serialized (lock prevents overlap)."""
     tool = _make_tts()

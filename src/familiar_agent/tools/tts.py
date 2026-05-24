@@ -142,6 +142,14 @@ class TTSTool:
 
         Phase C-1 で pico_agent.adapters.tts_sbv2 経由に差し替え。ElevenLabs
         直叩きコードは dead-code として残置 (上流マージコンフリクト最小化)。
+
+        Cycle 8 (E-a): remote/both の go2rtc 再生は本体オリジナルの
+        ``_play_via_go2rtc`` (``localhost:1984`` 固定で Pi からは到達不能) では
+        なく adapter の ``tts_sbv2.play_with_fallback`` に委譲する。これで
+        ``GO2RTC_BASE_URL`` / ``TAPO_STREAM_NAME`` / ``GO2RTC_ENABLED`` /
+        ffmpeg 前処理 / フォールバックチェーン (tapo→main_pc→rpi5) が設計通り
+        効く。本体側の ``_play_via_go2rtc`` / ``go2rtc_url`` / ``go2rtc_stream``
+        は say() からは未使用となり退役候補。
         """
         # NOTE: aiohttp 直叩きは pico_v3 で停止 (adapter 経由に統一)。
         from pico_agent.adapters import tts_sbv2
@@ -170,30 +178,30 @@ class TTSTool:
             tmp_path: str | None = None
             voice_guard.on_tts_start(text)
             try:
-                # SBV2 adapter は WAV bytes を返す (失敗時は空 bytes)。
-                target = "discord_vc" if output in ("remote", "both") else "local_speaker"
-                audio_data = await tts_sbv2.speak(text, target=target)
-                if not audio_data:
-                    return "TTS API failed (adapter returned empty bytes)"
-
-                # SBV2 は WAV を返すので tmp に書き出して既存再生経路を再利用。
-                tmp_path = _write_tmp_audio(audio_data, suffix=".wav")
-
+                # ── remote / both: カメラ (Tapo C210) 再生は adapter に委譲 ──
+                # remote はフルフォールバックチェーン (auto = tapo→main_pc→rpi5)、
+                # both はローカルを下で明示再生するのでカメラのみ (tapo_speaker)。
                 if output in ("remote", "both"):
-                    ok, msg = await asyncio.to_thread(
-                        _play_via_go2rtc, tmp_path, self.go2rtc_url, self.go2rtc_stream
-                    )
+                    pwf_target = "auto" if output == "remote" else "tapo_speaker"
+                    ok, via = await tts_sbv2.play_with_fallback(text, target=pwf_target)
                     if ok:
-                        played_via.append("camera")
+                        played_via.append(via)
                     else:
-                        logger.warning("go2rtc playback failed: %s", msg)
-                        if output == "remote":
-                            return f"TTS remote playback failed: {msg}"
+                        logger.warning("tts_sbv2.play_with_fallback failed: %s", via)
 
+                # ── local PC スピーカー ──
+                # local/both は常に、remote は adapter が何も鳴らせなかった時のみ
+                # (E-2 の無音バグ修正: remote 失敗時はローカルへフォールスルー)。
                 if output in ("local", "both") or (output == "remote" and not played_via):
-                    local_ok = await _play_local(tmp_path)
-                    if local_ok:
-                        played_via.append("local")
+                    # SBV2 adapter は WAV bytes を返す (失敗時は空 bytes)。
+                    audio_data = await tts_sbv2.speak(text, target="local_speaker")
+                    if audio_data:
+                        # SBV2 は WAV を返すので tmp に書き出して既存再生経路を再利用。
+                        tmp_path = _write_tmp_audio(audio_data, suffix=".wav")
+                        if await _play_local(tmp_path):
+                            played_via.append("local")
+                    elif not played_via:
+                        return "TTS API failed (adapter returned empty bytes)"
 
                 if not played_via:
                     return "TTS playback failed (no working audio player found)"
@@ -430,7 +438,13 @@ async def _play_local(tmp_path: str) -> bool:
 
 
 def _play_via_go2rtc(file_path: str, go2rtc_url: str, stream_name: str) -> tuple[bool, str]:
-    """Play audio file through camera speaker via go2rtc backchannel (sync, run in thread)."""
+    """Play audio file through camera speaker via go2rtc backchannel (sync, run in thread).
+
+    LEGACY / 退役候補 (Cycle 8, E-a): say() は本関数を使わず adapter の
+    ``tts_sbv2.play_with_fallback`` 経由に移行済み。本関数は ``GO2RTC_URL``
+    (= ``localhost:1984``, Pi 自身) を前提とするため Pi からは到達不能。
+    config/agent 配線整理 (Task 3) で削除予定。現状 say() からの参照なし。
+    """
     try:
         abs_path = os.path.abspath(file_path)
         src = f"ffmpeg:{abs_path}#audio=pcma#input=file"
