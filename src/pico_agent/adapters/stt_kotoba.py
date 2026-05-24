@@ -286,7 +286,7 @@ async def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
 
     form = aiohttp.FormData()
     form.add_field(
-        "file",
+        "audio",
         audio_bytes,
         filename="audio.wav",
         content_type="audio/wav",

@@ -1175,3 +1175,51 @@ async def test_subscription_loop_restarts_on_ffmpeg_eof(monkeypatch):
     except asyncio.CancelledError:
         pass
     assert spawn_count >= 2  # 少なくとも 1 回は再起動した
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Phase C-6: form key & sample_rate regression guards
+# whisper_server.py の /transcribe は request.files["audio"] を期待する。
+# 旧コードでは "file" を送って silent 400 → 空文字 fallback していた。
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stt_form_key_is_audio(monkeypatch):
+    """whisper_server.py が期待する form key 'audio' で送る (Phase C-6)。"""
+    captured: list[tuple] = []
+
+    class _FakeForm:
+        def add_field(self, name, value, **kwargs):
+            captured.append((name, value, kwargs))
+
+    monkeypatch.setattr(stt_kotoba.aiohttp, "FormData", _FakeForm)
+    mock_session = _make_mock_session(status=200, json_payload={"text": "x"})
+    with patch(
+        "pico_agent.adapters.stt_kotoba.aiohttp.ClientSession",
+        return_value=mock_session,
+    ):
+        await stt_kotoba.transcribe(b"AUDIO", sample_rate=16000)
+    names = [f[0] for f in captured]
+    assert "audio" in names
+    assert "file" not in names
+
+
+@pytest.mark.asyncio
+async def test_sample_rate_field_still_sent(monkeypatch):
+    """form key 変更後も sample_rate が落ちないこと (Phase C-6 regression 防止)。"""
+    captured: list[tuple] = []
+
+    class _FakeForm:
+        def add_field(self, name, value, **kwargs):
+            captured.append((name, value, kwargs))
+
+    monkeypatch.setattr(stt_kotoba.aiohttp, "FormData", _FakeForm)
+    mock_session = _make_mock_session(status=200, json_payload={"text": "x"})
+    with patch(
+        "pico_agent.adapters.stt_kotoba.aiohttp.ClientSession",
+        return_value=mock_session,
+    ):
+        await stt_kotoba.transcribe(b"AUDIO", sample_rate=16000)
+    sr = [f for f in captured if f[0] == "sample_rate"]
+    assert sr and sr[0][1] == "16000"

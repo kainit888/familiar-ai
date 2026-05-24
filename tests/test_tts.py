@@ -197,3 +197,19 @@ async def test_say_serializes_concurrent_calls():
 
     # Both should succeed (no exception)
     assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase C-6: TTSTool.__init__ should no longer probe / spawn go2rtc
+# ---------------------------------------------------------------------------
+
+
+def test_tts_tool_init_does_not_emit_go2rtc_warning(caplog):
+    """TTSTool() init で go2rtc binary not found warning が出ないこと (Phase C-6)。"""
+    from familiar_agent.tools.tts import TTSTool
+
+    with caplog.at_level("WARNING", logger="familiar_agent.tools.tts"):
+        TTSTool(api_key="k", voice_id="v", output="local")
+    msgs = [r.message for r in caplog.records]
+    assert not any("go2rtc binary not found" in m for m in msgs)
+    assert not any("go2rtc config not found" in m for m in msgs)

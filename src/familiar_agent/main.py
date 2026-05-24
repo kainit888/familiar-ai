@@ -53,6 +53,19 @@ def setup_logging(debug: bool = False) -> None:
     root.addHandler(file_handler)
     root.setLevel(level)
 
+    # Phase C-6: route loguru logs to the same app.log (TUI must stay clean).
+    # pico_agent.* modules emit via loguru; without this they vanish from app.log.
+    from loguru import logger as loguru_logger
+
+    loguru_logger.remove()  # drop default stderr sink so TUI is not polluted
+    loguru_logger.add(
+        log_file,
+        level=level,
+        format="{time:YYYY-MM-DD HH:mm:ss,SSS} [{level}] {name}: {message}",
+        enqueue=True,
+        encoding="utf-8",
+    )
+
     # Reduce noise from 3rd party libs
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("anthropic").setLevel(logging.WARNING)

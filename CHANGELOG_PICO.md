@@ -7,7 +7,79 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
-## [Unreleased] — Stage 2 Phase C-5 完了 (2026-05-24)
+## [Unreleased] — Stage 2 Phase C-6 完了 (2026-05-24)
+
+### Phase C-6 (2026-05-24): 三点同時修正 (STT form key / loguru sink / go2rtc 起動撤廃)
+
+このサイクルでは Stage 2 デバッグ調査 (Phase C-5.5 marker 投入) で判明した
+3 件の独立バグを一括修正した。いずれも v5 設計書「14-4-7 STT 連携 (Kotoba-Whisper)」
+「14-5-1 TTS 経路」「ロギング (TUI 衝突対策)」と整合する。
+
+#### 修正 1: STT form key `"file"` → `"audio"`
+
+- `src/pico_agent/adapters/stt_kotoba.py:287-293`
+  - `aiohttp.FormData().add_field("file", audio_bytes, ...)` を `"audio"` に変更
+- 受信側 `whisper_server.py:/transcribe` が `request.files["audio"]` を期待するため、
+  従来の `"file"` キーは静かに 400 で落ちて空文字を返していた (silent fail)
+- `sample_rate` の文字列同梱は **そのまま維持** (回帰防止テストあり)
+- 上流 PR 候補度: **低** (pico_v3 独自層、whisper_server.py との結線専用)
+
+#### 修正 2: loguru → app.log 専用 sink (二層ログ統合)
+
+- `src/familiar_agent/main.py::setup_logging` に **+13 行** (loguru import + 4-6 行の sink 追加 + 関連定数)
+  - `loguru_logger.remove()` でデフォルト stderr sink を除去 (TUI 汚染防止)
+  - `loguru_logger.add(log_file, level=..., enqueue=True, encoding="utf-8")` で
+    既存 `~/.cache/familiar-ai/app.log` へ enqueue (async-safe) で書き出す
+- pico_agent.* モジュール (loguru 経由) と familiar_agent.* (stdlib logging 経由)
+  の両系統が **同一ファイル** に出るようになる
+- **InterceptHandler は意図的に追加しない** (二重ログ回避)。逆方向はそのまま分離
+- 標準 logging 経路 (`logging.FileHandler` + 3rd party レベル絞込) は無変更
+- 上流 PR 候補度: **中** (familiar_agent 側だけでは loguru 依存ファイルが無いため、
+  v6 で「ロギング統合は pico オプション」として説明文を入れる前提)
+
+#### 修正 3: `_ensure_go2rtc()` 呼出削除 (TTSTool.__init__)
+
+- `src/familiar_agent/tools/tts.py:133` の `_ensure_go2rtc(self.go2rtc_url)` を削除
+- 関数本体 (L77-108)、`_GO2RTC_BIN` / `_GO2RTC_CACHE` / `_GO2RTC_CONFIG` 定数、
+  `TTSTool` クラスは **無変更で残置** (上流マージ性維持、二層分離原則)
+- Phase C-5 で `say()` が `tts_sbv2.speak()` 単一経路に統一済みのため、
+  go2rtc バイナリ起動は Pi 上で完全に不要 (HTTP API のみ使用)
+- 起動時に出ていた `"go2rtc binary not found"` / `"go2rtc config not found"`
+  WARNING ログが消える (回帰防止テストあり)
+- 上流 PR 候補度: **低-中** (v5 14-5-1 単一経路化と整合、上流に提案する場合は
+  「go2rtc サポート自体を deprecate するか option 化」が前提)
+
+#### 14-4-7 節への v6 改訂要望 (planner 集約)
+
+設計書 v6 改訂時、STT 連携節に以下を明文化する:
+
+- multipart form field 名: `"audio"` (whisper_server.py I/F)
+- `sample_rate` フィールドを文字列で同梱する
+- `/transcribe` レスポンスは `application/json` / `text/plain` の両 Content-Type
+  対応 (silent fail 設計)
+
+#### Phase C-5.5 デバッグマーカーの扱い
+
+- カイニット指示 **選択肢 A (残置)** で確定 — commit `e8728c7` で投入した
+  `_stdlog.info("...ENTER...")` 系マーカーは簡潔化・revert いずれも実施しない
+- loguru sink 追加後も二重ログにはならない (stdlib `_stdlog` と `loguru.logger`
+  は別系統で event も別) — 新規テストで実装確認
+
+#### Tests (Phase C-6)
+
+- `tests/test_adapter_stt_kotoba.py`: 2 件追記
+  - `test_stt_form_key_is_audio`: form field 名が `"audio"` で `"file"` は不在
+  - `test_sample_rate_field_still_sent`: `sample_rate="16000"` の文字列同梱維持
+- `tests/test_setup_logging_loguru.py` (新規): 1 件
+  - `test_loguru_logs_reach_app_log`: loguru/stdlib 両系統が `app.log` に届く
+- `tests/test_tts.py`: 1 件追記
+  - `test_tts_tool_init_does_not_emit_go2rtc_warning`: `TTSTool()` init 時に
+    `"go2rtc binary not found"` / `"go2rtc config not found"` WARNING が出ない
+- pytest 件数: 1359 → **1363** (グリーン)
+
+---
+
+## [Released] — Stage 2 Phase C-5 完了 (2026-05-24)
 
 ### Phase C-5 (2026-05-24): TTS 単一経路化
 

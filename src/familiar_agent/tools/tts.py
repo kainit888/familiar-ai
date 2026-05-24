@@ -129,8 +129,8 @@ class TTSTool:
         self._voice_guard = voice_guard or get_shared_voice_guard()
         # Serialize concurrent say() calls so audio never overlaps
         self._lock = asyncio.Lock()
-        # Ensure go2rtc is running at startup
-        _ensure_go2rtc(self.go2rtc_url)
+        # Phase C-6: removed _ensure_go2rtc() — go2rtc binary is unused on Pi,
+        # HTTP API only (see Phase C-5 single-path TTS).
 
     async def say(self, text: str, output: str | None = None) -> str:
         """Speak text aloud (pico_v3: routed through Style-BERT-VITS2 adapter).
