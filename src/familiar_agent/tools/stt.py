@@ -206,7 +206,12 @@ class STTTool:
             if not chunks:
                 return b""
 
-            audio = np.concatenate(chunks, axis=0)
+            # packed s16 mono フレームは形状 (1, n_samples) で、n_samples は
+            # フレームごとに変動する (例: 1088, 1120)。サンプル軸 (axis=1) で連結
+            # する。axis=0 だと n_samples 一致が要求され "size 1088 vs 1120" で
+            # ValueError → 録音が空になっていた (Cycle 8 C-b バグ修正)。下の
+            # flatten() で 1-D mono に畳む。tools/tts.py:_play_mp3_via_pyav も同方式。
+            audio = np.concatenate(chunks, axis=1)
             buf = io.BytesIO()
             sf.write(buf, audio.flatten(), 16000, format="WAV", subtype="PCM_16")
             duration = len(audio.flatten()) / 16000

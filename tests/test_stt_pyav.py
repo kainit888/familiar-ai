@@ -79,6 +79,51 @@ async def test_record_rtsp_returns_wav_bytes_on_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_rtsp_concatenates_variable_length_frames() -> None:
+    """Cycle 8 (C-b) regression: variable-length packed s16 frames must concat.
+
+    PyAV AudioResampler(format='s16', layout='mono') returns shape (1, n_samples)
+    with n_samples varying per frame (e.g. 1088 vs 1120). The old
+    np.concatenate(chunks, axis=0) raised "size 1088 vs 1120" → recording came
+    back empty. axis=1 + flatten() must produce non-empty WAV bytes.
+    """
+    import numpy as np
+
+    tool = STTTool.__new__(STTTool)
+    tool._rtsp_url = "rtsp://fake/stream"
+
+    stop_event = asyncio.Event()
+
+    # Two frames with DIFFERENT sample counts — the exact bug condition.
+    frame_a = MagicMock()
+    frame_a.to_ndarray.return_value = np.zeros((1, 1088), dtype="int16")
+    frame_b = MagicMock()
+    frame_b.to_ndarray.return_value = np.zeros((1, 1120), dtype="int16")
+
+    mock_resampler = MagicMock()
+    # resample() is called once per decoded frame; return one resampled frame each.
+    mock_resampler.resample.side_effect = [[frame_a], [frame_b]]
+
+    mock_audio_stream = MagicMock()
+    mock_audio_stream.type = "audio"
+
+    mock_container = MagicMock()
+    mock_container.streams = [mock_audio_stream]
+    mock_container.decode.return_value = [frame_a, frame_b]
+
+    mock_av = MagicMock()
+    mock_av.open.return_value = mock_container
+    mock_av.AudioResampler.return_value = mock_resampler
+
+    with patch.dict("sys.modules", {"av": mock_av}):
+        result = await tool._record_rtsp(stop_event)
+
+    # 1088 + 1120 = 2208 samples worth of WAV bytes, no ValueError.
+    assert isinstance(result, bytes)
+    assert len(result) > 0
+
+
+@pytest.mark.asyncio
 async def test_record_rtsp_returns_empty_bytes_when_av_unavailable() -> None:
     """If PyAV is not installed, _record_rtsp should return empty bytes gracefully."""
     tool = STTTool.__new__(STTTool)
