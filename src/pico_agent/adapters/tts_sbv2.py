@@ -54,6 +54,12 @@ from urllib.parse import quote, urlencode
 import aiohttp
 from loguru import logger
 
+# Phase C-5.5 調査用: 標準 logging を loguru と並行発行 (familiar_agent/main.py の
+# setup_logging が loguru sink を設定していないため、loguru 出力が app.log に
+# 届かない疑い。実機ログで切り分けるための一時マーカー)。
+import logging as _stdlogging
+_stdlog = _stdlogging.getLogger(__name__)
+
 # ── 型エイリアス ──────────────────────────────────────────────────────────
 # 感情 dict は ``{"valence": 0.0-1.0, "arousal": 0.0-1.0, ...}`` 形式。
 # Phase E (感情 3 値実装) で具体的なキーを TypedDict 化する想定。
@@ -543,18 +549,27 @@ async def speak(
         常に ``None``。例外は投げない (失敗時は無音 + logger.warning)。
         v5 14-5-11 でフォールバックは撤廃。
     """
+    _stdlog.info(
+        "tts_sbv2.speak: ENTER target=%s text_len=%d",
+        target,
+        len(text) if text else 0,
+    )
     if not text or not text.strip():
         logger.warning("tts_sbv2.speak: empty text")
+        _stdlog.info("tts_sbv2.speak: EXIT empty_text")
         return
     if target not in _VALID_TARGETS:
         logger.warning("tts_sbv2.speak: unknown target {!r}, returning silently", target)
+        _stdlog.info("tts_sbv2.speak: EXIT invalid_target=%s", target)
         return
 
     if target == "discord_vc":
         logger.warning("tts_sbv2.speak: target=discord_vc is not implemented yet (Phase D)")
+        _stdlog.info("tts_sbv2.speak: EXIT stub_discord_vc")
         return
     if target == "obs_audio":
         logger.warning("tts_sbv2.speak: target=obs_audio is not implemented yet (Phase K)")
+        _stdlog.info("tts_sbv2.speak: EXIT stub_obs_audio")
         return
 
     # target == "tapo_speaker": go2rtc HTTP API 経由で Tapo C210 へ送出
@@ -563,6 +578,7 @@ async def speak(
     wav_bytes = await _fetch_wav_bytes(text, speaker_id, emotion)
     if not wav_bytes:
         # _fetch_wav_bytes 内部で warning 済
+        _stdlog.info("tts_sbv2.speak: EXIT sbv2_failed")
         return
 
     src_path = _write_tmp_wav(wav_bytes)
@@ -571,17 +587,20 @@ async def speak(
         pre_path = await _preprocess_wav_with_ffmpeg(src_path)
         if pre_path is None:
             # _preprocess_wav_with_ffmpeg 内部で warning 済
+            _stdlog.info("tts_sbv2.speak: EXIT ffmpeg_failed")
             return
 
         ok = await _post_to_go2rtc(pre_path)
         if not ok:
             # _post_to_go2rtc 内部で warning 済
+            _stdlog.info("tts_sbv2.speak: EXIT go2rtc_post_failed")
             return
 
         logger.info(
             "tts_sbv2.speak: played via tapo_speaker (text={!r})",
             text[:40],
         )
+        _stdlog.info("tts_sbv2.speak: EXIT ok")
     finally:
         for p in (src_path, pre_path):
             if not p:

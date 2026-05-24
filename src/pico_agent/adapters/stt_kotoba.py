@@ -58,6 +58,12 @@ from urllib.parse import quote
 import aiohttp
 from loguru import logger
 
+# Phase C-5.5 調査用: 標準 logging を loguru と並行発行 (familiar_agent/main.py の
+# setup_logging が loguru sink を設定していないため、loguru 出力が app.log に
+# 届かない疑い。実機ログで切り分けるための一時マーカー)。
+import logging as _stdlogging
+_stdlog = _stdlogging.getLogger(__name__)
+
 
 # ── 型エイリアス ──────────────────────────────────────────────────────────
 class _SilenceEvent(TypedDict):
@@ -265,8 +271,14 @@ async def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
     Returns:
         書き起こしテキスト。失敗時 / 空入力時は空文字 (例外は投げない)。
     """
+    _stdlog.info(
+        "stt_kotoba.transcribe: ENTER bytes=%d sr=%d",
+        len(audio_bytes) if audio_bytes else 0,
+        sample_rate,
+    )
     if not audio_bytes:
         logger.warning("stt_kotoba.transcribe: empty audio_bytes")
+        _stdlog.info("stt_kotoba.transcribe: EXIT error=empty_audio_bytes")
         return ""
 
     url = _get_base_url()
@@ -283,7 +295,14 @@ async def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            _stdlog.info("stt_kotoba.transcribe: POST %s", url)
             async with session.post(url, data=form) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                _stdlog.info(
+                    "stt_kotoba.transcribe: status=%d ct=%s",
+                    resp.status,
+                    content_type,
+                )
                 if resp.status != 200:
                     body = await resp.text()
                     logger.warning(
@@ -292,23 +311,39 @@ async def transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
                         url,
                         body[:200],
                     )
+                    _stdlog.info(
+                        "stt_kotoba.transcribe: EXIT error=http_%d", resp.status
+                    )
                     return ""
                 # whisper_server は JSON {"text": "..."} を返す想定。
                 # plain text を返す実装にも対応するため両方試す。
-                content_type = resp.headers.get("Content-Type", "")
                 if "json" in content_type.lower():
                     try:
                         data = await resp.json()
                     except Exception as e:
                         logger.warning("stt_kotoba: JSON decode failed: {}", e)
+                        _stdlog.info(
+                            "stt_kotoba.transcribe: EXIT error=json_decode_failed"
+                        )
                         return ""
                     text = data.get("text", "") if isinstance(data, dict) else ""
-                    return str(text).strip()
+                    result = str(text).strip()
+                    _stdlog.info(
+                        "stt_kotoba.transcribe: EXIT text_len=%d",
+                        len(result) if result else 0,
+                    )
+                    return result
                 # text/plain fallback。
                 text = await resp.text()
-                return text.strip()
+                result = text.strip()
+                _stdlog.info(
+                    "stt_kotoba.transcribe: EXIT text_len=%d",
+                    len(result) if result else 0,
+                )
+                return result
     except Exception as e:
         logger.warning("stt_kotoba.transcribe: request failed: {}", e)
+        _stdlog.info("stt_kotoba.transcribe: EXIT error=%s", e)
         return ""
 
 
