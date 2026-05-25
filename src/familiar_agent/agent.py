@@ -59,6 +59,9 @@ from .mcp_client import MCPClientManager, _resolve_config_path
 # pico_v3 拡張: 応答漏出フィルタ (内部メンタル状態スキャフォールディング除去)
 from pico_agent.response_filter import strip_internal_state_leakage
 
+# pico_v3 拡張 (Phase C-10): self_model 汚染 (verbatim 反射等) の保存前検証
+from pico_agent.self_model_filter import is_valid_self_model_insight
+
 logger = logging.getLogger(__name__)
 
 
@@ -2225,6 +2228,12 @@ class EmbodiedAgent:
                 max_tokens=80,
             )
             if insight and insight.lower() != "nothing":
+                if not is_valid_self_model_insight(insight, final_text):
+                    logger.warning(
+                        "Self-model: insight rejected by validation filter: %s",
+                        insight[:60],
+                    )
+                    return
                 if _has_unexpected_language(insight, _LANG):
                     logger.warning(
                         "Self-model: discarding non-localized response (lang=%s): %s",

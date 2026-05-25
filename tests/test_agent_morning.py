@@ -366,7 +366,13 @@ async def test_update_self_model_discards_non_japanese_response(caplog):
 
     assert agent._memory.save_async.await_count == 0
     assert any(
-        ("non-localized" in rec.message or "discarding" in rec.message)
+        (
+            "non-localized" in rec.message
+            or "discarding" in rec.message
+            # Phase C-10: the validation filter now rejects ASCII-heavy/non-第一人称
+            # insights before the _has_unexpected_language branch.
+            or "rejected by validation filter" in rec.message
+        )
         for rec in caplog.records
     )
 

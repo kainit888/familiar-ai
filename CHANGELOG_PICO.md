@@ -7,7 +7,121 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
-## [Unreleased] — Stage 2 Phase C-8 完了 (2026-05-25)
+## [Unreleased] — Stage 2 Phase C-10 完了 (2026-05-25)
+
+### Phase C-10 (2026-05-25): self_model 汚染ループ修正
+
+`_update_self_model` (familiar_agent/agent.py) が utility backend qwen2.5:1.5b に
+自己洞察を作らせるが、1.5b が抽象化に失敗し応答テキストを **verbatim 反射** する。
+その verbatim 行が verbatim ガード無しで `kind='self_model'` として保存され、次セッション
+1 ターン目の morning reconstruction で system prompt に注入され、Gemini がそれをエコー
+していた (「同じ応答が繰り返される」C-9 バグ)。追加汚染パターン: プロンプトのラベルリーク
+(`良い例:\n私は…`)、韓国語 (ハングル) / 中国語混入、英語 verbatim 反射。
+
+**修正 (アプローチ Y, カイニット承認)**: pico_agent に保存前検証フィルタを新設し、
+agent.py から import + 呼び出し (2 箇所のみ侵入)。前例 `response_filter` と同型の二層
+分離を厳守 (filter は familiar_agent を import せず、依存は re / unicodedata / loguru のみ)。
+加えて既存 DB の汚染行を同フィルタの判定で削除するクリーンアップ script を新設・実行。
+
+判定 (`is_valid_self_model_insight(insight, final_text)`, True=保存可):
+- (a) verbatim / 高類似: NFKC 正規化 + 空白句読点除去後の部分包含 (norm_i >= 12) /
+  文字 bigram Jaccard >= 0.8 / bigram overlap 係数 >= 0.8 (冒頭差異で厳密包含が崩れた
+  反射も捕捉)。`final_text` が空なら (a) をスキップ → DB クリーンアップ用途
+- (a 補完) 会話エコー: 応答調末尾 AND 会話フィラーの反射文を final_text 不在でも弾く
+- (b) 一人称「私」要件 (欠落なら破棄)
+- (c) ラベルリーク (`良い例` / `条件[:：]` / `一文だけ` / `nothing` 等を re.IGNORECASE)
+- (d) 異言語スクリプト (`unicodedata.name(c)` が `HANGUL` 等で始まる文字混入)
+- (d 補完) 中国語混入 (CJK 漢字 >= 4 AND 仮名ゼロ)
+- 長さ: `_MIN_LEN=4` / `_MAX_LEN=200`。各破棄理由を `logger.warning` で記録
+
+既存行クリーンアップ (`is_contaminated_existing_row`): final_text 不在前提なので
+(c) ラベル OR (d) 異言語 (ハングル + 中国語混入 + ASCII 過多=英語 verbatim 反射)
+OR 過長 OR 会話エコー OR ((b) 一人称欠落 AND 応答調末尾) を汚染と判定。
+一人称欠落単独では削除しない (正常 self_model の誤削除防止)。
+
+**第2イテレーション強化 (会話エコー + 中国語混入)**: 第1イテレーションの口語反射
+判定は「一人称欠落 AND 応答調末尾」の AND だったため、**一人称『私』を含む会話
+エコー行** (例「私、元気だよ！話しかけてくれて嬉しいな。そっちはどう？」) を取り
+こぼし、これらが `recall_self_model` の `ORDER BY timestamp DESC LIMIT 5` で次回
+morning に再注入され C-9 バグを再発させる欠陥があった。対策として **一人称の有無に
+依らない会話エコー検出** を追加: **応答調末尾 (`_RESPONSE_TONE_PATTERNS`: だよ/だね/
+んだ/です/ます/かな/どう？/嬉しいな 等) AND 会話フィラー (`_CONVERSATIONAL_ECHO_MARKERS`:
+うん、/そうだね/元気だよ/話しかけてくれて/そっちは/どう？/分かりません 等)** の AND
+ゲート (reason=`conversational_echo`)。AND ゲートにより、フィラーを持たず断定/内省
+末尾 (〜られた。/〜ている。/〜惹かれる。) で終わる genuine な一人称内省は保持される。
+加えて **中国語混入** (CJK 漢字 >= 4 AND 仮名ゼロ。自然な日本語は必ず仮名を含む)
+を `chinese_mixin` として検出 (ASCII 比率も表音文字判定も漢字のみの中国語を取り
+こぼすため)。`is_valid_self_model_insight` (保存前) にも会話エコー / 中国語混入を
+(a)(d) の補完として組み込み、final_text 不在でも弾けるよう既存行判定と整合させた。
+
+#### Added
+
+- `src/pico_agent/self_model_filter.py` 新設
+  - `is_valid_self_model_insight(insight, final_text) -> bool` (保存前フィルタ)
+  - `is_contaminated_existing_row(content) -> bool` / `contamination_reason(content) -> str`
+    (既存行クリーンアップの単一真実源)
+- `scripts/dev/cleanup_self_model_c10.py` 新設 (既存 DB 汚染行クリーンアップ)
+  - argparse `--db` / `--dry-run` (既定) / `--apply`、判定は self_model_filter を import
+    再利用、DELETE のみ (DROP 禁止)、フィルタ通過行は残すので冪等
+
+#### Fixed
+
+- `src/familiar_agent/agent.py` (2 箇所のみ侵入、二層分離厳守)
+  - import 行追加 (`from pico_agent.self_model_filter import is_valid_self_model_insight`)
+  - `_update_self_model` の `if insight and insight.lower() != "nothing":` ブロック内、
+    `_has_unexpected_language` チェックの直前に検証ガード分岐を追加。reject 時 warning +
+    early return。既存 `_has_unexpected_language` は据え置き (新フィルタは上乗せ)
+
+#### DB cleanup (実行結果, 全数値は SELECT / pytest で実測)
+
+- バックアップ:
+  - 第1イテレーション (元状態): `~/.familiar_ai/observations.db.bak_c10` = **23 行** (SELECT 実測)
+  - 第2イテレーション再 backup: `~/.familiar_ai/observations.db.bak_c10b` = **6 行**
+    (sqlite backup API で WAL 込みの live state を取得。`cp` は WAL 未反映の .db 本体
+    23 行を写してしまうため不可)
+- 削除前 self_model 件数: **6** → 削除後: **1** (この第2イテレーションで **5 行**削除。
+  `--apply` 出力 `before=6 after=1` + 独立 SELECT で確認)
+- 第2イテレーション削除内訳: chinese_mixin (中国語混入) 1 / conversational_echo
+  (一人称含む会話エコー 4: 「私、元気だよ！…そっちはどう？」「うん、元気だよ！…
+  話しているんだ。」「うん、そうだね！…話しているんだよ。」「そのような状況では
+  私には…分かりません。」)
+- 累積 (両イテレーション合計): 元 23 行は **全 23 行が汚染**で削除済 (第1で 18 / 第2で 5)。
+  内訳 (強化フィルタを元 23 行に適用した実測): ascii_heavy_wrong_language 9 /
+  conversational_echo 6 / no_first_person_response_tone 4 / label_leak 2 /
+  chinese_mixin 1 / unexpected_script 1
+- 最終保持 **1 行**: `私はアニメの映像と…その不思議な融合体に魅せられた。`
+  (id=c10352e8, **backup 後に新規生成された genuine な日本語一人称内省**。元 23 行とは
+  別個体)。timestamp DESC 上位 5 (次回 morning の n=5 窓) に**会話エコー / 中国語混入は
+  皆無**であることを SELECT で実証
+- 冪等確認: `--apply` 再実行で削除候補 0 / 削除 0 件 (`before=1 after=1`, no-op)
+
+#### Tests
+
+- `tests/test_self_model_filter_c10.py` **24 ケース** (verbatim 部分包含 / Jaccard 近似
+  コピー / overlap 反射 / ラベルリーク / ハングル / 一人称欠落 / 空・None・短文・過長 reject、
+  正常 insight accept、final_text 空時の (a) スキップ、`is_contaminated_existing_row` の
+  汚染検出 + 正常行保持 + クリーンアップ冪等)。**第2イテレーションで +5 ケース追加**:
+  `test_contaminated_first_person_conversational_echo` (一人称含む会話エコー→True) /
+  `test_contaminated_clip_echo_disclaimer_row` (clip echo→True) /
+  `test_genuine_first_person_insight_preserved` (genuine 一人称内省 2 例→False、誤削除
+  防止 pin) / `test_contaminated_chinese_mixin_row` (中国語混入→True) /
+  `test_save_time_conversational_echo_rejected_empty_final` (保存前 final 空でもエコー
+  reject)。mutation 対応: 会話エコー検出削除で echo テストが fail、AND ゲートを緩める /
+  genuine 誤検出で preserved テストが fail、中国語検出削除で chinese テストが fail
+- `tests/test_self_model_pollution_c9.py` **3 ケース** (C-10 ガード成立を assert 追加
+  `is_valid_self_model_insight(verbatim_echo, final_text=verbatim_echo) is False`、
+  汚染メカニズムの pin は残置)
+- `tests/test_agent_morning.py` 更新: 既存 `test_update_self_model_discards_non_japanese_response`
+  の log メッセージ assert に新フィルタの reject メッセージを追加 (機能 assert は不変)
+- self_model 関連テスト合計 **c10=24 + c9=3 = 27**
+- フルスイート: **1400 passed** (実測 tail `1400 passed, 9 warnings`)、ruff / mypy クリーン
+
+#### 設計書との齟齬 (v6 改訂予定)
+
+設計書 v5 は DB パスを `~/.pico_v3/memory.db` と記載するが、実体は
+`~/.familiar_ai/observations.db` (テーブル `observations`, 列 `kind`)。本フェーズの
+実装・クリーンアップは実体に合わせた。設計書 v5 本体は本フェーズでは触らず、v6 改訂で
+反映予定。
 
 ### Phase C-8 (2026-05-25): TTS 複数チャンク音声途中切れバグ修正
 
