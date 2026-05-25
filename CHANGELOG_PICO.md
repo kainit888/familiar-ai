@@ -7,7 +7,160 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
-## [Unreleased] — Stage 2 Phase C-6 完了 (2026-05-24)
+## [Unreleased] — Stage 2 Phase C-8 完了 (2026-05-25)
+
+### Phase C-8 (2026-05-25): TTS 複数チャンク音声途中切れバグ修正
+
+長文を 30 文字分割して複数チャンクを SBV2 で合成したとき、音声が 1 個目のチャンクで
+途中切れする不具合を修正。**原因**: 旧 `_fetch_wav_bytes` が複数チャンクの WAV を
+`b"".join()` でバイト連結していたが、これだと WAV ヘッダの data サイズが第1チャンク分
+しか宣言されず、ffmpeg が 1 個目だけ読んで打ち切っていた (実機 ffprobe で確認: byte
+連結ファイル → 3.146s = chunk1 のみ / concat demuxer 結合 → 7.303s = 全チャンク)。
+**修正**: バイト連結をやめ、各チャンクの WAV を list で返し、ffmpeg の **concat
+demuxer** (`-f concat -safe 0 -i <list>`) で結合 + 前処理する単一経路に再設計。
+Phase C-7 の HTTP pull アーキ (配信サーバ / 単一 POST / 遅延削除 / 新 env) は **一切不変**。
+
+**部分失敗時の挙動 (採用方針: 部分再生)**: `_fetch_wav_parts` は空チャンク (`b""`) を
+`if part:` で list から除外し、取得できたチャンクのみ concat する。一部チャンクが失敗
+しても成功分は鳴らす (silent fail = 鳴る分は鳴らす方針に合致)。全チャンク失敗時のみ無音。
+
+#### Fixed
+
+- `src/pico_agent/adapters/tts_sbv2.py`
+  - `_fetch_wav_bytes` → `_fetch_wav_parts` に改名・再設計。戻り値を `bytes` から
+    `list[bytes]` へ。最後の `return b"".join(audio_parts)` を `return parts` に変更。
+    空チャンクは `if part:` で除外、全滅 / 空入力 / session 例外時は `[]` を返す
+  - `_write_tmp_wavs(parts: list[bytes]) -> list[str]` を新設 (各 part を `_write_tmp_wav`
+    で書き出す)。`_write_tmp_wav` は据え置き
+  - `_build_af_filter() -> str` を新設 (`volume=<TTS_VOLUME>,apad=pad_dur=<TTS_TAIL_SILENCE>`
+    を切り出し、concat 経路と共有。パラメータ値は不変)
+  - `_write_concat_list(src_paths) -> str` を新設。各 path を `os.path.abspath` + シングル
+    クォートエスケープ (`'` → `'\''`) して `file '<path>'` 形式で 1 行ずつ tempfile API
+    で書き出す (echo/redirect 不使用)
+  - `_build_concat_ffmpeg_args(list_path, dst) -> list[str]` を新設
+    (`ffmpeg -y -loglevel error -f concat -safe 0 -i <list> -af <filter> -ar <rate> -ac 1 -f wav <dst>`)
+  - `_concat_and_preprocess(src_paths, out_dir=None) -> str | None` を新設。concat demuxer で
+    全チャンクを結合 + 前処理。ffmpeg なし / 入力空 / rc!=0 / 例外で `None` + warning (silent
+    fail)、`finally` で list ファイルを `_unlink_quiet`
+  - `_preprocess_wav_with_ffmpeg` (単一 WAV 前処理) と `_build_ffmpeg_args` を削除
+    (concat 経路に置換、`_build_af_filter` は残置)
+  - `speak()` tapo 経路を組み替え: `_fetch_wav_parts` → `_write_tmp_wavs` →
+    `_concat_and_preprocess(src_paths, out_dir=serve_dir)` → 単一 POST。`finally` で
+    SBV2 生 WAV 群を即削除、配信 WAV は C-7 の遅延削除を維持
+
+#### Tests (Phase C-8)
+
+- `tests/test_adapter_tts_sbv2.py`: 既存書換 + 新規追加 (84 → 90 件)
+  - 新規 `test_concat_list_contains_all_chunks` — list ファイルに両チャンク行が含まれ
+    行数 == 入力数 (1個目だけ書く mutation を検知)
+  - 新規 `test_concat_list_escapes_single_quotes` — シングルクォートエスケープ確認
+  - 新規 `test_concat_args_use_concat_demuxer` — `-f concat` / `-safe 0` / `-i <list>` /
+    `-af volume=...,apad=...` / `-ar 16000` / `-ac 1` / 末尾 `-f wav <dst>` (mutation 検知)
+  - 新規 `test_concat_args_use_env_overrides` — 前処理パラメータの env 上書き維持確認
+  - 新規 `test_speak_multi_chunk_writes_all_src_and_concats` — `_concat_and_preprocess` を
+    スパイ化し渡る src_paths 長 >= 2 == チャンク数 + 単一 POST (byte-join 復活 / 1個目
+    だけ渡す mutation を検知)
+  - 新規 `test_fetch_wav_parts_returns_list` — 複数チャンクで list / len == チャンク数 /
+    各要素 bytes (`b"".join` 復活を検知)
+  - 新規 `test_fetch_wav_parts_excludes_empty_and_all_fail_returns_empty` — `b""` 除外 +
+    全滅 `[]` (空除外削除を検知)
+  - 移植 (旧 `_preprocess_wav_with_ffmpeg` 単体テスト → `_concat_and_preprocess` 側へ):
+    `test_concat_returns_none_on_nonzero_rc` / `test_concat_no_ffmpeg_returns_none` /
+    `test_concat_empty_src_returns_none` / `test_concat_exec_exception_returns_none`
+  - 書換: `test_fetch_wav_bytes_*` → `test_fetch_wav_parts_*` (list 期待)、
+    `test_model_name_query_includes_model_name` を `_fetch_wav_parts` 呼出へ、
+    `_patch_go2rtc_chain` と各 `fake_preprocess` を `_concat_and_preprocess` の fake に差替
+  - 緑維持確認: `test_speak_splits_long_text_into_multiple_requests` (複数 GET → 単一 POST)、
+    C-7 系 (`test_serve_*` / `test_go2rtc_url_uses_http_url_not_local_path` 等)
+- pytest 件数: 1367 → **1373** (グリーン、ruff/mypy クリーン)
+
+### Phase C-7 (2026-05-25): go2rtc HTTP pull 方式に修正
+
+go2rtc は `src=ffmpeg:<url>#input=file` で WAV を **HTTP pull** する。従来は Pi 上の
+ローカルパス (`ffmpeg:/tmp/xxx.wav#input=file`) を渡していたが、go2rtc は **メイン PC**
+で動くため Pi のローカルパスを開けず、音が鳴らなかった。本サイクルでは Pi 側に小さな
+WAV 配信サーバ (aiohttp.web) を立て、go2rtc に Pi の HTTP URL を pull させる方式へ修正。
+
+#### 修正 4: default go2rtc URL バグ
+
+- `src/pico_agent/adapters/tts_sbv2.py:74`
+  - `_DEFAULT_GO2RTC_BASE_URL = "http://127.0.0.1:1984"` → `"http://192.168.10.104:1984"`
+  - go2rtc は Pi ローカルではなくメイン PC で常駐するため、`127.0.0.1` は誤り
+
+#### 修正 5: 新規 env アクセサ + .env.example
+
+- `src/pico_agent/adapters/tts_sbv2.py:82` 付近: 定数 3 件追加
+  - `_DEFAULT_TTS_SERVE_PORT = 50021` / `_DEFAULT_TTS_PI_SELF_IP = "192.168.10.109"` /
+    `_DEFAULT_TTS_DELETE_DELAY_SEC = 30.0`
+- アクセサ 3 件追加 (`_get_*` 慣習: int/float は try/except フォールバック、str はそのまま)
+  - `_get_serve_port() -> int` (env `TTS_SERVE_PORT`)
+  - `_get_pi_self_ip() -> str` (env `TTS_PI_SELF_IP`)
+  - `_get_delete_delay_sec() -> float` (env `TTS_DELETE_DELAY_SEC`、**カイニット提案で採用**)
+- `.env.example` の go2rtc/TTS ブロック (L134 直後) に 3 キーをコメント付きで追記
+  (`.env` 本体は無変更)
+
+#### 修正 2: Pi 側 WAV HTTP 配信サーバ (aiohttp.web、新規依存なし)
+
+- `src/pico_agent/adapters/tts_sbv2.py`: `from aiohttp import web` 追加 (L55)、
+  module-level singleton (`_serve_runner` / `_serve_dir` / `_serve_lock`) +
+  `_serve_handler` / `_ensure_http_server()` を新規追加
+  - `_ensure_http_server()` は lazy init + singleton (lock 下で冪等起動)。
+    `tempfile.mkdtemp` で配信 dir を作り `0.0.0.0:<TTS_SERVE_PORT>` に listen、
+    `(root_dir, port)` を返す
+  - `_serve_handler` は `Path(name).name` でトラバーサル無効化 + `.wav` 以外は 404 +
+    `_serve_dir is None` も 404
+
+#### 修正 1: src を HTTP URL に + 配信 dir への WAV 配置
+
+- `src/pico_agent/adapters/tts_sbv2.py`
+  - `_build_go2rtc_url(wav_path)` → `_build_go2rtc_url(wav_url)` (引数の意味を
+    ローカルパス → HTTP URL へ。`ffmpeg:<wav_url>#audio=pcma#input=file`)
+  - `_preprocess_wav_with_ffmpeg(src_path, out_dir: Path | None = None)`:
+    `out_dir` 指定時はその dir 内に WAV を作る (配信 dir)。`None` は従来動作 (後方互換)
+  - `speak()` tapo 経路: `_ensure_http_server()` → 配信 dir 取得 → ffmpeg 出力をその dir →
+    `http://<TTS_PI_SELF_IP>:<port>/<name>` を組立 → `_post_to_go2rtc(wav_url)`
+  - `#audio=pcma#input=file` の維持必須要素は不変
+
+#### 修正 3: 遅延削除
+
+- `src/pico_agent/adapters/tts_sbv2.py`: `_unlink_quiet(path)` / `_delayed_unlink(path, delay)`
+  を新規追加。`speak()` の `finally` を変更:
+  - SBV2 生 WAV (`src_path`) は **即削除** (`_unlink_quiet`)
+  - 配信 WAV (`pre_path`) は go2rtc が pull し終える猶予のため
+    `asyncio.create_task(_delayed_unlink(pre_path, _get_delete_delay_sec()))` で **遅延削除**
+
+#### Tests (Phase C-7)
+
+- `tests/test_adapter_tts_sbv2.py`: 既存テスト書換 (件数据え置き) + 新規 4 件
+  - 書換: `test_go2rtc_url_default` / `test_legacy_GO2RTC_URL_ignored` を
+    `192.168.10.104:1984` 期待へ、`test_go2rtc_encodes_src_correctly` /
+    `test_go2rtc_uses_env_overrides` を HTTP URL 入力 + `ffmpeg%3Ahttp%3A` 期待へ
+  - 共通モックヘルパ `_patch_go2rtc_chain` に `_ensure_http_server` fake と
+    `_delayed_unlink` 即時化を追加 (実サーバ起動なしで全 tapo 経路テスト緑維持)。
+    独自 session を立てる `test_speak_passes_speaker_id_to_query` /
+    `test_speak_emotion_affects_style_weight` / `test_speak_ffmpeg_failure_returns_silently`
+    にも `_ensure_http_server` fake を追加、`fake_preprocess` を `out_dir=None` 受容に
+  - 新規 1: `test_go2rtc_url_uses_http_url_not_local_path` — 二重 unquote で
+    `/tmp/` 不在 + `http://<ip>:<port>` 在 + `ffmpeg:http://` 在 + `#audio=pcma#input=file` 在
+  - 新規 2: `test_serve_server_singleton` — `AppRunner`/`TCPSite` mock 化、`mkdtemp` 固定、
+    singleton リセット。2 回呼んで TCPSite 構築回数==1・port 一致を assert
+  - 新規 3: `test_serve_wav_not_deleted_immediately` — 段階1=`_delayed_unlink` スパイ化で
+    speak() 直後に配信 WAV 存在 + 遅延 task へ `(pre_path, 30.0)` 渡し確認、
+    段階2=`asyncio.sleep` 即 return 化し実 `_delayed_unlink` 直接 await で `not exists()`
+  - 新規 4: `test_default_go2rtc_base_url_is_main_pc` — env 未設定で
+    `_get_go2rtc_base_url() == "http://192.168.10.104:1984"` + 定数直接 assert
+- pytest 件数: 1363 → **1367** (グリーン)
+
+#### 設計書 v5 との齟齬 (v5.1 改訂予定)
+
+- v5 14-5-2 / 14-5-5 節は `src=ffmpeg:<wav_path>#input=file` を **ローカルパス前提** で
+  記述しているが、go2rtc がメイン PC で動く以上 Pi ローカルパスは開けない。本サイクルの
+  HTTP pull 方式 (Pi 側 WAV 配信サーバ + Pi の HTTP URL を src に渡す) との齟齬は
+  **v5.1 で改訂予定** (本サイクルでは CHANGELOG 記録のみ、設計書本体は無変更)
+
+---
+
+## [Released] — Stage 2 Phase C-6 完了 (2026-05-24)
 
 ### Phase C-6 (2026-05-24): 三点同時修正 (STT form key / loguru sink / go2rtc 起動撤廃)
 

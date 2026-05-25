@@ -26,9 +26,12 @@ v5 (2026-05-24) で `play_with_fallback` (`tapo_speaker → main_pc → rpi5` �
     - 例外を raise せず silent fail + logger.warning
     - 失敗時は無音 (None 返却)、フォールバックは設けない (v5 14-5-11)
 
-go2rtc 連携 (v5 14-5-5 / 14-5-12 確定):
+go2rtc 連携 (v5 14-5-5 / 14-5-12 確定、Phase C-7 で HTTP pull 方式へ修正):
     - POST {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=<URL-encoded ffmpeg URL>
-    - src 形式: ffmpeg:<wav_path>#audio=pcma#input=file
+    - src 形式: ffmpeg:<wav_url>#audio=pcma#input=file
+    - <wav_url> は Pi 側 WAV 配信サーバの HTTP URL
+      (例 http://192.168.10.109:50021/xxxx.wav)。go2rtc (メイン PC) が
+      このローカルパスではなく HTTP で WAV を pull する (Phase C-7)。
     - Body 空、Authorization なし、Content-Type なし
     - LAN 内認証なし (192.168.10.104:1984)
     - **Pi 側に go2rtc バイナリを置かない** (HTTP API 単一経路)
@@ -52,6 +55,7 @@ from typing import Literal, TypeAlias
 from urllib.parse import quote, urlencode
 
 import aiohttp
+from aiohttp import web
 from loguru import logger
 
 # Phase C-5.5 調査用: 標準 logging を loguru と並行発行 (familiar_agent/main.py の
@@ -71,7 +75,7 @@ Target: TypeAlias = Literal["tapo_speaker", "discord_vc", "obs_audio"]
 # ── 設定 (環境変数で上書き可能、ハードコード禁止) ────────────────────────────
 _DEFAULT_BASE_URL = "http://192.168.10.104:5000"
 _DEFAULT_TIMEOUT_SEC = 60.0
-_DEFAULT_GO2RTC_BASE_URL = "http://127.0.0.1:1984"
+_DEFAULT_GO2RTC_BASE_URL = "http://192.168.10.104:1984"
 _DEFAULT_TAPO_STREAM_NAME = "tapo_c210"
 _DEFAULT_TTS_MODEL_NAME = "jvnv-F1-jp"
 _DEFAULT_TTS_VOLUME = 0.5
@@ -80,10 +84,23 @@ _DEFAULT_TTS_TAIL_SILENCE = 0.5
 _DEFAULT_TTS_CHUNK_MAX_CHARS = 30
 _DEFAULT_TTS_CHUNK_DELAY_MS = 0
 
+# go2rtc は ffmpeg:<url>#input=file で WAV を **HTTP pull** する (Phase C-7)。
+# Pi 上の WAV を go2rtc (メイン PC) から取りに来させるため、Pi 側で小さな
+# HTTP 配信サーバを立てて WAV を公開する。以下はそのパラメータ。
+_DEFAULT_TTS_SERVE_PORT = 50021
+_DEFAULT_TTS_PI_SELF_IP = "192.168.10.109"
+_DEFAULT_TTS_DELETE_DELAY_SEC = 30.0   # 配信 WAV 遅延削除秒 (カイニット提案で env 外出し)
+
 # 暖機ファイル (カイニット指定)
 _WARMUP_WAV_PATH = Path("/tmp/pico_v3_warmup.wav")
 _WARMUP_TEXT = "ん"
 _WARMUP_DONE: bool = False
+
+# Pi 側 WAV 配信サーバ (Phase C-7、go2rtc HTTP pull 用)。
+# lazy init + singleton: 初回 speak() で起動し、以後は使い回す。
+_serve_runner: web.AppRunner | None = None
+_serve_dir: Path | None = None
+_serve_lock = asyncio.Lock()
 
 # 分割優先度: 「。」「！」「？」「、」「\n」の順
 _SPLIT_PRIORITY: tuple[str, ...] = ("。", "！", "？", "、", "\n")
@@ -167,6 +184,29 @@ def _get_chunk_delay_ms() -> int:
         return int(raw) if raw else _DEFAULT_TTS_CHUNK_DELAY_MS
     except ValueError:
         return _DEFAULT_TTS_CHUNK_DELAY_MS
+
+
+def _get_serve_port() -> int:
+    """Pi 側 WAV 配信サーバの待受ポートを取得 (環境変数 TTS_SERVE_PORT)。"""
+    raw = os.environ.get("TTS_SERVE_PORT", "")
+    try:
+        return int(raw) if raw else _DEFAULT_TTS_SERVE_PORT
+    except ValueError:
+        return _DEFAULT_TTS_SERVE_PORT
+
+
+def _get_pi_self_ip() -> str:
+    """go2rtc が WAV を取りに来る Pi 自身の LAN IP を取得 (環境変数 TTS_PI_SELF_IP)。"""
+    return os.environ.get("TTS_PI_SELF_IP", _DEFAULT_TTS_PI_SELF_IP)
+
+
+def _get_delete_delay_sec() -> float:
+    """配信 WAV の遅延削除秒数を取得 (環境変数 TTS_DELETE_DELAY_SEC)。"""
+    raw = os.environ.get("TTS_DELETE_DELAY_SEC", "")
+    try:
+        return float(raw) if raw else _DEFAULT_TTS_DELETE_DELAY_SEC
+    except ValueError:
+        return _DEFAULT_TTS_DELETE_DELAY_SEC
 
 
 # ── テキスト分割 ──────────────────────────────────────────────────────────
@@ -330,15 +370,20 @@ async def _warmup_once() -> None:
         # フラグは立てない、次回再試行
 
 
-# ── SBV2 WAV bytes 取得 (旧 speak() の本体を helper 化) ───────────────────
+# ── SBV2 WAV パーツ取得 (旧 speak() の本体を helper 化、Phase C-8 で list 化) ──
 
 
-async def _fetch_wav_bytes(
+async def _fetch_wav_parts(
     text: str,
     speaker_id: int,
     emotion: EmotionDict | None,
-) -> bytes:
-    """テキストを 30 文字分割 → SBV2 GET → 連結した WAV bytes を返す (silent fail)。
+) -> list[bytes]:
+    """テキストを 30 文字分割 → SBV2 GET → 各チャンクの WAV bytes を list で返す (silent fail)。
+
+    Phase C-8: 旧 ``_fetch_wav_bytes`` は複数チャンクを ``b"".join()`` でバイト連結して
+    いたが、これだと WAV ヘッダの data サイズが第1チャンク分しか宣言されず、ffmpeg が
+    1個目だけ読んで打ち切る (実機 ffprobe で確認)。バイト連結をやめ、各チャンクの WAV を
+    list で返して呼び出し側で concat demuxer により結合する。
 
     Args:
         text: 読み上げ対象テキスト (空 / 空白のみは呼び出し側で除外済の前提)。
@@ -346,21 +391,22 @@ async def _fetch_wav_bytes(
         emotion: ``{"valence": 0.0-1.0, "arousal": 0.0-1.0}`` 形式の感情 dict。
 
     Returns:
-        連結された WAV bytes。失敗時は空 bytes (例外は投げない)。
+        各チャンクの WAV bytes の list。空チャンク (b"") は除外する (部分再生)。
+        全滅 / 空入力 / session 例外時は空 list ``[]`` を返す (例外は投げない)。
     """
     chunks = _split_chunks(text.strip())
     if not chunks:
-        return b""
+        return []
 
     logger.debug(
-        "tts_sbv2._fetch_wav_bytes: text={!r} chunks={} speaker_id={}",
+        "tts_sbv2._fetch_wav_parts: text={!r} chunks={} speaker_id={}",
         text[:40],
         len(chunks),
         speaker_id,
     )
 
     timeout = aiohttp.ClientTimeout(total=_get_timeout())
-    audio_parts: list[bytes] = []
+    parts: list[bytes] = []
     chunk_delay_ms = _get_chunk_delay_ms()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -368,18 +414,56 @@ async def _fetch_wav_bytes(
                 query = _build_query(chunk, speaker_id, emotion)
                 part = await _fetch_one_chunk(session, chunk, query)
                 if part:
-                    audio_parts.append(part)
+                    parts.append(part)
                 if chunk_delay_ms > 0 and i < len(chunks) - 1:
                     await asyncio.sleep(chunk_delay_ms / 1000.0)
     except Exception as e:
-        logger.warning("tts_sbv2._fetch_wav_bytes: session-level failure: {}", e)
-        return b""
+        logger.warning("tts_sbv2._fetch_wav_parts: session-level failure: {}", e)
+        return []
 
-    if not audio_parts:
-        logger.warning("tts_sbv2._fetch_wav_bytes: empty WAV bytes after all chunks")
-        return b""
+    if not parts:
+        logger.warning("tts_sbv2._fetch_wav_parts: empty WAV bytes after all chunks")
+        return []
 
-    return b"".join(audio_parts)
+    return parts
+
+
+# ── Pi 側 WAV HTTP 配信サーバ (Phase C-7、go2rtc HTTP pull 用) ─────────────
+
+
+async def _serve_handler(request: web.Request) -> web.StreamResponse:
+    """配信 dir 内の <name>.wav を返す。トラバーサル / 非 wav は 404。"""
+    name = Path(request.match_info["name"]).name  # トラバーサル無効化
+    if not name.endswith(".wav"):
+        return web.Response(status=404)
+    if _serve_dir is None:
+        return web.Response(status=404)
+    target = _serve_dir / name
+    if not target.is_file():
+        return web.Response(status=404)
+    return web.FileResponse(path=target)
+
+
+async def _ensure_http_server() -> tuple[Path, int]:
+    """配信サーバを冪等起動し (root_dir, port) を返す。
+
+    すでに起動済みなら既存の配信 dir と現在の待受ポートを返す。
+    未起動なら一時 dir を作り、aiohttp.web で 0.0.0.0:<port> に listen する。
+    """
+    global _serve_runner, _serve_dir
+    async with _serve_lock:
+        if _serve_runner is not None and _serve_dir is not None:
+            return _serve_dir, _get_serve_port()
+        _serve_dir = Path(tempfile.mkdtemp(prefix="pico_tts_serve_"))
+        app = web.Application()
+        app.router.add_get("/{name}", _serve_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=_get_serve_port())
+        await site.start()
+        _serve_runner = runner
+        logger.info("tts_sbv2: WAV serve server up on 0.0.0.0:{}", _get_serve_port())
+        return _serve_dir, _get_serve_port()
 
 
 # ── 一時 WAV / ffmpeg 前処理 ──────────────────────────────────────────────
@@ -392,34 +476,67 @@ def _write_tmp_wav(wav_bytes: bytes) -> str:
         return f.name
 
 
+def _write_tmp_wavs(parts: list[bytes]) -> list[str]:
+    """複数の WAV bytes をそれぞれ一時ファイルに書き出してパス list を返す (Phase C-8)。"""
+    return [_write_tmp_wav(p) for p in parts]
+
+
 def _which(name: str) -> str | None:
     """shutil.which のラッパ (path にバイナリが存在すれば絶対パス、なければ None)。"""
     return shutil.which(name)
 
 
-def _build_ffmpeg_args(src: str, dst: str) -> list[str]:
-    """ffmpeg 前処理用のコマンド引数を組み立てる。
+def _build_af_filter() -> str:
+    """ffmpeg ``-af`` フィルタ文字列を組み立てる。
+
+    ``volume=<TTS_VOLUME>,apad=pad_dur=<TTS_TAIL_SILENCE>``。
+    Phase C-8 で concat 経路と共有するため切り出した (パラメータ値は不変)。
+    """
+    return f"volume={_get_tts_volume()},apad=pad_dur={_get_tts_tail_silence()}"
+
+
+def _write_concat_list(src_paths: list[str]) -> str:
+    """concat demuxer 用のリストファイルを書き出してパスを返す (Phase C-8)。
+
+    各 path を絶対パス化し、ffmpeg concat demuxer の ``file '<path>'`` 形式で 1 行ずつ
+    書く。path 内のシングルクォートは ``'\\''`` でエスケープする。
+    echo/redirect ではなく Python の tempfile API で書く。
+    """
+    lines: list[str] = []
+    for p in src_paths:
+        abs_path = os.path.abspath(p)
+        escaped = abs_path.replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    with tempfile.NamedTemporaryFile(
+        suffix=".txt", delete=False, mode="w", encoding="utf-8"
+    ) as f:
+        f.write("\n".join(lines) + "\n")
+        return f.name
+
+
+def _build_concat_ffmpeg_args(list_path: str, dst: str) -> list[str]:
+    """concat demuxer + 前処理 (音量・PCMA 用 16k 単 ch) の ffmpeg 引数を組み立てる。
 
     生成コマンド:
-        ffmpeg -y -loglevel error -i <src> \
+        ffmpeg -y -loglevel error -f concat -safe 0 -i <list_path> \
           -af "volume=<TTS_VOLUME>,apad=pad_dur=<TTS_TAIL_SILENCE>" \
           -ar <TTS_PRE_RESAMPLE> -ac 1 -f wav <dst>
     """
-    volume = _get_tts_volume()
-    tail = _get_tts_tail_silence()
-    ar = _get_tts_pre_resample()
-    af = f"volume={volume},apad=pad_dur={tail}"
     return [
         "ffmpeg",
         "-y",
         "-loglevel",
         "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
         "-i",
-        src,
+        list_path,
         "-af",
-        af,
+        _build_af_filter(),
         "-ar",
-        str(ar),
+        str(_get_tts_pre_resample()),
         "-ac",
         "1",
         "-f",
@@ -428,19 +545,39 @@ def _build_ffmpeg_args(src: str, dst: str) -> list[str]:
     ]
 
 
-async def _preprocess_wav_with_ffmpeg(src_path: str) -> str | None:
-    """SBV2 出力 WAV を ffmpeg で前処理 (音量・PCMA 用 16k 単 ch) して新ファイルパスを返す。
+async def _concat_and_preprocess(
+    src_paths: list[str], out_dir: Path | None = None
+) -> str | None:
+    """複数の SBV2 生 WAV を concat demuxer で結合 + 前処理して新ファイルパスを返す (Phase C-8)。
+
+    旧 ``_preprocess_wav_with_ffmpeg`` (単一 WAV 前処理) を置き換える。バイト連結ではなく
+    ffmpeg concat demuxer で結合することで、全チャンクの音声が欠けずに再生される。
+
+    Args:
+        src_paths: 結合対象 (SBV2 生 WAV) の絶対パス list。
+        out_dir: 出力先ディレクトリ。指定時はその dir 内に WAV を作る
+            (Phase C-7: go2rtc HTTP pull 用の配信 dir)。``None`` なら
+            従来通り tempfile デフォルト位置に作る (後方互換)。
 
     Returns:
-        前処理済み WAV の絶対パス。ffmpeg 失敗時 / バイナリ無しなら ``None``。
+        結合・前処理済み WAV の絶対パス。ffmpeg 失敗時 / バイナリ無し / 入力空なら ``None``。
     """
     ffmpeg = _which("ffmpeg")
     if ffmpeg is None:
-        logger.warning("tts_sbv2._preprocess_wav_with_ffmpeg: ffmpeg not found in PATH")
+        logger.warning("tts_sbv2._concat_and_preprocess: ffmpeg not found in PATH")
+        return None
+    if not src_paths:
+        logger.warning("tts_sbv2._concat_and_preprocess: no source WAV paths given")
         return None
 
-    dst_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    args = _build_ffmpeg_args(src_path, dst_path)
+    list_path = _write_concat_list(src_paths)
+    if out_dir is not None:
+        dst_path = tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, dir=str(out_dir)
+        ).name
+    else:
+        dst_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    args = _build_concat_ffmpeg_args(list_path, dst_path)
     # _which が見つけた絶対パスを引数 0 に差し替え
     args[0] = ffmpeg
 
@@ -453,57 +590,57 @@ async def _preprocess_wav_with_ffmpeg(src_path: str) -> str | None:
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             logger.warning(
-                "tts_sbv2._preprocess_wav_with_ffmpeg: ffmpeg rc={} stderr={!r}",
+                "tts_sbv2._concat_and_preprocess: ffmpeg rc={} stderr={!r}",
                 proc.returncode,
                 stderr.decode("utf-8", errors="replace")[:200] if stderr else "",
             )
-            try:
-                os.unlink(dst_path)
-            except OSError:
-                pass
+            _unlink_quiet(dst_path)
             return None
         return dst_path
     except Exception as e:
-        logger.warning("tts_sbv2._preprocess_wav_with_ffmpeg: exec failed: {}", e)
-        try:
-            os.unlink(dst_path)
-        except OSError:
-            pass
+        logger.warning("tts_sbv2._concat_and_preprocess: exec failed: {}", e)
+        _unlink_quiet(dst_path)
         return None
+    finally:
+        _unlink_quiet(list_path)
 
 
 # ── go2rtc HTTP API POST (v5 14-5-5 / 14-5-12) ────────────────────────────
 
 
-def _build_go2rtc_url(wav_path: str) -> str:
-    """go2rtc POST URL を組み立てる。
+def _build_go2rtc_url(wav_url: str) -> str:
+    """go2rtc POST URL を組み立てる (Phase C-7: HTTP pull 方式)。
 
     形式:
         {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=<URL-encoded ffmpeg src>
 
     src 形式:
-        ffmpeg:<wav_path>#audio=pcma#input=file
+        ffmpeg:<wav_url>#audio=pcma#input=file
+
+    ``wav_url`` は go2rtc (メイン PC) が取りに来る Pi 側配信サーバの HTTP URL
+    (例 ``http://192.168.10.109:50021/xxxx.wav``)。``#input=file`` は維持必須。
     """
     base_url = _get_go2rtc_base_url()
     stream = _get_tapo_stream_name()
-    src = f"ffmpeg:{wav_path}#audio=pcma#input=file"
+    src = f"ffmpeg:{wav_url}#audio=pcma#input=file"
     # # と : を含むので quote(safe="") で完全エンコード
     src_encoded = quote(src, safe="")
     return f"{base_url}/api/streams?dst={quote(stream, safe='')}&src={src_encoded}"
 
 
-async def _post_to_go2rtc(wav_path: str) -> bool:
-    """前処理済み WAV を go2rtc HTTP API へ POST する (silent fail)。
+async def _post_to_go2rtc(wav_url: str) -> bool:
+    """配信 WAV の HTTP URL を go2rtc HTTP API へ POST する (silent fail)。
 
-    v5 14-5-5 仕様:
+    v5 14-5-5 仕様 (Phase C-7 で src をローカルパスから HTTP URL へ変更):
         POST {GO2RTC_BASE_URL}/api/streams?dst={TAPO_STREAM_NAME}&src=ffmpeg:...
         - body 空、Authorization なし、LAN 内認証なし
         - Pi 側に go2rtc バイナリを置かない (HTTP API 単一経路)
+        - ``wav_url`` は go2rtc が取りに来る Pi 側配信サーバの HTTP URL
 
     Returns:
         成功時 True、HTTP / ネットワーク失敗時 False (例外は投げない)。
     """
-    url = _build_go2rtc_url(wav_path)
+    url = _build_go2rtc_url(wav_url)
     timeout = aiohttp.ClientTimeout(total=_get_timeout())
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -521,6 +658,23 @@ async def _post_to_go2rtc(wav_path: str) -> bool:
     except Exception as e:
         logger.warning("tts_sbv2._post_to_go2rtc: request failed: {}", e)
         return False
+
+
+# ── 一時ファイル削除 (Phase C-7: 配信 WAV は遅延削除) ─────────────────────
+
+
+def _unlink_quiet(path: str) -> None:
+    """ファイルを削除する。存在しない / 権限エラーは握りつぶす。"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+async def _delayed_unlink(path: str, delay: float) -> None:
+    """delay 秒待ってから path を削除する (go2rtc が pull し終える猶予)。"""
+    await asyncio.sleep(delay)
+    _unlink_quiet(path)
 
 
 # ── 公開 API: speak() ─────────────────────────────────────────────────────
@@ -575,22 +729,29 @@ async def speak(
     # target == "tapo_speaker": go2rtc HTTP API 経由で Tapo C210 へ送出
     await _warmup_once()
 
-    wav_bytes = await _fetch_wav_bytes(text, speaker_id, emotion)
-    if not wav_bytes:
-        # _fetch_wav_bytes 内部で warning 済
+    # Phase C-8: 各チャンクの WAV を list で取得 (バイト連結しない)。
+    parts = await _fetch_wav_parts(text, speaker_id, emotion)
+    if not parts:
+        # _fetch_wav_parts 内部で warning 済
         _stdlog.info("tts_sbv2.speak: EXIT sbv2_failed")
         return
 
-    src_path = _write_tmp_wav(wav_bytes)
+    src_paths = _write_tmp_wavs(parts)
     pre_path: str | None = None
     try:
-        pre_path = await _preprocess_wav_with_ffmpeg(src_path)
+        # Phase C-7: 配信サーバを lazy 起動し、ffmpeg 出力をその配信 dir に置く。
+        serve_dir, port = await _ensure_http_server()
+        # Phase C-8: concat demuxer で全チャンクを結合 + 前処理 (途中切れ修正)。
+        pre_path = await _concat_and_preprocess(src_paths, out_dir=serve_dir)
         if pre_path is None:
-            # _preprocess_wav_with_ffmpeg 内部で warning 済
+            # _concat_and_preprocess 内部で warning 済
             _stdlog.info("tts_sbv2.speak: EXIT ffmpeg_failed")
             return
 
-        ok = await _post_to_go2rtc(pre_path)
+        # go2rtc (メイン PC) が取りに来る Pi 側 HTTP URL を組み立てて POST。
+        name = Path(pre_path).name
+        wav_url = f"http://{_get_pi_self_ip()}:{port}/{name}"
+        ok = await _post_to_go2rtc(wav_url)
         if not ok:
             # _post_to_go2rtc 内部で warning 済
             _stdlog.info("tts_sbv2.speak: EXIT go2rtc_post_failed")
@@ -602,10 +763,7 @@ async def speak(
         )
         _stdlog.info("tts_sbv2.speak: EXIT ok")
     finally:
-        for p in (src_path, pre_path):
-            if not p:
-                continue
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        for sp in src_paths:
+            _unlink_quiet(sp)  # SBV2 生 WAV 群は即削除
+        if pre_path:  # 配信 WAV は go2rtc が pull し終えるまで遅延削除
+            asyncio.create_task(_delayed_unlink(pre_path, _get_delete_delay_sec()))

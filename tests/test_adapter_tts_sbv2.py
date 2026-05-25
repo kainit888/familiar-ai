@@ -14,9 +14,11 @@ v5 (2026-05-24) で ``play_with_fallback`` (tapo → main_pc → rpi5 の 3 段
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import unquote
 
 import pytest
 
@@ -58,7 +60,12 @@ def _make_mock_session(status: int = 200, audio: bytes = b"FAKE_WAV_BYTES", text
 
 
 def _patch_go2rtc_chain(monkeypatch, tmp_path, post_status: int = 200):
-    """tapo_speaker 経路の ffmpeg 前処理と go2rtc POST を mock する。
+    """tapo_speaker 経路の HTTP 配信サーバ / ffmpeg 前処理 / go2rtc POST を mock する。
+
+    Phase C-7: speak() が ``_ensure_http_server`` を呼ぶようになったため、
+    (a) 実サーバを起動しないよう fake で差し替え、
+    (b) fire-and-forget の遅延削除 task がイベントループ警告を出さないよう
+        ``_delayed_unlink`` を即時化する。
 
     Returns:
         captured dict: ``url`` / ``method`` (post/put) / ``post_count`` を記録する。
@@ -66,11 +73,26 @@ def _patch_go2rtc_chain(monkeypatch, tmp_path, post_status: int = 200):
     pre_path = str(tmp_path / "preprocessed.wav")
     (tmp_path / "preprocessed.wav").write_bytes(b"PREPROCESSED")
 
-    async def fake_preprocess(_src):
+    async def fake_concat(_src_paths, out_dir=None):
         return pre_path
 
     monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
+    )
+
+    # 遅延削除 task のスリープを即時化 (ループ警告回避・テスト高速化)。
+    async def _instant_delayed_unlink(path, delay):
+        return None
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._delayed_unlink", _instant_delayed_unlink
     )
 
     captured: dict = {"urls": [], "method": None, "post_count": 0}
@@ -147,12 +169,12 @@ async def test_speak_http_error_returns_silently(monkeypatch, tmp_path):
     # ffmpeg は呼ばれない (SBV2 で失敗するので)
     pre_called: list = []
 
-    async def fake_preprocess(_src):
+    async def fake_concat(_src_paths, out_dir=None):
         pre_called.append("called")
         return None
 
     monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
     )
     mock_session = _make_mock_session(status=500, text_body="server error")
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
@@ -227,6 +249,82 @@ async def test_speak_splits_long_text_into_multiple_requests(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_speak_multi_chunk_writes_all_src_and_concats(monkeypatch, tmp_path):
+    """Phase C-8: 複数チャンクが全て tmp WAV に書かれ、concat に全 src_paths が渡る。
+
+    mutation 検知:
+        - byte-join 復活 (単一 WAV) や 1個目だけ concat に渡す実装にすると
+          ``len(src_paths) >= 2`` が fail する。
+        - speak() は単一 go2rtc POST (連結 WAV を一括送出) であること。
+    """
+    long_text = ("こんにちは。今日は良い天気ですね。" + "ピコは元気です、ええ、本当に元気です。") * 5
+    expected_chunks = len(tts_sbv2._split_chunks(long_text.strip()))
+    assert expected_chunks >= 2  # 前提: 複数チャンク
+
+    captured: dict = {"src_paths": None, "post_count": 0}
+    pre_path = str(tmp_path / "concat.wav")
+    (tmp_path / "concat.wav").write_bytes(b"CONCATENATED")
+
+    # _concat_and_preprocess をスパイ化して渡された src_paths を捕捉
+    async def spy_concat(src_paths, out_dir=None):
+        captured["src_paths"] = list(src_paths)
+        return pre_path
+
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
+    async def _instant_delayed_unlink(path, delay):
+        return None
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._concat_and_preprocess", spy_concat)
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._delayed_unlink", _instant_delayed_unlink
+    )
+
+    class _MockSession:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get(self, url):
+            resp = MagicMock()
+            resp.status = 200
+            resp.read = AsyncMock(return_value=b"WAV")
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        def post(self, url, data=None, headers=None):
+            captured["post_count"] += 1
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession)
+
+    result = await tts_sbv2.speak(long_text, target="tapo_speaker")
+    assert result is None
+    # 複数チャンク分の src WAV が concat に渡る (byte-join 復活なら 1 件で fail)
+    assert captured["src_paths"] is not None
+    assert len(captured["src_paths"]) >= 2
+    assert len(captured["src_paths"]) == expected_chunks
+    # 単一 go2rtc POST
+    assert captured["post_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_speak_passes_speaker_id_to_query(monkeypatch, tmp_path):
     """speaker_id=3 が URL クエリに含まれる。"""
     captured: dict = {"get_url": None, "post_url": None}
@@ -260,11 +358,17 @@ async def test_speak_passes_speaker_id_to_query(monkeypatch, tmp_path):
             resp.__aexit__ = AsyncMock(return_value=False)
             return resp
 
-    async def fake_preprocess(_src):
+    async def fake_concat(_src_paths, out_dir=None):
         return str(tmp_path / "pre.wav")
 
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
     monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
     )
     (tmp_path / "pre.wav").write_bytes(b"PRE")
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
@@ -310,11 +414,17 @@ async def test_speak_emotion_affects_style_weight(monkeypatch, tmp_path):
             resp.__aexit__ = AsyncMock(return_value=False)
             return resp
 
-    async def fake_preprocess(_src):
+    async def fake_concat(_src_paths, out_dir=None):
         return str(tmp_path / "pre.wav")
 
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
     monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
     )
     (tmp_path / "pre.wav").write_bytes(b"PRE")
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
@@ -467,12 +577,18 @@ async def test_speak_ffmpeg_failure_returns_silently(monkeypatch, tmp_path):
         async def __aexit__(self, *_a):
             return False
 
-    # ffmpeg 前処理が None を返す (失敗)
-    async def fake_preprocess(_src):
+    # ffmpeg concat 前処理が None を返す (失敗)
+    async def fake_concat(_src_paths, out_dir=None):
         return None
 
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
     monkeypatch.setattr(
-        "pico_agent.adapters.tts_sbv2._preprocess_wav_with_ffmpeg", fake_preprocess
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
     )
     monkeypatch.setattr("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession)
 
@@ -615,27 +731,80 @@ async def test_post_to_go2rtc_uses_POST_not_PUT(monkeypatch, tmp_path):
     assert captured["method"] == "post"  # PUT ではない
 
 
-# ── _fetch_wav_bytes 単体テスト ────────────────────────────────────────
+# ── _fetch_wav_parts 単体テスト (Phase C-8: list 返却) ─────────────────
 
 
 @pytest.mark.asyncio
-async def test_fetch_wav_bytes_returns_concatenated_bytes():
-    """_fetch_wav_bytes は SBV2 から取得した WAV bytes を返す。"""
+async def test_fetch_wav_parts_returns_list():
+    """_fetch_wav_parts は複数チャンクを連結せず WAV bytes の list で返す (Phase C-8)。
+
+    mutation 検知: 旧実装は ``b"".join(parts)`` で単一 bytes を返していた。
+    新実装は list を返し、各要素が独立した WAV bytes であること。
+    """
+    # 30 文字制限を超える長文で確実に複数チャンクに分かれるようにする
+    long_text = "あいうえおかきくけこさしすせそ。" * 6  # 区切りありの長文
+    expected_chunks = len(tts_sbv2._split_chunks(long_text.strip()))
+    assert expected_chunks >= 2  # 前提: 複数チャンク
+
     mock_session = _make_mock_session(status=200, audio=b"RIFF\x00WAVE")
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
-        result = await tts_sbv2._fetch_wav_bytes("hi", speaker_id=0, emotion=None)
-    assert result == b"RIFF\x00WAVE"
+        result = await tts_sbv2._fetch_wav_parts(long_text, speaker_id=0, emotion=None)
+
+    assert isinstance(result, list)
+    assert len(result) == expected_chunks
+    for part in result:
+        assert isinstance(part, bytes)
+        assert part == b"RIFF\x00WAVE"
 
 
 @pytest.mark.asyncio
-async def test_fetch_wav_bytes_failure_returns_empty():
-    """_fetch_wav_bytes は失敗時に空 bytes を返す (silent fail)。"""
+async def test_fetch_wav_parts_failure_returns_empty():
+    """_fetch_wav_parts は失敗時に空 list を返す (silent fail)。"""
     with patch(
         "pico_agent.adapters.tts_sbv2.aiohttp.ClientSession",
         side_effect=Exception("connection refused"),
     ):
-        result = await tts_sbv2._fetch_wav_bytes("hi", speaker_id=0, emotion=None)
-    assert result == b""
+        result = await tts_sbv2._fetch_wav_parts("hi", speaker_id=0, emotion=None)
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_wav_parts_excludes_empty_and_all_fail_returns_empty(monkeypatch):
+    """空チャンク (b"") は list から除外され、全滅時は [] を返す (Phase C-8)。
+
+    mutation 検知: ``if part:`` の空除外を削ると len が 3 になり fail。
+    """
+    # (a) 1個目成功・2個目空 (失敗)・3個目成功 → b"" を除いた 2 件
+    long_text = "あいうえおかきくけこさしすせそ。" * 6
+    chunks = tts_sbv2._split_chunks(long_text.strip())
+    assert len(chunks) >= 3  # 前提: 3 チャンク以上
+
+    call_count = {"n": 0}
+    stub_returns = [b"WAV1", b"", b"WAV2"]
+
+    async def fake_fetch_one(_session, _chunk, _query):
+        i = call_count["n"]
+        call_count["n"] += 1
+        # 4 件目以降も成功扱い (チャンク数が 3 超でも b"" 混入の検証は満たす)
+        return stub_returns[i] if i < len(stub_returns) else b"WAVN"
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._fetch_one_chunk", fake_fetch_one)
+    mock_session = _make_mock_session(status=200, audio=b"X")
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
+        result = await tts_sbv2._fetch_wav_parts(long_text, speaker_id=0, emotion=None)
+
+    assert b"" not in result  # 空チャンクは除外される
+    # 取得成功したチャンクのみ残る (空 1 件分減る)
+    assert len(result) == len(chunks) - 1
+
+    # (b) 全チャンク b"" → 全滅で [] を返す
+    async def fake_fetch_all_empty(_session, _chunk, _query):
+        return b""
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._fetch_one_chunk", fake_fetch_all_empty)
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=mock_session):
+        result_empty = await tts_sbv2._fetch_wav_parts(long_text, speaker_id=0, emotion=None)
+    assert result_empty == []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -725,40 +894,93 @@ def test_split_no_infinite_loop():
     assert len(result) < 100  # 1 文字ずつ進むなどの暴走はない
 
 
-# ── ffmpeg 4 件 ───────────────────────────────────────────────────────
+# ── ffmpeg concat 6 件 (Phase C-8: concat demuxer 経路) ─────────────────
 
 
-def test_ffmpeg_build_correct_args(monkeypatch):
-    """_build_ffmpeg_args が想定の引数列を返す。"""
+def test_concat_args_use_concat_demuxer(monkeypatch):
+    """_build_concat_ffmpeg_args が concat demuxer + 前処理の引数列を返す (Phase C-8)。
+
+    mutation 検知: ``-safe 0`` や ``-f concat`` を削ると fail。
+    """
     monkeypatch.delenv("TTS_VOLUME", raising=False)
     monkeypatch.delenv("TTS_PRE_RESAMPLE", raising=False)
     monkeypatch.delenv("TTS_TAIL_SILENCE", raising=False)
-    args = tts_sbv2._build_ffmpeg_args("/tmp/in.wav", "/tmp/out.wav")
-    # 必須フラグの存在確認
+    args = tts_sbv2._build_concat_ffmpeg_args("/tmp/list.txt", "/tmp/out.wav")
     assert args[0] == "ffmpeg"
     assert "-y" in args
     assert "-loglevel" in args
     assert "error" in args
-    assert "-i" in args
-    assert "/tmp/in.wav" in args
-    assert "-af" in args
-    # デフォルトの volume=0.5, apad=pad_dur=0.5 が af フィルタに含まれる
+    # concat demuxer フラグ (mutation 検知の核)
+    f_idx = args.index("-f")
+    assert args[f_idx + 1] == "concat"
+    safe_idx = args.index("-safe")
+    assert args[safe_idx + 1] == "0"
+    # -i に list ファイルが渡る
+    i_idx = args.index("-i")
+    assert args[i_idx + 1] == "/tmp/list.txt"
+    # 前処理 -af は維持必須パラメータ (volume / apad)
     af_idx = args.index("-af")
     af_val = args[af_idx + 1]
     assert "volume=0.5" in af_val
     assert "apad=pad_dur=0.5" in af_val
-    assert "-ar" in args
-    assert "16000" in args
-    assert "-ac" in args
-    assert "1" in args
-    assert "-f" in args
-    assert "wav" in args
-    assert "/tmp/out.wav" in args
+    # -ar 16000 / -ac 1
+    ar_idx = args.index("-ar")
+    assert args[ar_idx + 1] == "16000"
+    ac_idx = args.index("-ac")
+    assert args[ac_idx + 1] == "1"
+    # 末尾は -f wav <dst>
+    assert args[-3:] == ["-f", "wav", "/tmp/out.wav"]
+
+
+def test_concat_args_use_env_overrides(monkeypatch):
+    """環境変数で volume / ar / apad が concat 引数にも反映される (前処理パラメータ維持確認)。"""
+    monkeypatch.setenv("TTS_VOLUME", "0.8")
+    monkeypatch.setenv("TTS_PRE_RESAMPLE", "8000")
+    monkeypatch.setenv("TTS_TAIL_SILENCE", "1.0")
+    args = tts_sbv2._build_concat_ffmpeg_args("/tmp/list.txt", "/tmp/out.wav")
+    af_idx = args.index("-af")
+    af_val = args[af_idx + 1]
+    assert "volume=0.8" in af_val
+    assert "apad=pad_dur=1.0" in af_val
+    ar_idx = args.index("-ar")
+    assert args[ar_idx + 1] == "8000"
+
+
+def test_concat_list_contains_all_chunks():
+    """_write_concat_list は全チャンクを ``file '<path>'`` 形式で書き出す (Phase C-8)。
+
+    mutation 検知: 1個目しか書かない実装にすると行数 != 2 で fail。バイト連結バグの
+    再発 (data サイズが第1チャンク分しか宣言されない) を構造的に防ぐ要のテスト。
+    """
+    list_path = tts_sbv2._write_concat_list(["/tmp/a.wav", "/tmp/b.wav"])
+    try:
+        with open(list_path, encoding="utf-8") as f:
+            content = f.read()
+        lines = [ln for ln in content.splitlines() if ln.strip()]
+        # 両チャンクが含まれる
+        assert any(ln.startswith("file '") and ln.endswith("a.wav'") for ln in lines)
+        assert any(ln.startswith("file '") and ln.endswith("b.wav'") for ln in lines)
+        # 行数 == 入力数 (1個目しか書かない mutation を検知)
+        assert len(lines) == 2
+    finally:
+        os.unlink(list_path)
+
+
+def test_concat_list_escapes_single_quotes():
+    """path 内のシングルクォートが ffmpeg concat 用にエスケープされる。"""
+    list_path = tts_sbv2._write_concat_list(["/tmp/it's.wav"])
+    try:
+        with open(list_path, encoding="utf-8") as f:
+            content = f.read()
+        # シングルクォートは '\'' でエスケープされる
+        assert "'\\''" in content
+    finally:
+        os.unlink(list_path)
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_returns_none_on_nonzero_rc(monkeypatch, tmp_path):
-    """_preprocess_wav_with_ffmpeg は rc!=0 のとき None を返す。"""
+async def test_concat_returns_none_on_nonzero_rc(monkeypatch, tmp_path):
+    """_concat_and_preprocess は rc!=0 のとき None を返す (旧 ffmpeg テストから移植)。"""
     monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", lambda n: "/usr/bin/ffmpeg")
 
     async def fake_exec(*args, **kwargs):
@@ -773,32 +995,43 @@ async def test_ffmpeg_returns_none_on_nonzero_rc(monkeypatch, tmp_path):
 
     src = str(tmp_path / "src.wav")
     (tmp_path / "src.wav").write_bytes(b"FAKE")
-    result = await tts_sbv2._preprocess_wav_with_ffmpeg(src)
+    result = await tts_sbv2._concat_and_preprocess([src])
     assert result is None
 
 
 @pytest.mark.asyncio
-async def test_ffmpeg_no_ffmpeg_passthrough(monkeypatch, tmp_path):
-    """ffmpeg バイナリが PATH に無ければ None。"""
+async def test_concat_no_ffmpeg_returns_none(monkeypatch, tmp_path):
+    """ffmpeg バイナリが PATH に無ければ None (旧 ffmpeg テストから移植)。"""
     monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", lambda n: None)
     src = str(tmp_path / "src.wav")
     (tmp_path / "src.wav").write_bytes(b"FAKE")
-    result = await tts_sbv2._preprocess_wav_with_ffmpeg(src)
+    result = await tts_sbv2._concat_and_preprocess([src])
     assert result is None
 
 
-def test_ffmpeg_uses_env_overrides(monkeypatch):
-    """環境変数で volume / ar / apad が上書きされる。"""
-    monkeypatch.setenv("TTS_VOLUME", "0.8")
-    monkeypatch.setenv("TTS_PRE_RESAMPLE", "8000")
-    monkeypatch.setenv("TTS_TAIL_SILENCE", "1.0")
-    args = tts_sbv2._build_ffmpeg_args("/tmp/in.wav", "/tmp/out.wav")
-    af_idx = args.index("-af")
-    af_val = args[af_idx + 1]
-    assert "volume=0.8" in af_val
-    assert "apad=pad_dur=1.0" in af_val
-    ar_idx = args.index("-ar")
-    assert args[ar_idx + 1] == "8000"
+@pytest.mark.asyncio
+async def test_concat_empty_src_returns_none(monkeypatch):
+    """src_paths が空なら None (concat 対象なし)。"""
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", lambda n: "/usr/bin/ffmpeg")
+    result = await tts_sbv2._concat_and_preprocess([])
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_concat_exec_exception_returns_none(monkeypatch, tmp_path):
+    """create_subprocess_exec が例外でも raise せず None (旧 ffmpeg テストから移植・拡張)。"""
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._which", lambda n: "/usr/bin/ffmpeg")
+
+    async def fake_exec(*args, **kwargs):
+        raise OSError("exec failed")
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2.asyncio.create_subprocess_exec", fake_exec
+    )
+    src = str(tmp_path / "src.wav")
+    (tmp_path / "src.wav").write_bytes(b"FAKE")
+    result = await tts_sbv2._concat_and_preprocess([src])
+    assert result is None
 
 
 # ── 暖機 4 件 ─────────────────────────────────────────────────────────
@@ -885,25 +1118,26 @@ async def test_warmup_called_only_once(monkeypatch, tmp_path):
 
 
 def test_go2rtc_encodes_src_correctly(monkeypatch):
-    """_build_go2rtc_url が ffmpeg: src を URL エンコードする。"""
+    """_build_go2rtc_url が ffmpeg: src (HTTP URL) を URL エンコードする。"""
     monkeypatch.setenv("GO2RTC_BASE_URL", "http://host:1984")
     monkeypatch.setenv("TAPO_STREAM_NAME", "tapo_c210")
-    url = tts_sbv2._build_go2rtc_url("/tmp/audio.wav")
-    # src には ffmpeg:<path>#audio=pcma#input=file がエンコードされて入る
+    # Phase C-7: 引数はローカルパスではなく Pi 側配信サーバの HTTP URL。
+    url = tts_sbv2._build_go2rtc_url("http://192.168.10.109:50021/audio.wav")
+    # src には ffmpeg:<http url>#audio=pcma#input=file がエンコードされて入る
     assert "dst=tapo_c210" in url
     assert "src=" in url
     # # は %23、: は %3A
     assert "%23audio%3Dpcma" in url
     assert "%23input%3Dfile" in url
-    # ffmpeg: の : も %3A
-    assert "ffmpeg%3A" in url
+    # ffmpeg:http:// の : も %3A
+    assert "ffmpeg%3Ahttp%3A" in url
 
 
 def test_go2rtc_uses_env_overrides(monkeypatch):
     """_build_go2rtc_url が env の上書きを反映する。"""
     monkeypatch.setenv("GO2RTC_BASE_URL", "http://192.168.10.104:9999")
     monkeypatch.setenv("TAPO_STREAM_NAME", "custom_stream")
-    url = tts_sbv2._build_go2rtc_url("/tmp/in.wav")
+    url = tts_sbv2._build_go2rtc_url("http://192.168.10.109:50021/in.wav")
     assert url.startswith("http://192.168.10.104:9999/api/streams?")
     assert "dst=custom_stream" in url
 
@@ -915,9 +1149,9 @@ def test_go2rtc_url_env_override(monkeypatch):
 
 
 def test_go2rtc_url_default(monkeypatch):
-    """GO2RTC_BASE_URL 未設定なら 127.0.0.1:1984 がデフォルト。"""
+    """GO2RTC_BASE_URL 未設定なら 192.168.10.104:1984 (メイン PC) がデフォルト。"""
     monkeypatch.delenv("GO2RTC_BASE_URL", raising=False)
-    assert tts_sbv2._get_go2rtc_base_url() == "http://127.0.0.1:1984"
+    assert tts_sbv2._get_go2rtc_base_url() == "http://192.168.10.104:1984"
 
 
 def test_go2rtc_stream_env_override(monkeypatch):
@@ -937,7 +1171,7 @@ def test_go2rtc_stream_default(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_model_name_query_includes_model_name(monkeypatch):
-    """_fetch_wav_bytes の URL に model_name クエリが必ず含まれる (env override 確認)。"""
+    """_fetch_wav_parts の URL に model_name クエリが必ず含まれる (env override 確認)。"""
     monkeypatch.setenv("TTS_MODEL_NAME", "test_model_xyz")
     captured: dict = {}
 
@@ -962,7 +1196,7 @@ async def test_model_name_query_includes_model_name(monkeypatch):
             return resp
 
     with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _CapturingSession):
-        await tts_sbv2._fetch_wav_bytes("ピコ", speaker_id=0, emotion=None)
+        await tts_sbv2._fetch_wav_parts("ピコ", speaker_id=0, emotion=None)
 
     assert "model_name=test_model_xyz" in captured["url"]
 
@@ -980,8 +1214,8 @@ def test_legacy_GO2RTC_URL_ignored(monkeypatch):
     """旧キー GO2RTC_URL は無視される (新キー GO2RTC_BASE_URL のみ参照)。"""
     monkeypatch.setenv("GO2RTC_URL", "http://legacy-should-be-ignored:9999")
     monkeypatch.delenv("GO2RTC_BASE_URL", raising=False)
-    # GO2RTC_URL に値があっても、新キー側のデフォルトが返る
-    assert tts_sbv2._get_go2rtc_base_url() == "http://127.0.0.1:1984"
+    # GO2RTC_URL に値があっても、新キー側のデフォルト (メイン PC) が返る
+    assert tts_sbv2._get_go2rtc_base_url() == "http://192.168.10.104:1984"
 
 
 def test_legacy_GO2RTC_STREAM_ignored(monkeypatch):
@@ -1082,3 +1316,168 @@ def test_emotion_to_style_weight_clamped_to_range():
     """valence 範囲外 (1.5 / -0.5) でも style_weight は -1.0〜+1.0 にクランプされる。"""
     assert tts_sbv2._emotion_to_style_weight({"valence": 1.5}) == 1.0
     assert tts_sbv2._emotion_to_style_weight({"valence": -0.5}) == -1.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase C-7 (2026-05-25): go2rtc HTTP pull 方式に修正
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_go2rtc_url_uses_http_url_not_local_path(monkeypatch):
+    """_build_go2rtc_url は HTTP URL を src に埋め込む (ローカルパスを使わない)。
+
+    mutation 検知: 旧実装は ``ffmpeg:/tmp/xxx.wav#...`` のローカルパスを使っていた。
+    新実装は ``ffmpeg:http://<ip>:<port>/xxx.wav#...`` を使う。
+    """
+    monkeypatch.setenv("GO2RTC_BASE_URL", "http://192.168.10.104:1984")
+    monkeypatch.setenv("TAPO_STREAM_NAME", "tapo_c210")
+    ip = "192.168.10.109"
+    port = 50021
+    http_url = f"http://{ip}:{port}/abcd.wav"
+    url = tts_sbv2._build_go2rtc_url(http_url)
+    # 二重 unquote (dst/src のクエリ層 → src 内の ffmpeg URL 層)
+    decoded = unquote(unquote(url))
+    assert "/tmp/" not in decoded
+    assert f"http://{ip}:{port}" in decoded
+    assert "ffmpeg:http://" in decoded
+    assert "#audio=pcma#input=file" in decoded
+
+
+@pytest.mark.asyncio
+async def test_serve_server_singleton(monkeypatch, tmp_path):
+    """_ensure_http_server は冪等: 2 回呼んでも TCPSite は 1 回しか構築されない。"""
+    # モジュールの singleton 状態をリセット
+    monkeypatch.setattr(tts_sbv2, "_serve_runner", None)
+    monkeypatch.setattr(tts_sbv2, "_serve_dir", None)
+
+    # tempfile.mkdtemp を tmp_path 固定
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2.tempfile.mkdtemp",
+        lambda *a, **kw: str(tmp_path),
+    )
+
+    runner_instance = MagicMock()
+    runner_instance.setup = AsyncMock()
+
+    site_instance = MagicMock()
+    site_instance.start = AsyncMock()
+
+    site_ctor_calls: list = []
+
+    def _fake_app_runner(_app):
+        return runner_instance
+
+    def _fake_tcp_site(_runner, host=None, port=None):
+        site_ctor_calls.append((host, port))
+        return site_instance
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2.web.AppRunner", _fake_app_runner
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2.web.TCPSite", _fake_tcp_site
+    )
+
+    try:
+        dir1, port1 = await tts_sbv2._ensure_http_server()
+        dir2, port2 = await tts_sbv2._ensure_http_server()
+
+        # TCPSite は 1 度だけ構築される (singleton)
+        assert len(site_ctor_calls) == 1
+        # port は一致 (デフォルト 50021)
+        assert port1 == port2 == 50021
+        assert dir1 == dir2
+    finally:
+        # 他テスト汚染防止: singleton をリセット
+        monkeypatch.setattr(tts_sbv2, "_serve_runner", None)
+        monkeypatch.setattr(tts_sbv2, "_serve_dir", None)
+
+
+@pytest.mark.asyncio
+async def test_serve_wav_not_deleted_immediately(monkeypatch, tmp_path):
+    """配信 WAV は speak() 直後には消えず、遅延 task 経由で消える。"""
+    pre_path = str(tmp_path / "pre.wav")
+
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
+    async def fake_concat(_src_paths, out_dir=None):
+        # 実 pre.wav を tmp_path 内に作る
+        (tmp_path / "pre.wav").write_bytes(b"PREPROCESSED")
+        return pre_path
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
+    )
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+
+    # 実 _delayed_unlink を退避してから スパイ化 (sleep させず、引数だけ記録)
+    real_delayed_unlink = tts_sbv2._delayed_unlink
+    spy: dict = {"calls": []}
+
+    async def _spy_delayed_unlink(path, delay):
+        spy["calls"].append((path, delay))
+        # 実際には消さない (段階1 検証のため)
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._delayed_unlink", _spy_delayed_unlink
+    )
+
+    # POST 成功モック
+    class _MockSession:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get(self, url):
+            resp = MagicMock()
+            resp.status = 200
+            resp.read = AsyncMock(return_value=b"WAV")
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        def post(self, url, data=None, headers=None):
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession)
+
+    await tts_sbv2.speak("テスト", target="tapo_speaker")
+    # 段階1: speak() 直後はまだ配信 WAV が残っている
+    assert (tmp_path / "pre.wav").exists()
+    # pre_path が遅延削除 task に渡された証拠
+    # (create_task で起動されるため、イベントループに 1 度譲って task を走らせる)
+    await asyncio.sleep(0)
+    assert spy["calls"], "expected _delayed_unlink to be scheduled"
+    scheduled_path, scheduled_delay = spy["calls"][0]
+    assert scheduled_path == pre_path
+    assert scheduled_delay == tts_sbv2._DEFAULT_TTS_DELETE_DELAY_SEC
+
+    # 段階2: asyncio.sleep を即 return 化し、実 _delayed_unlink を直接 await
+    async def _instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.asyncio.sleep", _instant_sleep)
+    await real_delayed_unlink(pre_path, 30.0)
+    assert not (tmp_path / "pre.wav").exists()
+
+
+def test_default_go2rtc_base_url_is_main_pc(monkeypatch):
+    """GO2RTC_BASE_URL 未設定なら メイン PC (192.168.10.104:1984) がデフォルト。"""
+    monkeypatch.delenv("GO2RTC_BASE_URL", raising=False)
+    assert tts_sbv2._get_go2rtc_base_url() == "http://192.168.10.104:1984"
+    # 定数も直接 assert (mutation 検知)
+    assert tts_sbv2._DEFAULT_GO2RTC_BASE_URL == "http://192.168.10.104:1984"
