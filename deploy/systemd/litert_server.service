@@ -17,7 +17,8 @@ Environment=LITERT_MODEL_PATH=/home/pico/litert_models/gemma-4-E2B/gemma-4-E2B-i
 Environment=LITERT_LISTEN_PORT=11435
 
 # litert-lm-api / fastapi / uvicorn は本体 deps に含まれるため group 指定不要。
-ExecStart=/usr/bin/env uv run python -m pico_agent.litert_server
+# systemd の最小 PATH には ~/.local/bin が無く `uv` が解決できないため絶対パス指定。
+ExecStart=/home/pico/.local/bin/uv run python -m pico_agent.litert_server
 
 Restart=on-failure
 RestartSec=10
