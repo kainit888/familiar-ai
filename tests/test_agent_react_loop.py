@@ -850,3 +850,135 @@ async def test_agent_does_not_warn_when_llm_returns_text(caplog):
         rec for rec in caplog.records if "LLM returned empty text" in rec.getMessage()
     ]
     assert not matching, "warning must not fire when LLM returns non-empty text"
+
+
+# ---------------------------------------------------------------------------
+# Phase C-10a: vision 再質問時の see 強制 soft nudge
+# ---------------------------------------------------------------------------
+
+
+def _make_vision_agent():
+    """see を tool_use する backend を持つ camera 付き agent。
+
+    make_assistant_message / make_tool_results を Anthropic 互換の content
+    ブロック形状にして、vision_reprompt が see 痕跡を検出できるようにする。
+    """
+    agent = _make_agent(with_camera=True)
+
+    # see の tool_use ブロックを含む assistant content / 画像付き tool_result を
+    # 履歴に残す形状に差し替える (vision_reprompt の検出経路を実体化)。
+    def _assistant_msg(result, raw):
+        content = []
+        if result.text:
+            content.append({"type": "text", "text": result.text})
+        for tc in result.tool_calls:
+            content.append(
+                {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input}
+            )
+        return {"role": "assistant", "content": content}
+
+    def _tool_results(tool_calls, results):
+        blocks = []
+        for tc, (text, image) in zip(tool_calls, results):
+            sub = [{"type": "text", "text": text}]
+            if image:
+                sub.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image,
+                        },
+                    }
+                )
+            blocks.append(
+                {"type": "tool_result", "tool_use_id": tc.id, "content": sub}
+            )
+        return [{"role": "user", "content": blocks}]
+
+    agent.backend.make_assistant_message = _assistant_msg
+    agent.backend.make_tool_results = _tool_results
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_vision_requestion_triggers_second_see_capture():
+    """vision 再質問で see が 2 回撮影される (1 回目は初回観察、2 回目は再質問)。
+
+    soft nudge が user メッセージに注入され、モデルが see を呼べば camera.call が
+    2 回呼ばれる。実カメラには一切触れない (camera.call は AsyncMock)。
+    """
+    agent = _make_vision_agent()
+    # see → end_turn を 2 ターン分 (初回観察 + 再質問)
+    see_tc1 = ToolCall(id="see1", name="see", input={})
+    see_tc2 = ToolCall(id="see2", name="see", input={})
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[see_tc1]), None),
+            (TurnResult(stop_reason="end_turn", text="机が見える", tool_calls=[]), "机が見える"),
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[see_tc2]), None),
+            (TurnResult(stop_reason="end_turn", text="まだ机がある", tool_calls=[]), "まだ机がある"),
+        ]
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("何が見える？")        # 初回観察 (see #1)
+        await agent.run("もう一回見て")          # vision 再質問 (see #2)
+    finally:
+        for p in ps:
+            p.stop()
+
+    # camera.call は see を 2 回実行 (再質問でも撮り直す)
+    see_calls = [c for c in agent._camera.call.call_args_list if c.args and c.args[0] == "see"]
+    assert len(see_calls) == 2
+
+    # 2 回目の user メッセージに soft nudge が注入されている
+    user_texts = [
+        m["content"]
+        for m in agent.messages
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str)
+    ]
+    assert any("[VISION]" in t for t in user_texts), (
+        f"expected force_see nudge in re-question user message, got: {user_texts}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_vision_input_does_not_inject_nudge():
+    """非 vision 入力では履歴に see があっても nudge を注入しない (回帰)。"""
+    agent = _make_vision_agent()
+    see_tc = ToolCall(id="see1", name="see", input={})
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[see_tc]), None),
+            (TurnResult(stop_reason="end_turn", text="机が見える", tool_calls=[]), "机が見える"),
+            (TurnResult(stop_reason="end_turn", text="そうだね", tool_calls=[]), "そうだね"),
+        ]
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("何が見える？")   # see #1
+        await agent.run("ありがとう")      # 非 vision 入力 (nudge 注入しない)
+    finally:
+        for p in ps:
+            p.stop()
+
+    user_texts = [
+        m["content"]
+        for m in agent.messages
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str)
+    ]
+    # 「ありがとう」ターンの user メッセージに VISION nudge は無い
+    assert not any("[VISION]" in t for t in user_texts), (
+        f"nudge must not be injected for non-vision input, got: {user_texts}"
+    )
+    # see は 1 回だけ (非 vision 入力は撮り直さない)
+    see_calls = [c for c in agent._camera.call.call_args_list if c.args and c.args[0] == "see"]
+    assert len(see_calls) == 1
