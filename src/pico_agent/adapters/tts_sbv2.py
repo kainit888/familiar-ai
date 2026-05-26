@@ -50,6 +50,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Literal, TypeAlias
 from urllib.parse import quote, urlencode
@@ -89,7 +90,11 @@ _DEFAULT_TTS_CHUNK_DELAY_MS = 0
 # HTTP 配信サーバを立てて WAV を公開する。以下はそのパラメータ。
 _DEFAULT_TTS_SERVE_PORT = 50021
 _DEFAULT_TTS_PI_SELF_IP = "192.168.10.109"
-_DEFAULT_TTS_DELETE_DELAY_SEC = 30.0   # 配信 WAV 遅延削除秒 (カイニット提案で env 外出し)
+_DEFAULT_TTS_DELETE_DELAY_SEC = 30.0   # 配信 WAV 遅延削除秒の下限 (floor、go2rtc pull 猶予)
+# Phase C-8.1: 削除 delay を再生時間ベースで動的算出する係数。長文 TTS で
+# go2rtc が pull/再生し終える前に WAV を消してしまう「not found」レースを防ぐ。
+_DEFAULT_TTS_DELETE_SAFETY = 1.5       # 再生時間に掛ける安全係数 (TTS_DELETE_SAFETY)
+_DEFAULT_TTS_DELETE_MARGIN_SEC = 10.0  # 上乗せ固定マージン秒 (TTS_DELETE_MARGIN_SEC)
 
 # 暖機ファイル (カイニット指定)
 _WARMUP_WAV_PATH = Path("/tmp/pico_v3_warmup.wav")
@@ -201,12 +206,30 @@ def _get_pi_self_ip() -> str:
 
 
 def _get_delete_delay_sec() -> float:
-    """配信 WAV の遅延削除秒数を取得 (環境変数 TTS_DELETE_DELAY_SEC)。"""
+    """配信 WAV の遅延削除秒数の下限 (floor) を取得 (環境変数 TTS_DELETE_DELAY_SEC)。"""
     raw = os.environ.get("TTS_DELETE_DELAY_SEC", "")
     try:
         return float(raw) if raw else _DEFAULT_TTS_DELETE_DELAY_SEC
     except ValueError:
         return _DEFAULT_TTS_DELETE_DELAY_SEC
+
+
+def _get_delete_safety() -> float:
+    """削除 delay の安全係数を取得 (環境変数 TTS_DELETE_SAFETY、既定 1.5)。"""
+    raw = os.environ.get("TTS_DELETE_SAFETY", "")
+    try:
+        return float(raw) if raw else _DEFAULT_TTS_DELETE_SAFETY
+    except ValueError:
+        return _DEFAULT_TTS_DELETE_SAFETY
+
+
+def _get_delete_margin_sec() -> float:
+    """削除 delay に上乗せする固定マージン秒を取得 (環境変数 TTS_DELETE_MARGIN_SEC、既定 10.0)。"""
+    raw = os.environ.get("TTS_DELETE_MARGIN_SEC", "")
+    try:
+        return float(raw) if raw else _DEFAULT_TTS_DELETE_MARGIN_SEC
+    except ValueError:
+        return _DEFAULT_TTS_DELETE_MARGIN_SEC
 
 
 # ── テキスト分割 ──────────────────────────────────────────────────────────
@@ -677,6 +700,45 @@ async def _delayed_unlink(path: str, delay: float) -> None:
     _unlink_quiet(path)
 
 
+def _wav_duration_sec(path: str) -> float | None:
+    """WAV ファイルの再生時間 (秒) を標準 ``wave`` で求める (silent fail)。
+
+    ``getnframes() / getframerate()`` で算出する。ファイルが読めない / WAV で
+    ない / framerate が 0 など壊れている場合は ``None`` を返す (例外は投げない)。
+    """
+    try:
+        with wave.open(path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+        if rate <= 0:
+            return None
+        return frames / float(rate)
+    except (OSError, wave.Error, EOFError) as e:
+        logger.debug("tts_sbv2._wav_duration_sec: cannot read {!r}: {}", path, e)
+        return None
+
+
+def _compute_delete_delay(pre_path: str) -> float:
+    """配信 WAV の遅延削除 delay を再生時間ベースで動的算出する (Phase C-8.1)。
+
+    長文 TTS は連結後の再生時間が固定 floor (TTS_DELETE_DELAY_SEC=30) を超えて
+    しまい、go2rtc が pull / 再生し終える前に WAV が消えて「not found」レースに
+    なる。再生時間に安全係数 + マージンを掛けた値と floor の大きい方を採用する。
+
+    Args:
+        pre_path: 連結・前処理済み配信 WAV の絶対パス。
+
+    Returns:
+        ``floor`` (= ``_get_delete_delay_sec()``) を下限とした削除 delay 秒。
+        WAV 長が読めない場合は安全側に倒して ``floor`` を返す。
+    """
+    dur = _wav_duration_sec(pre_path)
+    floor = _get_delete_delay_sec()
+    if dur is None:
+        return floor
+    return max(floor, dur * _get_delete_safety() + _get_delete_margin_sec())
+
+
 # ── 公開 API: speak() ─────────────────────────────────────────────────────
 
 
@@ -766,4 +828,6 @@ async def speak(
         for sp in src_paths:
             _unlink_quiet(sp)  # SBV2 生 WAV 群は即削除
         if pre_path:  # 配信 WAV は go2rtc が pull し終えるまで遅延削除
-            asyncio.create_task(_delayed_unlink(pre_path, _get_delete_delay_sec()))
+            # Phase C-8.1: 固定 30s ではなく再生時間ベースの動的 delay。長文で
+            # go2rtc が pull/再生し終える前に消す「not found」レースを防ぐ。
+            asyncio.create_task(_delayed_unlink(pre_path, _compute_delete_delay(pre_path)))

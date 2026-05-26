@@ -1481,3 +1481,176 @@ def test_default_go2rtc_base_url_is_main_pc(monkeypatch):
     assert tts_sbv2._get_go2rtc_base_url() == "http://192.168.10.104:1984"
     # 定数も直接 assert (mutation 検知)
     assert tts_sbv2._DEFAULT_GO2RTC_BASE_URL == "http://192.168.10.104:1984"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase C-8.1 (2026-05-26): 配信 WAV 削除レース修正 (動的 delete delay)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _write_real_wav(path, duration_sec: float, sample_rate: int = 16000) -> None:
+    """指定再生時間の有効な WAV (PCM s16 mono) を path に書き出す (テスト用)。"""
+    import wave as _wave
+
+    nframes = int(round(duration_sec * sample_rate))
+    with _wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # s16
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * nframes)
+
+
+def test_wav_duration_sec_reads_known_length(tmp_path):
+    """_wav_duration_sec は wave で既知長 WAV の再生時間を正しく返す。"""
+    wav_path = tmp_path / "known.wav"
+    _write_real_wav(wav_path, duration_sec=2.5, sample_rate=16000)
+    dur = tts_sbv2._wav_duration_sec(str(wav_path))
+    assert dur is not None
+    assert abs(dur - 2.5) < 0.01
+
+
+def test_wav_duration_sec_broken_returns_none(tmp_path):
+    """壊れた / WAV でないファイルは None を返す (silent fail)。"""
+    bad = tmp_path / "broken.wav"
+    bad.write_bytes(b"NOT_A_WAV_AT_ALL")
+    assert tts_sbv2._wav_duration_sec(str(bad)) is None
+    # 存在しないパスも None
+    assert tts_sbv2._wav_duration_sec(str(tmp_path / "missing.wav")) is None
+
+
+def test_compute_delete_delay_long_exceeds_floor(tmp_path, monkeypatch):
+    """長尺 (90s) WAV では delay が floor(30) を大きく超える。
+
+    mutation 検知: _compute_delete_delay を ``return floor`` 固定に戻すと
+    この assert (delay > floor) が fail する。
+    """
+    monkeypatch.delenv("TTS_DELETE_DELAY_SEC", raising=False)
+    monkeypatch.delenv("TTS_DELETE_SAFETY", raising=False)
+    monkeypatch.delenv("TTS_DELETE_MARGIN_SEC", raising=False)
+    wav_path = tmp_path / "long.wav"
+    _write_real_wav(wav_path, duration_sec=90.0, sample_rate=16000)
+    floor = tts_sbv2._get_delete_delay_sec()  # 30.0
+    delay = tts_sbv2._compute_delete_delay(str(wav_path))
+    # 90s * 1.5 + 10 = 145s >> 30s floor
+    assert delay > floor
+    assert abs(delay - (90.0 * 1.5 + 10.0)) < 0.5
+    # 再生時間 (90s) 以上の猶予が必ず確保される (レース防止の本質)
+    assert delay >= 90.0
+
+
+def test_compute_delete_delay_short_uses_floor(tmp_path, monkeypatch):
+    """短尺 (2s) WAV では floor(30) が下限として効く。"""
+    monkeypatch.delenv("TTS_DELETE_DELAY_SEC", raising=False)
+    monkeypatch.delenv("TTS_DELETE_SAFETY", raising=False)
+    monkeypatch.delenv("TTS_DELETE_MARGIN_SEC", raising=False)
+    wav_path = tmp_path / "short.wav"
+    _write_real_wav(wav_path, duration_sec=2.0, sample_rate=16000)
+    # 2s * 1.5 + 10 = 13s < 30s floor → floor が採用される
+    delay = tts_sbv2._compute_delete_delay(str(wav_path))
+    assert delay == tts_sbv2._DEFAULT_TTS_DELETE_DELAY_SEC  # 30.0
+
+
+def test_compute_delete_delay_unreadable_falls_back_to_floor(tmp_path):
+    """WAV 長が読めない (壊れ) 場合は安全側に floor を返す。"""
+    bad = tmp_path / "bad.wav"
+    bad.write_bytes(b"GARBAGE")
+    delay = tts_sbv2._compute_delete_delay(str(bad))
+    assert delay == tts_sbv2._get_delete_delay_sec()
+
+
+def test_compute_delete_delay_env_overrides(tmp_path, monkeypatch):
+    """TTS_DELETE_SAFETY / TTS_DELETE_MARGIN_SEC の env 上書きが反映される。"""
+    monkeypatch.delenv("TTS_DELETE_DELAY_SEC", raising=False)
+    monkeypatch.setenv("TTS_DELETE_SAFETY", "2.0")
+    monkeypatch.setenv("TTS_DELETE_MARGIN_SEC", "5.0")
+    assert tts_sbv2._get_delete_safety() == 2.0
+    assert tts_sbv2._get_delete_margin_sec() == 5.0
+    wav_path = tmp_path / "m.wav"
+    _write_real_wav(wav_path, duration_sec=60.0, sample_rate=16000)
+    # 60 * 2.0 + 5 = 125s
+    delay = tts_sbv2._compute_delete_delay(str(wav_path))
+    assert abs(delay - 125.0) < 0.5
+
+
+def test_delete_safety_margin_invalid_fallback(monkeypatch):
+    """不正値 env は既定 (1.5 / 10.0) にフォールバックする。"""
+    monkeypatch.setenv("TTS_DELETE_SAFETY", "not_a_number")
+    monkeypatch.setenv("TTS_DELETE_MARGIN_SEC", "x")
+    assert tts_sbv2._get_delete_safety() == tts_sbv2._DEFAULT_TTS_DELETE_SAFETY
+    assert tts_sbv2._get_delete_margin_sec() == tts_sbv2._DEFAULT_TTS_DELETE_MARGIN_SEC
+
+
+@pytest.mark.asyncio
+async def test_speak_long_text_schedules_delay_ge_playback(monkeypatch, tmp_path):
+    """speak() 長文: _delayed_unlink に渡る delay が再生時間以上 (レース防止)。
+
+    _patch_go2rtc_chain を流用しつつ、_concat_and_preprocess が返す pre_path に
+    実 tmp WAV (長尺) を書く。これにより _compute_delete_delay が再生時間ベースの
+    大きな delay を算出することを検証する。
+
+    mutation 検知: _compute_delete_delay を ``return floor`` 固定に戻すと
+    delay(30) < 再生時間(80) になり assert が fail する。
+    """
+    playback_sec = 80.0
+    pre_path = str(tmp_path / "long_pre.wav")
+    _write_real_wav(tmp_path / "long_pre.wav", duration_sec=playback_sec)
+
+    async def fake_concat(_src_paths, out_dir=None):
+        return pre_path
+
+    async def fake_ensure_http_server():
+        return (tmp_path, 50021)
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat)
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._ensure_http_server", fake_ensure_http_server
+    )
+
+    # delayed_unlink をスパイ化 (sleep させず引数だけ記録)
+    spy: dict = {"calls": []}
+
+    async def _spy_delayed_unlink(path, delay):
+        spy["calls"].append((path, delay))
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._delayed_unlink", _spy_delayed_unlink
+    )
+
+    class _MockSession:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get(self, url):
+            resp = MagicMock()
+            resp.status = 200
+            resp.read = AsyncMock(return_value=b"WAV")
+            resp.text = AsyncMock(return_value="")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        def post(self, url, data=None, headers=None):
+            resp = MagicMock()
+            resp.status = 200
+            resp.text = AsyncMock(return_value="ok")
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    monkeypatch.setattr("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", _MockSession)
+
+    await tts_sbv2.speak("長文のテストです。" * 10, target="tapo_speaker")
+    await asyncio.sleep(0)  # create_task を走らせる
+
+    assert spy["calls"], "expected _delayed_unlink to be scheduled"
+    scheduled_path, scheduled_delay = spy["calls"][0]
+    assert scheduled_path == pre_path
+    # 再生時間 (80s) 以上の delay が確保されている (floor=30 では不足)
+    assert scheduled_delay >= playback_sec
+    assert scheduled_delay > tts_sbv2._get_delete_delay_sec()
