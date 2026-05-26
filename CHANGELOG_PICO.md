@@ -9,6 +9,111 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase C-8.1 (2026-05-26): TTS 配信 WAV 削除レース修正 (動的 delete delay)
+
+**原因**: `tts_sbv2.speak()` の finally は配信 WAV を固定 30s 後に削除していた
+(`_delayed_unlink(pre_path, _get_delete_delay_sec())`)。長文 TTS は連結後の再生
+時間が 30s を超え得るため、go2rtc がメイン PC 側で WAV を pull / 再生し終える前に
+Pi 側で WAV が消え、「not found」レースで音声が途切れる / 鳴らない事象が起きていた。
+
+**修正**: 削除 delay を再生時間ベースで動的算出する。
+- 新 helper `_wav_duration_sec(path) -> float | None` … 標準 `wave` の
+  `getnframes()/getframerate()` で再生秒を求める。読めない / 壊れ WAV は `None`。
+- 新 helper `_compute_delete_delay(pre_path) -> float` …
+  `dur = _wav_duration_sec(pre_path); floor = _get_delete_delay_sec();
+  return floor if dur is None else max(floor, dur*_get_delete_safety()+_get_delete_margin_sec())`。
+- 新 env アクセサ `_get_delete_safety()` (`TTS_DELETE_SAFETY`, 既定 1.5) /
+  `_get_delete_margin_sec()` (`TTS_DELETE_MARGIN_SEC`, 既定 10.0)。既存 `_get_*`
+  慣習どおり try/except で不正値はデフォルトにフォールバック。
+- `speak()` finally を `_delayed_unlink(pre_path, _compute_delete_delay(pre_path))`
+  へ差替。`TTS_DELETE_DELAY_SEC=30` は**下限 (floor)** として維持 (後方互換)。
+- `.env.example` に `TTS_DELETE_SAFETY` / `TTS_DELETE_MARGIN_SEC` 追記。
+
+**二層分離**: pico_agent 完結 (familiar_agent 0 行)。設計書 24 章侵入点の追加なし。
+
+#### Added (C-8.1)
+
+- `tests/test_adapter_tts_sbv2.py` に 8 件追加 (実 I/O なし、tmp に実 WAV を書く)
+  - `_wav_duration_sec` の既知長 WAV 検証 + 壊れ WAV → None
+  - `_compute_delete_delay` 長尺 (90s) で floor 超 / 短尺 (2s) で floor=30 /
+    壊れ → floor / env 上書き (safety=2.0, margin=5.0) / 不正値フォールバック
+  - `speak()` 長文 (80s WAV) で `_delayed_unlink` に渡る delay が再生時間以上
+    (mutation 検知: `_compute_delete_delay` を `return floor` 固定に戻すと長尺
+    テストが fail)
+
+### Phase C-10a (2026-05-26): Vision 再質問時の see 強制 soft nudge
+
+**原因**: ユーザーが「もう一回見て」「今どう?」と**新しい観察**を求めても、モデルが
+会話履歴に残った前回 `see` の画像 (tool_result) をそのまま再利用して答え、カメラを
+今撮り直さないことがあった。
+
+**修正**: vision 再質問を検出して user メッセージへ soft nudge を注入する。
+- 新設 `src/pico_agent/vision_reprompt.py` (response_filter / self_model_filter と
+  同型、familiar_agent を import しない、re / loguru のみ)。
+  - `needs_force_see(user_input, messages) -> bool` … vision 関連キーワード
+    (見て / 何が見える / カメラ / もう一回見て / 今どう 等、保守的) を含み、**かつ
+    履歴の直近に see 痕跡** (assistant の `tool_use name="see"` または画像付き
+    `tool_result`) があれば True。AND ゲートで初回観察・非 vision 入力では注入しない。
+  - `force_see_suffix() -> str` … 「[VISION] これは新しい観察の要求です。履歴の前回
+    画像を再利用せず、必ず see() を今すぐ呼んでから答えること。」
+- `src/familiar_agent/agent.py`: import 1 行 + `make_user_message` 直前で
+  `if needs_force_see(user_input, self.messages): user_input_with_ctx += force_see_suffix()`
+  の 2-3 行のみ (合計 +7 行)。他の familiar_agent 変更なし。
+- これは**プロンプト注入 (soft nudge)** であり「都度 see を強制」する hard 保証では
+  ない (backend 非依存を優先)。実世界の追従はカイニット実機確認範囲。
+
+**二層分離**: 本体は pico_agent/vision_reprompt.py。agent.py 侵入は import + 2-3 行。
+familiar_agent→pico_agent 一方向 import (24 章侵入点と整合: 既存 response_filter /
+self_model_filter import と同列の最小注入)。
+
+#### Added (C-10a)
+
+- `src/pico_agent/vision_reprompt.py` 新設 (vision 再質問判定 + nudge テキスト)
+- `tests/test_vision_reprompt.py` 新設 (判定ロジック、suffix 内容、二層分離 import 検査)
+  - mutation 検知: `_VISION_PATTERNS` を空に差し替えると vision 入力でも未検出
+- `tests/test_agent_react_loop.py` に統合 2 件追加 (camera.call mock、実カメラ非干渉)
+  - vision 再質問で see 撮影が 2 回 / user メッセージに `[VISION]` nudge 注入
+  - 非 vision 入力では nudge 未注入・see 1 回のみ (回帰)
+
+### Phase C-Ctrl+T 常時化 (2026-05-26): STT 常時 ON 化 (Tapo RTSP / Kotoba-Whisper)
+
+**原因**: Phase C-4 で `stt_kotoba.start_rtsp_subscription` (Tapo C210 RTSP 音声
+トラックを常時購読し無音区切りで Kotoba-Whisper に投げる VAD 購読) を実装済みだったが
+**TUI から未配線**で、TUI の音声入力は Ctrl+T の一発録音 (ElevenLabs) のみだった。
+
+**修正**: 常時 RTSP STT を UI 層から配線し、Ctrl+T を一時停止/再開トグルに再定義。
+- `src/familiar_agent/tui.py`:
+  - import 1 行 `from pico_agent.adapters import stt_kotoba` (realtime_stt_session
+    import と同型)。
+  - `__init__`: `self._continuous_stt_task: asyncio.Task | None = None` /
+    `self._continuous_stt_enabled: bool`。env `CONTINUOUS_STT` 既定 ON
+    (`_continuous_stt_enabled_default()`、false/0/no/off で OFF)。
+  - `on_mount`: `CONTINUOUS_STT` ON なら `run_worker(_start_continuous_stt())`。
+    `_start_continuous_stt` が `stt_kotoba.start_rtsp_subscription(on_speech=...)`
+    を起動し task を保持。callback `_continuous_stt_on_speech` は committed 相当
+    (`_input_queue.put(text)` + ログ + `_last_interaction` 更新)。依存未満なら
+    stt_kotoba 側で no-op task が返るため安全。
+  - `action_toggle_listen` (Ctrl+T) を**常時購読の一時停止/再開トグル**に再定義
+    (デフォルト ON、Ctrl+T で OFF↔ON)。一発録音 `_do_record` との二重起動は
+    `_continuous_stt_enabled` で排他。Ctrl+T binding ラベルは維持、Space PTT は不変。
+  - `action_quit` で `_stop_continuous_stt()` (task cancel) を追加。
+- `.env.example` に `CONTINUOUS_STT` 追記。
+
+**二層分離**: 本体 `start_rtsp_subscription` は pico_agent。tui.py は既に
+realtime_stt_session を import 済の UI 層で、STT wiring は UI 責務 (pico ラップ不可)。
+familiar_agent→pico_agent 一方向 import 厳守。
+
+#### Added (Ctrl+T 常時化)
+
+- `tests/test_tui_continuous_stt.py` 新設 (22 件、実 mic/RTSP/ffmpeg/ElevenLabs
+  非干渉。`start_rtsp_subscription` を AsyncMock 化)
+  - `__init__` 属性 / `CONTINUOUS_STT` デフォルト ON・OFF 値 (parametrize)
+  - on_mount→`_start_continuous_stt` が on_speech 付きで subscription を呼ぶ /
+    `on_speech("こんにちは")` 直呼びで `_input_queue` に積まれる / 空発話無視 /
+    無効時スキップ / 二重起動防止
+  - `action_toggle_listen` で task cancel↔再起動・`_continuous_stt_enabled` 遷移 /
+    デバウンス / `_stop_continuous_stt` の cancel / Ctrl+T・Space binding 維持
+
 ### Phase C-11 (2026-05-26): LiteRT-LM + Gemma 4 E2B utility ラッパー本実装
 
 utility backend (day summary / emotion / self-model / compaction) を qwen2.5:1.5b

@@ -31,6 +31,11 @@ from ._ui_helpers import (
 )
 from .realtime_stt_session import create_realtime_stt_controller, RealtimeSttController
 
+# pico_v3 拡張 (Phase C-Ctrl+T 常時化): Tapo RTSP 音声トラックを Kotoba-Whisper で
+# 常時購読する STT (Phase C-4 実装済 start_rtsp_subscription) を UI 層から配線する。
+# realtime_stt_session と同型 (UI 責務の STT wiring)。一方向 import (familiar_agent→pico_agent)。
+from pico_agent.adapters import stt_kotoba
+
 if TYPE_CHECKING:
     from .agent import EmbodiedAgent
     from .desires import DesireSystem
@@ -96,6 +101,18 @@ def _format_tokens(n: int) -> str:
     if n < 1000:
         return str(n)
     return f"{n / 1000:.1f}k"
+
+
+def _continuous_stt_enabled_default() -> bool:
+    """常時 RTSP STT のデフォルト ON/OFF を環境変数 CONTINUOUS_STT から取得 (既定 ON)。
+
+    ``CONTINUOUS_STT`` 未設定なら True (カイニット推奨「維持・デフォルト ON」)。
+    ``false`` / ``0`` / ``no`` / ``off`` (大小無視) のときだけ False。
+    """
+    raw = os.environ.get("CONTINUOUS_STT", "").strip().lower()
+    if raw in ("false", "0", "no", "off"):
+        return False
+    return True
 
 
 # Slash commands shown in the autocomplete dropdown
@@ -192,6 +209,10 @@ class FamiliarApp(App):
         self._ptt_active: bool = False
         # Realtime STT (hands-free, always-on)
         self._realtime_stt: RealtimeSttController | None = create_realtime_stt_controller()
+        # pico_v3 (Phase C-Ctrl+T 常時化): Tapo RTSP 常時 STT (Kotoba-Whisper) task。
+        # CONTINUOUS_STT (既定 ON) が真なら on_mount で起動し、Ctrl+T で一時停止/再開する。
+        self._continuous_stt_task: asyncio.Task | None = None
+        self._continuous_stt_enabled: bool = _continuous_stt_enabled_default()
 
     def _open_log_file(self) -> Path:
         log_dir = Path.home() / ".cache" / "familiar-ai"
@@ -252,6 +273,11 @@ class FamiliarApp(App):
         # Start realtime STT if configured
         if self._realtime_stt:
             self.run_worker(self._start_realtime_stt(), exclusive=False)
+        # pico_v3 (Phase C-Ctrl+T 常時化): Tapo RTSP 常時 STT (Kotoba-Whisper) を起動。
+        # CONTINUOUS_STT 既定 ON。依存未満 (RTSP URL 無 / ffmpeg 無) でも no-op task が
+        # 返るため安全 (stt_kotoba.start_rtsp_subscription の仕様)。
+        if self._continuous_stt_enabled:
+            self.run_worker(self._start_continuous_stt(), exclusive=False)
         # Show initializing status until embedding model is ready
         if not self.agent.is_embedding_ready:
             asyncio.create_task(self._embedding_ready_watcher())
@@ -587,6 +613,57 @@ class FamiliarApp(App):
             self._log_system(f"\u26a0 Realtime STT init failed: {e}")
             self._realtime_stt = None
 
+    async def _continuous_stt_on_speech(self, text: str) -> None:
+        """常時 RTSP STT の 1 発話 committed コールバック (input queue へ投入)。
+
+        realtime_stt の on_committed と同じ責務: ログ表示 + last_interaction 更新 +
+        input_queue へ投入。実 I/O (RTSP/ffmpeg/whisper) は stt_kotoba 側で完結し、
+        ここはテキスト 1 件を受け取るだけ (テストで直呼びして配線検証する)。
+        """
+        if not text or not text.strip():
+            return
+        try:
+            self._write_log(
+                f"[bold cyan]\U0001f3a4 {self._companion_name}[/bold cyan] {text}"
+            )
+        except Exception:
+            pass
+        self._last_interaction = time.time()
+        await self._input_queue.put(text)
+
+    async def _start_continuous_stt(self) -> None:
+        """Tapo RTSP 常時 STT (Kotoba-Whisper) を起動し task を保持する。
+
+        stt_kotoba.start_rtsp_subscription は依存未満なら no-op task を返すため、
+        ここでは silent fail で握る (TUI を落とさない)。一時停止中 (Ctrl+T OFF) は
+        起動しない。
+        """
+        if not self._continuous_stt_enabled:
+            return
+        if self._continuous_stt_task is not None and not self._continuous_stt_task.done():
+            return  # 二重起動防止
+        try:
+            self._continuous_stt_task = await stt_kotoba.start_rtsp_subscription(
+                on_speech=self._continuous_stt_on_speech
+            )
+            self._log_system("\U0001f3a4 Continuous STT ON (Tapo RTSP / Kotoba-Whisper)")
+        except Exception as e:
+            logger.warning("Continuous STT start failed: %s", e)
+            self._log_system(f"⚠ Continuous STT start failed: {e}")
+            self._continuous_stt_task = None
+
+    async def _stop_continuous_stt(self) -> None:
+        """常時 RTSP STT task を cancel して停止する (一時停止 / 終了時)。"""
+        task = self._continuous_stt_task
+        self._continuous_stt_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     async def action_restart_realtime_stt(self) -> None:
         """Reconnect realtime STT after a loop or transient transport issue."""
         if not self._realtime_stt:
@@ -604,26 +681,29 @@ class FamiliarApp(App):
             self._log_system("Realtime STT restart unavailable before startup")
 
     async def action_toggle_listen(self) -> None:
-        """Toggle microphone recording for voice input."""
-        if not self.agent.stt:
-            self._log_system("STT not configured (set ELEVENLABS_API_KEY)")
-            return
+        """Ctrl+T — 常時 RTSP STT の一時停止 / 再開トグル (デフォルト ON)。
+
+        pico_v3 (Phase C-Ctrl+T 常時化): 旧「一発録音トグル」を、常時購読の
+        pause/resume に再定義する。STT は起動時から常時 ON のため、Ctrl+T は
+        OFF→ON ではなく「今 ON なら止める / 今 OFF なら再開する」挙動になる。
+        一発録音 (_do_record) は常時購読が ON の間は起動しない (二重起動排他)。
+        """
         # Debounce: ignore key-repeat events within 0.5 s of the last toggle
         now = time.time()
         if now - self._last_toggle_listen < 0.5:
             return
         self._last_toggle_listen = now
 
-        stream = self.query_one("#stream", Static)
-
-        if not self._recording:
-            self._recording = True
-            self._stop_recording.clear()
-            stream.add_class("recording")
-            stream.update("🎙 Recording… (Ctrl+T to stop)")
-            self.run_worker(self._do_record(), exclusive=False)
+        if self._continuous_stt_enabled:
+            # 現在 ON → 一時停止
+            self._continuous_stt_enabled = False
+            await self._stop_continuous_stt()
+            self._log_system("\U0001f507 Continuous STT paused (Ctrl+T to resume)")
         else:
-            self._stop_recording.set()
+            # 現在 OFF → 再開
+            self._continuous_stt_enabled = True
+            self._log_system("\U0001f3a4 Continuous STT resuming…")
+            self.run_worker(self._start_continuous_stt(), exclusive=False)
 
     async def _do_record(self) -> None:
         """Worker: record until stop_event, transcribe, then submit as user input."""
@@ -704,6 +784,11 @@ class FamiliarApp(App):
                     await asyncio.wait_for(self._realtime_stt.stop(), timeout=2.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
+            # pico_v3: 常時 RTSP STT task を停止 (cancel)。
+            try:
+                await asyncio.wait_for(self._stop_continuous_stt(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
             try:
                 await asyncio.wait_for(self.agent.close(), timeout=2.0)
             except (asyncio.TimeoutError, Exception):
