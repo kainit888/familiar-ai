@@ -7,9 +7,72 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
-## [Unreleased] — Stage 2 Phase C-10 完了 (2026-05-25)
+## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
-### Phase C-10 (2026-05-25): self_model 汚染ループ修正
+### Phase C-11 (2026-05-26): LiteRT-LM + Gemma 4 E2B utility ラッパー本実装
+
+utility backend (day summary / emotion / self-model / compaction) を qwen2.5:1.5b
+(Ollama) から **Gemma 4 E2B / LiteRT-LM** に差し替え可能にする。前段ベンチで E2B が
+1.5b より日本語抽象化・指示追従ともに優位と確定したことを受けた本実装。
+
+**方針 α (familiar_agent 0 行改変, カイニット承認)**: pico_agent に OpenAI 互換
+FastAPI ラッパー `litert_server.py` を新設。familiar-ai の utility 経路 (backend.py の
+OpenAI 互換 `complete(prompt, max_tokens)`) は単一 user メッセージ
+`[{"role":"user","content":prompt}]` を `POST /v1/chat/completions` に送り
+`resp.choices[0].message.content` だけ読むため、`.env` の `UTILITY_BASE_URL` を
+`http://localhost:11435/v1` に切り替えるだけで familiar_agent を一切変えずに差し替わる。
+`response_filter` / `self_model_filter` と同型の二層分離を厳守 (litert_server は
+familiar_agent を import しない、pico_agent 自己完結)。
+
+LiteRT Engine / Conversation は並行駆動安全でないため:
+- Engine は `lifespan` で `asyncio.to_thread(_engine_factory, model_path)` により
+  起動時に **1 回だけ warm** し `app.state.engine` に保持する singleton。
+- 推論は `asyncio.Lock` で直列化 (`async with lock: await to_thread(_run)`)。
+- `max_num_tokens=2048` (前段 probe で 2048 未満は長プロンプトで
+  DYNAMIC_UPDATE_SLICE クラッシュと確定)。
+- `_engine_factory` / `_build_sampler` は module レベル変数 = DI 差し込み点。
+  本番実装 (`_real_engine_factory` / `_real_build_sampler`) は `litert_lm` を
+  **関数内で遅延 import** し、テストはここを monkeypatch して実 Gemma ロードを回避。
+
+エンドポイント:
+- `GET /health`: engine None (ロード中 / 失敗) → 503、ロード済 → 200。
+- `POST /v1/chat/completions`: messages 空 → 400 / engine None → 503 /
+  推論例外 → 500 (detail に `inference failed`)。レスポンスは
+  `{"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}], ...}`。
+
+**依存**: Python 3.11 (project uv env) で `litert-lm-api>=0.12.0` の import を実機確認
+(wheel は `py3-none-manylinux_2_27_aarch64` = ABI 非依存。probe は 3.13 だったが
+3.11 でも import OK)。本体 `[project.dependencies]` に `fastapi>=0.115.0` /
+`uvicorn>=0.34.0` / `litert-lm-api>=0.12.0` を追加 (optional group 退避は不要)。
+
+#### Added
+
+- `src/pico_agent/litert_server.py` 新設 (FastAPI OpenAI 互換 utility サーバ)
+  - `create_app() -> FastAPI` / `lifespan` singleton warm / `asyncio.Lock` 直列化
+  - DI factory `_engine_factory` / `_build_sampler` (遅延 import + monkeypatch 点)
+  - helper `_flatten_content` / `_messages_to_prompt` / `_extract_text` (PoC 流用)
+  - `main()` = `uvicorn.run(app, host="127.0.0.1", port=LITERT_LISTEN_PORT or 11435)`
+- `tests/test_litert_server_c11.py` 新設 (7 件, 全て engine mock = 実 Gemma ロードなし)
+  - (a) OpenAI shape (role=assistant / content str) / (b) Lock 直列化 (max_concurrent==1)
+    / (c) singleton (factory 呼出 1 回) / (d) health 503→200 / (e) messages 空 400・欠落 422
+    / (f) 推論例外 500 / (g) `_real_engine_factory` の max_num_tokens>=2048 (Engine を
+    MagicMock 化)
+- `deploy/systemd/litert_server.service` 新設 (設置のみ、enable/start はカイニット手動)
+- `.env.example`: utility を Gemma/LiteRT に向ける例 + `LITERT_MODEL_PATH` /
+  `LITERT_LISTEN_PORT` を追記
+- `pyproject.toml [project.dependencies]`: fastapi / uvicorn / litert-lm-api 追加
+
+#### Tests (Phase C-11)
+
+- mutation 対応: Lock 削除 → (b) fail / singleton 削除 → (c) fail / 例外捕捉削除 →
+  (f) fail / health 503 削除 → (d) fail / max_num_tokens 緩め → (g) fail。
+  Lock 削除 mutation を実際に注入し (b) が `concurrent send_message detected` で
+  fail することを確認後 revert。
+- フルスイート 1407 passed (C-10 時 1400 → +7)。
+
+---
+
+## Phase C-10 (2026-05-25): self_model 汚染ループ修正
 
 `_update_self_model` (familiar_agent/agent.py) が utility backend qwen2.5:1.5b に
 自己洞察を作らせるが、1.5b が抽象化に失敗し応答テキストを **verbatim 反射** する。

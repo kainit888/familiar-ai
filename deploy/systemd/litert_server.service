@@ -1,0 +1,26 @@
+[Unit]
+# Phase C-11: LiteRT-LM + Gemma 4 E2B utility server (OpenAI 互換, localhost:11435).
+# familiar-ai の UTILITY_BASE_URL を http://localhost:11435/v1 に向けると、
+# familiar_agent を一切改変せず utility 推論をこのサーバに委譲できる。
+# enable / start はカイニットが手動で行う (このファイルは設置のみ)。
+Description=pico LiteRT utility server (Gemma 4 E2B, OpenAI-compatible)
+After=network.target
+
+[Service]
+Type=simple
+User=pico
+Group=pico
+WorkingDirectory=/home/pico/pico_v3
+
+# .litertlm モデルへの安定パス (snapshot hash を直書きしない symlink を推奨)。
+Environment=LITERT_MODEL_PATH=/home/pico/litert_models/gemma-4-E2B/gemma-4-E2B-it.litertlm
+Environment=LITERT_LISTEN_PORT=11435
+
+# litert-lm-api / fastapi / uvicorn は本体 deps に含まれるため group 指定不要。
+ExecStart=/usr/bin/env uv run python -m pico_agent.litert_server
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
