@@ -982,3 +982,141 @@ async def test_non_vision_input_does_not_inject_nudge():
     # see は 1 回だけ (非 vision 入力は撮り直さない)
     see_calls = [c for c in agent._camera.call.call_args_list if c.args and c.args[0] == "see"]
     assert len(see_calls) == 1
+
+
+# ── Phase X Problem-2 B: say blind-retry suppression after timeout ─────────────
+#
+# mutation 対応:
+#   - timed_out_tools の skip チェック削除 → test_say_timeout_then_same_say_not_re_executed が fail
+#   - 全 tool を抑止 (tool 名 key でない) → test_say_timeout_does_not_block_different_tool が fail
+#   - timed_out_tools を instance 属性化 (turn 跨ぎ漏れ) → test_say_works_normally_in_next_turn が fail
+#   - timeout gate 無しで同名抑止 → test_two_different_says_both_run_when_no_timeout が fail
+
+
+@pytest.mark.asyncio
+async def test_say_timeout_then_same_say_not_re_executed():
+    """say がタイムアウトしたら、同一ターン内で再 say しても実行されない。"""
+    agent = _make_agent(with_tts=True)
+    agent._tts.call = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    tc1 = ToolCall(id="t1", name="say", input={"text": "X"})
+    tc2 = ToolCall(id="t2", name="say", input={"text": "X"})  # blind retry
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc1]), None),
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc2]), None),
+            (TurnResult(stop_reason="end_turn", text="ok", tool_calls=[]), "ok"),
+        ]
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("test")
+    finally:
+        for p in ps:
+            p.stop()
+
+    # first say timed out (call_count 1); second say skipped (not re-executed)
+    assert agent._tts.call.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_say_timeout_does_not_block_different_tool():
+    """say のタイムアウトは別 tool (remember) の実行を妨げない。"""
+    agent = _make_agent(with_tts=True)
+    agent._tts.call = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    tc_say = ToolCall(id="t1", name="say", input={"text": "X"})
+    tc_rem = ToolCall(id="t2", name="remember", input={"content": "note"})
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc_say]), None),
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc_rem]), None),
+            (TurnResult(stop_reason="end_turn", text="done", tool_calls=[]), "done"),
+        ]
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("test")
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert agent._memory_tool.call.called  # remember not suppressed
+
+
+@pytest.mark.asyncio
+async def test_say_works_normally_in_next_turn():
+    """timed_out_tools は run() ごとにリセット — 次ターンの say は通常実行される。"""
+    agent = _make_agent(with_tts=True)
+
+    # run 1: say times out
+    agent._tts.call = AsyncMock(side_effect=asyncio.TimeoutError())
+    tc1 = ToolCall(id="t1", name="say", input={"text": "X"})
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc1]), None),
+            (TurnResult(stop_reason="end_turn", text="a", tool_calls=[]), "a"),
+        ]
+    )
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("turn1")
+    finally:
+        for p in ps:
+            p.stop()
+
+    # run 2: say succeeds (fresh turn → timed_out_tools reset)
+    agent._tts.call = AsyncMock(return_value=("spoken", None))
+    tc2 = ToolCall(id="t2", name="say", input={"text": "Y"})
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc2]), None),
+            (TurnResult(stop_reason="end_turn", text="b", tool_calls=[]), "b"),
+        ]
+    )
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("turn2")
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert agent._tts.call.call_count == 1  # the new mock ran once → say executed
+
+
+@pytest.mark.asyncio
+async def test_two_different_says_both_run_when_no_timeout():
+    """タイムアウトしなければ同一ターンの複数 say は両方実行される (過抑止しない)。"""
+    agent = _make_agent(with_tts=True)
+    agent._tts.call = AsyncMock(return_value=("spoken", None))
+
+    tc1 = ToolCall(id="t1", name="say", input={"text": "A"})
+    tc2 = ToolCall(id="t2", name="say", input={"text": "B"})
+    agent.backend.stream_turn = AsyncMock(
+        side_effect=[
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc1]), None),
+            (TurnResult(stop_reason="tool_use", text="", tool_calls=[tc2]), None),
+            (TurnResult(stop_reason="end_turn", text="ok", tool_calls=[]), "ok"),
+        ]
+    )
+
+    ps = _patch_heavy()
+    for p in ps:
+        p.start()
+    try:
+        await agent.run("test")
+    finally:
+        for p in ps:
+            p.stop()
+
+    assert agent._tts.call.call_count == 2  # both says executed (no timeout)

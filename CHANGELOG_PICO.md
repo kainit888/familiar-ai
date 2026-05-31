@@ -9,6 +9,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase X Problem-2 修正 B (2026-05-31): say blind-retry 抑止
+
+**修正** (`familiar_agent/agent.py` ReAct ループ、agent.py 完結):
+- per-turn ローカル `timed_out_tools: set[str]` を導入 (run() ごと=1ターンごとに
+  リセット → ターン跨ぎは無影響)。tool が `asyncio.TimeoutError` で timeout したら
+  その tool 名を記録。
+- 同一ターン内で既に timeout した tool が再呼出されたら **実行せず** 終端結果
+  「Tool X timed out earlier this turn and was not retried. Do not retry…」を返す
+  (tool_use ごとに tool_result を必ず対にする API 制約を満たすため collected に append)。
+- **tool 名 key** で判定 (ハングはサーバ状態依存で入力非依存 → 同 tool の再試行は
+  どのテキストでも再ハングする)。他 tool は無影響、timeout してない通常の複数 say は
+  両方実行される。
+- 修正 A (15s fast-fail) と二重防御: A で各試行が 15s で諦め、B で再試行自体を止める。
+- テスト +4 (timeout 後同一 say 非実行 / 別 tool は実行 / 次ターンの say は通常実行 /
+  timeout 無しの複数 say は両方実行)。pytest 1496 → 1508 緑、regression なし。
+
 ### Phase X Problem-2 修正 A (2026-05-31): SBV2 speak fast-fail
 
 **背景**: Stage A 実機で「同一発話3連発」発生。原因は (A) `tts_sbv2.speak()` が

@@ -2857,6 +2857,12 @@ class EmbodiedAgent:
         say_used = False
         final_text = "(no response)"
         non_say_streak = 0  # consecutive tool calls without say()
+        # Phase X Problem-2 B: tools that hit a timeout this turn. A tool that
+        # timed out is not re-executed in the same turn (the hang is server-state,
+        # so re-issuing the same tool — e.g. say against a stuck TTS — only hangs
+        # again). Local set = resets every run() (one run() == one turn), so
+        # cross-turn calls are unaffected.
+        timed_out_tools: set[str] = set()
         observation_action_name: str | None = None
         observation_action_input: dict | None = None
         pending_view_action_name: str | None = None
@@ -3024,6 +3030,25 @@ class EmbodiedAgent:
                         if on_action:
                             on_action(tc.name, tc.input)
 
+                        # Phase X Problem-2 B: a tool that already timed out this
+                        # turn is not re-executed — re-issuing it (e.g. say against
+                        # a hung TTS) would only time out again. Return a terminal
+                        # result so the LLM stops blind-retrying; still append it so
+                        # every tool_use is paired with a tool_result (API requires).
+                        if tc.name in timed_out_tools:
+                            logger.info(
+                                "Skipping blind-retry of timed-out tool: %s", tc.name
+                            )
+                            text = (
+                                f"Tool {tc.name} timed out earlier this turn and was "
+                                "not retried. Do not retry it; continue without it or "
+                                "end the turn."
+                            )
+                            if on_tool_result is not None:
+                                on_tool_result(tc.name, tc.input, text)
+                            collected.append((text, None))
+                            continue
+
                         timeout_s = self._tool_timeout_seconds(tc.name)
                         try:
                             text, image = await asyncio.wait_for(
@@ -3040,6 +3065,7 @@ class EmbodiedAgent:
                             )
                             self._last_tool_error = text
                             self._tool_failure_streak += 1
+                            timed_out_tools.add(tc.name)  # Problem-2 B: no blind retry
                         except Exception as e:
                             logger.warning("Tool %s failed: %s", tc.name, e)
                             text, image = f"Tool error: {e}", None
