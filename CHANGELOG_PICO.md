@@ -9,6 +9,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase X Stage A (2026-05-31): auto_desire 解放 + 個別 drive 無効化フラグ
+
+**目的**: 視覚自走 (Phase X) の最小 viable。既存の desire 自走モデル
+(idle で drive が成長 → `get_dominant()` で発火 → `agent.run("", inner_voice=...)`)
+を有効化する。Tapo event はまだ繋がない (Stage C)。master ゲート
+`FAMILIAR_AUTO_DESIRE=true` + 暴走時に個別 drive を切れる仕組みを用意。
+
+**設計書からの訂正 (実測)**:
+- auto_desire の env は `AUTO_DESIRE` ではなく既存の **`FAMILIAR_AUTO_DESIRE`**
+  (`config.py:237` で既に読込済) → config.py 改修不要。
+- 個別フラグは設計書案の「`_react_to_scene_events` でチェック」では不十分。
+  同関数は scene イベント由来 boost だけを扱い、`look_around`/`explore` の
+  時間成長発火 (`tick()`→`get_dominant()`) を通らない。→ enforce は `desires.py`
+  の選択経路に置く。
+
+**実装** (`familiar_agent/desires.py` のみ、additive):
+- `_parse_disabled_drives(raw)` … `FAMILIAR_DISABLED_DRIVES` のカンマリストを
+  strip/lower/空捨てで `frozenset` 化。空入力 → 空集合 (= 全 drive 有効、既定)。
+- `DesireSystem.__init__` に `disabled_drives` kwarg 追加 (明示指定優先、
+  なければ env から)。`self._disabled_drives` 保持。
+- `_effective_score()` 先頭で無効 drive は `return 0.0` → `get_dominant`・
+  `as_coalition`・workspace・inner_voice prompt から一括除外 (1 箇所で全経路カバー)。
+- `boost()` 先頭で無効 drive は no-op → scene イベント由来の加算も抑止。
+- `tick()` は非ゲート (level は成長するがスコア 0 で不可視、hot loop 非介入)。
+- config.py / main.py / tui.py / agent.py / `get_dominant`・`as_coalition` の
+  シグネチャは無改修。kwarg 既定 None で既存 16 箇所の呼出は不変 → regression なし。
+
+**環境変数** (`.env.example` に追記、`.env` 本体はカイニット手動):
+- `FAMILIAR_AUTO_DESIRE=true` (自走有効化)
+- `FAMILIAR_DISABLED_DRIVES=look_around,explore` (個別無効化、既定空)
+
+**テスト** (`tests/test_desires.py` +7): 無効 drive が get_dominant に出ない
+(level 強制 high でも) / boost no-op / coalition 除外 / 有効 drive は通常発火 /
+既定で全有効 / env parse 正規化 / env 読込。mutation 対応明記。
+pytest 1480 → 1487 緑、regression なし。
+
+**範囲外** (後続 Stage): 視覚変化専用 inner_voice prompt (Stage B)、Tapo ONVIF
+event 受信層 (Stage C)、実機誤発火チューニング (Stage D)。
+
 ### say 登録ゲートを独自 TTS 設定へ切替 (2026-05-31, Phase X 前段)
 
 **背景**: `TTSTool.say()` は Phase C-1/C-5 で既に `pico_agent.adapters.tts_sbv2`

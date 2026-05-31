@@ -118,6 +118,16 @@ TRIGGER_THRESHOLD = 0.6
 DECAY_ON_SATISFY = 0.5  # drop hard so it can rebuild and fire again
 
 
+def _parse_disabled_drives(raw: str) -> frozenset[str]:
+    """Parse FAMILIAR_DISABLED_DRIVES (comma list) into a normalized name set.
+
+    Phase X Stage A: individual drives can be turned off without disabling all
+    autonomy. Whitespace-trimmed, lower-cased, empty entries dropped. Empty input
+    → empty set (= every drive enabled, the default).
+    """
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 @dataclass(slots=True)
 class DriveSpec:
     name: str
@@ -135,6 +145,7 @@ class DesireSystem:
         state_path: Path | None = None,
         companion_name: str | None = None,
         drive_config_path: Path | None = None,
+        disabled_drives: frozenset[str] | None = None,
     ):
         self._state_path = state_path or Path.home() / ".familiar_ai" / "desires.json"
         self._desires: dict[str, float] = {}
@@ -146,6 +157,13 @@ class DesireSystem:
             or default_name
         )
         self._companion_name = resolved_name or default_name
+        # Phase X Stage A: per-drive disable. Explicit arg wins; else env list.
+        if disabled_drives is not None:
+            self._disabled_drives: frozenset[str] = frozenset(d.lower() for d in disabled_drives)
+        else:
+            self._disabled_drives = _parse_disabled_drives(
+                os.environ.get("FAMILIAR_DISABLED_DRIVES", "")
+            )
         self._drive_config_path = drive_config_path
         self._last_fired: dict[str, float] = {}
         self._schedule_multiplier = 1.0
@@ -403,6 +421,8 @@ class DesireSystem:
 
     def boost(self, desire_name: str, amount: float = 0.2) -> None:
         """Boost a desire (e.g., dopamine response to novelty)."""
+        if desire_name.lower() in self._disabled_drives:
+            return  # Phase X Stage A: disabled drives never accumulate.
         current = self._desires.get(desire_name, 0.0)
         self._desires[desire_name] = min(1.0, current + amount)
         self._save()
@@ -425,6 +445,10 @@ class DesireSystem:
         }
 
     def _effective_score(self, name: str, level: float) -> float:
+        # Phase X Stage A: disabled drives score 0 → never dominant, never in
+        # coalition/workspace, never emitted as an inner_voice prompt.
+        if name.lower() in self._disabled_drives:
+            return 0.0
         affordance = self._context_affordances.get(name, 1.0)
         permission = (
             self._social_permission

@@ -12,6 +12,7 @@ from familiar_agent.desires import (
     GROWTH_RATES,
     TRIGGER_THRESHOLD,
     DesireSystem,
+    _parse_disabled_drives,
     detect_worry_signal,
 )
 
@@ -93,7 +94,12 @@ def test_worry_companion_has_no_growth_rate() -> None:
 
 @pytest.fixture
 def desires(tmp_path: Path) -> DesireSystem:
-    return DesireSystem(state_path=tmp_path / "desires.json", companion_name="Kota")
+    # disabled_drives=frozenset() で env FAMILIAR_DISABLED_DRIVES から隔離 (hermetic)
+    return DesireSystem(
+        state_path=tmp_path / "desires.json",
+        companion_name="Kota",
+        disabled_drives=frozenset(),
+    )
 
 
 def test_worry_starts_at_zero(desires: DesireSystem) -> None:
@@ -197,3 +203,79 @@ def test_rest_prompt_is_localized_for_ja_and_en(
     ja_prompt = ja_desires.dominant_as_prompt()
     assert ja_prompt is not None
     assert "内部衝動" in ja_prompt
+
+
+# ── Phase X Stage A: per-drive disable (FAMILIAR_DISABLED_DRIVES) ───────────────
+#
+# mutation 対応 (各テストが捕捉する破壊):
+#   - _effective_score の無効ガード削除 →
+#       test_disabled_drive_never_dominant_even_when_forced_high
+#       test_disabled_drive_excluded_from_coalition が fail
+#   - boost の無効ガード削除 → test_disabled_drive_boost_is_noop が fail
+#   - 無効セットが有効ドライブまで巻き込む → test_enabled_drive_still_fires が fail
+#   - 既定が空でなくなる (regression) → test_default_no_disabled_drives_all_enabled が fail
+#   - _parse_disabled_drives の strip/lower/空捨て破壊 →
+#       test_parse_disabled_drives_normalizes が fail
+#   - __init__ の env フォールバック未配線 → test_disabled_drives_read_from_env が fail
+
+
+def test_parse_disabled_drives_normalizes() -> None:
+    assert _parse_disabled_drives(" Look_Around , explore ,, ") == frozenset(
+        {"look_around", "explore"}
+    )
+    assert _parse_disabled_drives("") == frozenset()
+    assert _parse_disabled_drives("   ") == frozenset()
+
+
+def test_disabled_drives_read_from_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FAMILIAR_DISABLED_DRIVES", "curiosity, Explore")
+    ds = DesireSystem(state_path=tmp_path / "d.json")
+    assert ds._disabled_drives == frozenset({"curiosity", "explore"})
+
+
+def test_default_no_disabled_drives_all_enabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("FAMILIAR_DISABLED_DRIVES", raising=False)
+    ds = DesireSystem(state_path=tmp_path / "d.json")
+    assert ds._disabled_drives == frozenset()
+    ds._desires["worry_companion"] = 1.0
+    dominant = ds.get_dominant()
+    assert dominant is not None and dominant[0] == "worry_companion"
+
+
+def test_disabled_drive_never_dominant_even_when_forced_high(tmp_path: Path) -> None:
+    ds = DesireSystem(
+        state_path=tmp_path / "d.json", disabled_drives=frozenset({"look_around"})
+    )
+    ds._desires["look_around"] = 1.0
+    dominant = ds.get_dominant()
+    assert dominant is None or dominant[0] != "look_around"
+
+
+def test_disabled_drive_boost_is_noop(tmp_path: Path) -> None:
+    ds = DesireSystem(
+        state_path=tmp_path / "d.json", disabled_drives=frozenset({"worry_companion"})
+    )
+    ds.boost("worry_companion", 0.9)
+    assert ds.level("worry_companion") == 0.0
+
+
+def test_disabled_drive_excluded_from_coalition(tmp_path: Path) -> None:
+    ds = DesireSystem(
+        state_path=tmp_path / "d.json", disabled_drives=frozenset({"worry_companion"})
+    )
+    ds._desires["worry_companion"] = 1.0
+    coalition = ds.as_coalition()
+    assert coalition is None or (
+        "worry_companion" not in coalition.summary
+        and "worry_companion" not in coalition.context_block
+    )
+
+
+def test_enabled_drive_still_fires(tmp_path: Path) -> None:
+    # explore disabled, look_around enabled → look_around still wins
+    ds = DesireSystem(
+        state_path=tmp_path / "d.json", disabled_drives=frozenset({"explore"})
+    )
+    ds._desires["look_around"] = 1.0
+    dominant = ds.get_dominant()
+    assert dominant is not None and dominant[0] == "look_around"
