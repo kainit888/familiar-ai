@@ -9,6 +9,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase C-13a (2026-05-31): 幻聴 denylist 追加 + allowlist 見直し
+
+**原因**: C-13 (commit 1717a12) のフィルタ実装後、実機運用 (2026-05-31 11:21
+セッション) で短い幻聴が残存。app.log の `transcribe: EXIT text_len` と、ピコの
+`remember`/`say` が引用した発話から確認:
+- 「いい」(len=2) … 無音由来。ピコが「『いい』だなんて、何かいいことあった？」と
+  誤応答し observation 保存 (id ffb2069e)。
+- 「はい」(len=2) … C-13 で allowlist にあったため素通り、ピコが「はい！お返事
+  ありがとう」と誤応答 (observation id 51a9094f)。
+
+**修正**:
+- denylist に「いい」「はい」を追加 (いずれも len=2、完全一致のみで捕捉)。
+  len<5 で prefix/包含レンジに入らず、包含署名長ゲート (≥6) にも掛からないため
+  「いいね」「いいよ」「いいですね」「はいはい」「はい、そうです」等の実発話は
+  巻き込まない (C-13 で「ごめん」包含が実発話を誤 drop した教訓を踏襲)。
+- 「はい」を allowlist から削除し denylist へ移動。常時 ON STT では単独「はい」の
+  情報量が小さく誤 drop コストが低い一方、素通しは無音への誤応答 (本バグ) を招く。
+  カイニットが実機で単独「はい」の取りこぼしを問題視すれば再考可能 (可逆)。
+- 「うん」「ええ」「OK」は幻聴の実観測が無いため allowlist 保持 (誤 drop 回避の保険)。
+- テスト 4 件純増 (test_drops_ii / test_drops_hai / test_passes_ii_compounds /
+  test_passes_hai_compounds / test_passes_un_still_allowlisted、旧 test_passes_hai
+  は test_drops_hai へ置換)。pytest 1469 → 1473 緑、regression なし。
+
 ### Phase C-13 (2026-05-31): Whisper STT 幻聴フィルタ (Pi5 テキスト層)
 
 **原因**: Kotoba-Whisper (Whisper Large 系) は無音/環境ノイズを入力されると、

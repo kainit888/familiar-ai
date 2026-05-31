@@ -1,4 +1,4 @@
-"""Phase C-13: Whisper STT 幻聴フィルタのテスト。
+"""Phase C-13 / C-13a: Whisper STT 幻聴フィルタのテスト。
 
 `pico_agent.stt_hallucination_filter` の純ロジックと、
 `pico_agent.adapters.stt_kotoba._emit_segment` への統合を検証する。
@@ -6,6 +6,8 @@ familiar_agent には依存しない (二層分離の確認も兼ねる)。
 
 mutation 対応 (各テストが捕捉する破壊):
     - denylist を空にする → test_drops_* (denylist 系) が fail
+    - C-13a の「いい」を denylist から外す → test_drops_ii が fail
+    - C-13a の「はい」を denylist から外す → test_drops_hai が fail
     - allowlist 完全一致優先を削除 → test_passes_arigatou が fail
       (「ありがとう」は denylist「ありがとうございました」の prefix として rule 6 で
        catch されるため、allowlist (rule 3) が唯一の救済経路 = load-bearing)
@@ -14,14 +16,17 @@ mutation 対応 (各テストが捕捉する破壊):
     - 正規化 (空白除去) を削除 → test_drops_with_trailing_whitespace が fail
     - 包含マッチを過度に広げる (長文も対象) → test_passes_real_speech_pico_san が fail
     - 包含の署名長ゲート (≥6 文字) を外す → test_passes_gomen_in_context が fail
+    - 「いい」/「はい」を完全一致でなく包含で扱う → test_passes_ii_compounds /
+      test_passes_hai_compounds が fail (「いいね」「はいはい」を巻き込む)
     - 統合の幻聴チェックを削除 → test_filter_called_in_emit_segment が fail
     - トグル方向を逆転 / 既定を OFF にする → test_filter_disabled_via_env が fail
     - 統合が正当発話まで落とす → test_normal_text_reaches_on_speech が fail
 
-注: test_passes_hai / test_passes_arigatou は両方 allowlist を経由するが、
-decisive (= allowlist 削除で結果が変わる) なのは test_passes_arigatou のみ。
-「はい」は len=2 で他のどの規則にも掛からないため allowlist が無くても通過する
-(allowlist は「はい」に対しては防御的・将来 denylist 拡張への保険)。
+注: allowlist が decisive (= 削除で結果が変わる) なのは test_passes_arigatou のみ
+(「ありがとう」は denylist フレーズの prefix で catch されかけるのを allowlist が
+救う)。「うん」「ええ」「OK」は他のどの規則にも掛からないため allowlist が無くても
+通過する = 防御的 (将来 denylist 拡張への保険)。「はい」は C-13a で allowlist から
+denylist へ移動済 (実機で幻聴頻出)。
 """
 
 from __future__ import annotations
@@ -78,9 +83,32 @@ def test_passes_arigatou():
     assert is_whisper_hallucination("ありがとう") is False
 
 
-def test_passes_hai():
-    # カイニット実機観測値 (len=2、allowlist で救済)
-    assert is_whisper_hallucination("はい") is False
+def test_drops_ii():
+    # C-13a 実機観測 (len=2、2026-05-31 11:21、無音由来でピコが誤応答)
+    assert is_whisper_hallucination("いい") is True
+
+
+def test_drops_hai():
+    # C-13a: 実機で幻聴頻出 (len=2)。allowlist から denylist へ移動
+    assert is_whisper_hallucination("はい") is True
+
+
+def test_passes_ii_compounds():
+    # 「いい」完全一致のみ。実発話の複合語は巻き込まない (誤 drop 厳禁)
+    assert is_whisper_hallucination("いいね") is False
+    assert is_whisper_hallucination("いいよ") is False
+    assert is_whisper_hallucination("いいですね") is False
+
+
+def test_passes_hai_compounds():
+    # 「はい」完全一致のみ。複合・長文は通過
+    assert is_whisper_hallucination("はいはい") is False
+    assert is_whisper_hallucination("はい、そうです") is False
+
+
+def test_passes_un_still_allowlisted():
+    # 「うん」は幻聴観測が無いため allowlist 保持 (C-13a で維持)
+    assert is_whisper_hallucination("うん") is False
 
 
 def test_passes_normal_sentence():
