@@ -870,7 +870,7 @@ class EmbodiedAgent:
         self._memory_tool = MemoryTool(self._memory)
         self._tom_tool = ToMTool(
             self._memory,
-            default_person=config.companion_name,
+            default_person=config.resolve_tom_default_person(),
             backend=self._utility_backend,
         )
         self._coding = CodingTool(config.coding)
@@ -1447,7 +1447,9 @@ class EmbodiedAgent:
         body_desc = self._get_body_description()
         base = re.sub(r"\(body.*?\)", body_desc, base, flags=re.DOTALL)
 
-        stable_parts = [p for p in [self._me_md, base] if p]
+        stable_parts = [
+            p for p in [self._me_md, base, _t("identity_uncertainty_guidance")] if p
+        ]
         stable = "\n\n---\n\n".join(stable_parts)
 
         agent_mood, agent_mood_intensity = self._decayed_mood()

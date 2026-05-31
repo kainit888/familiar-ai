@@ -9,6 +9,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Problem-1 修正 (2026-06-01): 視覚 identity の誤認 (無条件「カイニット」)
+
+**原因**: 顔認識が無く、`agent.py:873` が `ToMTool(default_person=config.companion_name)`
+で ToM のデフォルト人物を companion 名に固定 + LLM が ME.md/companion 文脈に誘導され、
+カメラに映った誰でも「あ、カイニットだ」と決め打ちしていた (Phase X Stage A 実機で発覚)。
+`see()` は identity を出さない。Phase X とは独立の既存バグ。
+
+**修正** (`familiar_agent`、最小侵入。顔認識実装は範囲外):
+- `config.AgentConfig` に 2 フィールド追加: `tom_default_person`
+  (env `TOM_DEFAULT_PERSON_LABEL`、既定 `"unknown_person"`) / `face_recognition_enabled`
+  (env `FACE_RECOGNITION_ENABLED`、既定 false、将来の顔認識用予約)。
+- `resolve_tom_default_person()`: フラグ true でも認識器が無いので **warning + ラベルを返す**
+  (companion_name へは戻さない = バグ再発防止)。
+- `agent.py:873`: `default_person=config.companion_name` → `config.resolve_tom_default_person()`。
+- `agent.py:1450`: system prompt の stable 部に `_t("identity_uncertainty_guidance")` を注入。
+- locale `identity_uncertainty_guidance` を ja/en に追加: 「人物を断定するな / 同居でも
+  相手本人と決めつけるな / ただし会話・名乗り(『ただいま』『私だよ』)・時間帯・声から
+  **文脈推論してよい** / 不確実なら『誰かいる』とだけ言う」。他言語は en フォールバック。
+- `companion_name` の他 28 箇所 (UI 表示 / desires の owner 関係 / config) は **無変更**
+  (視覚 identity ではない、grep 確認済)。`tom.py` も無変更 (本番ラベルは resolver 経由)。
+- テスト +8 (`test_tom_default_person.py`: ラベル既定/env 上書き/companion_name 不使用/
+  フラグ既定false/フラグtrueでもラベル+warning/locale 識別不確実性・文脈推論・en フォールバック)。
+  pytest 1539 → 1547 緑、regression なし。
+
+**実機検証 (Stage D)**: ピコが無条件「カイニットだ」でなく「誰かいる」or 挨拶文脈から
+カイニット推論する確認。既存記憶 DB の誤認データ cleanup は別タスク (範囲外)。
+
 ### Phase X Stage C (2026-05-31): Tapo ONVIF event 受信層
 
 **目的**: Tapo C210 自身の motion/person 検知 (ONVIF event) を視覚自走の

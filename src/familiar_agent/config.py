@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -164,6 +165,20 @@ class AgentConfig:
         default_factory=lambda: os.environ.get("COMPANION_NAME", _default_companion_name())
     )
 
+    # ── Visual identity (Problem-1) ─────────────────────────────────────
+    # Label used by the ToM tool when the person on camera is unidentified.
+    # Decoupled from companion_name so Pico does NOT hard-label every face it
+    # sees as the companion. Face recognition is a separate, out-of-scope task.
+    tom_default_person: str = field(
+        default_factory=lambda: os.environ.get("TOM_DEFAULT_PERSON_LABEL", "unknown_person")
+    )
+    # Reserved flag for future face recognition. No recognizer exists yet; when
+    # set we warn and still use the label (never fall back to companion_name,
+    # which would reintroduce the Problem-1 misidentification bug).
+    face_recognition_enabled: bool = field(
+        default_factory=lambda: _bool_env("FACE_RECOGNITION_ENABLED", default=False)
+    )
+
     # Platform: "anthropic" | "gemini" | "openai" | "kimi" | "glm"
     platform: str = field(default_factory=lambda: os.environ.get("PLATFORM", "anthropic"))
 
@@ -254,3 +269,18 @@ class AgentConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     coding: CodingConfig = field(default_factory=CodingConfig)
+
+    def resolve_tom_default_person(self) -> str:
+        """Resolve the ToM default-person label (Problem-1 fix).
+
+        Face recognition is out of scope: when the flag is on but no recognizer
+        exists, warn and still return the label — never fall back to
+        companion_name (that is the misidentification bug being fixed).
+        """
+        if self.face_recognition_enabled:
+            logging.getLogger(__name__).warning(
+                "FACE_RECOGNITION_ENABLED is set but face recognition is not "
+                "implemented; using TOM_DEFAULT_PERSON_LABEL=%r instead.",
+                self.tom_default_person,
+            )
+        return self.tom_default_person
