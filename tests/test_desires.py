@@ -11,6 +11,7 @@ from familiar_agent.desires import (
     DEFAULT_DESIRES,
     GROWTH_RATES,
     TRIGGER_THRESHOLD,
+    VISUAL_CHANGE_TTL_SECONDS,
     DesireSystem,
     _parse_disabled_drives,
     detect_worry_signal,
@@ -279,3 +280,110 @@ def test_enabled_drive_still_fires(tmp_path: Path) -> None:
     ds._desires["look_around"] = 1.0
     dominant = ds.get_dominant()
     assert dominant is not None and dominant[0] == "look_around"
+
+
+# ── Phase X Stage B: visual-change inner_voice prompt ──────────────────────────
+#
+# mutation 対応 (各テストが捕捉する破壊):
+#   - boost の visual arm 漏れ / dominant_as_prompt の consume 漏れ →
+#       test_visual_boost_yields_visual_prompt が fail
+#   - 常に visual prompt を返す (置換が無条件) → test_no_visual_marker_generic_prompt が fail
+#   - consume が pop しない (再利用) → test_visual_marker_one_shot が fail
+#   - TTL チェック削除 → test_visual_marker_staleness が fail
+#   - global flag 実装 (per-drive でない) → test_visual_marker_is_per_drive が fail
+#   - arm が disabled ガードより前 → test_disabled_drive_not_visually_armed が fail
+#   - locale key 欠落 → test_visual_change_locale_resolves が fail
+
+
+def _visual_prompt_ja() -> str:
+    from familiar_agent._i18n import _t
+
+    return _t("inner_voice_visual_change")
+
+
+def test_visual_boost_yields_visual_prompt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    ds = DesireSystem(state_path=tmp_path / "d.json", disabled_drives=frozenset())
+    ds.boost("look_around", 0.9, visual=True)
+    prompt = ds.dominant_as_prompt()
+    assert prompt is not None and "見えたものは無視しても構いません" in prompt
+
+
+def test_no_visual_marker_generic_prompt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    ds = DesireSystem(state_path=tmp_path / "d.json", disabled_drives=frozenset())
+    ds.boost("look_around", 0.9)  # no visual=True
+    prompt = ds.dominant_as_prompt()
+    assert prompt is not None
+    assert "見えたものは無視しても構いません" not in prompt
+
+
+def test_visual_marker_one_shot(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    ds = DesireSystem(state_path=tmp_path / "d.json", disabled_drives=frozenset())
+    ds.boost("look_around", 0.9, visual=True)
+    first = ds.dominant_as_prompt()
+    second = ds.dominant_as_prompt()
+    assert "見えたものは無視しても構いません" in (first or "")
+    assert "見えたものは無視しても構いません" not in (second or "")
+
+
+def test_visual_marker_staleness(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    ds = DesireSystem(state_path=tmp_path / "d.json", disabled_drives=frozenset())
+    ds.boost("look_around", 0.9, visual=True)
+    # backdate the arm beyond the TTL
+    import time
+
+    ds._visual_change_armed_at["look_around"] = time.time() - VISUAL_CHANGE_TTL_SECONDS - 1
+    prompt = ds.dominant_as_prompt()
+    assert prompt is not None
+    assert "見えたものは無視しても構いません" not in prompt
+
+
+def test_visual_marker_is_per_drive(tmp_path: Path, monkeypatch) -> None:
+    # look_around armed visually, but rest is dominant → generic (not visual) prompt
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    ds = DesireSystem(state_path=tmp_path / "d.json", disabled_drives=frozenset())
+    ds.boost("look_around", 0.7, visual=True)
+    ds.boost("rest", 1.0)  # rest dominates
+    dominant = ds.get_dominant()
+    assert dominant is not None and dominant[0] == "rest"
+    prompt = ds.dominant_as_prompt()
+    assert prompt is not None
+    assert "見えたものは無視しても構いません" not in prompt
+
+
+def test_disabled_drive_not_visually_armed(tmp_path: Path) -> None:
+    ds = DesireSystem(
+        state_path=tmp_path / "d.json", disabled_drives=frozenset({"look_around"})
+    )
+    before = ds.level("look_around")
+    ds.boost("look_around", 0.9, visual=True)
+    # disabled drive: boost is a no-op (level unchanged) AND never armed
+    assert "look_around" not in ds._visual_change_armed_at
+    assert ds.level("look_around") == before
+
+
+def test_visual_change_locale_resolves(monkeypatch) -> None:
+    from familiar_agent._i18n import _t
+
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    assert "見えたもの" in _t("inner_voice_visual_change")
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "en")
+    assert "ignore what you saw" in _t("inner_voice_visual_change")
+
+
+def test_as_coalition_peek_does_not_consume_visual_mark(tmp_path: Path, monkeypatch) -> None:
+    # Regression: as_coalition() must PEEK the visual mark, not consume it,
+    # so the inner_voice path (dominant_as_prompt) still gets the visual prompt.
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    ds = DesireSystem(state_path=tmp_path / "d.json", disabled_drives=frozenset())
+    ds.boost("look_around", 0.9, visual=True)
+    coalition = ds.as_coalition()  # workspace path runs first in the pipeline
+    assert coalition is not None
+    # mark survives the as_coalition peek
+    assert "look_around" in ds._visual_change_armed_at
+    # inner_voice path still receives the visual prompt
+    prompt = ds.dominant_as_prompt()
+    assert prompt is not None and "見えたものは無視しても構いません" in prompt

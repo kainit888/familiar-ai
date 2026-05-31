@@ -738,9 +738,9 @@ def _react_to_scene_events(events: list[dict], desires: DesireSystem | None) -> 
         label = (event.get("entity_label") or "").lower()
         if "person" in label:
             if event_type == "appeared":
-                desires.boost("greet_companion", 0.6)
+                desires.boost("greet_companion", 0.6, visual=True)
             elif event_type == "disappeared":
-                desires.boost("worry_companion", 0.2)
+                desires.boost("worry_companion", 0.2, visual=True)
 
 
 # Maps each format_*_for_context output to a short Japanese natural-language
@@ -1007,7 +1007,7 @@ class EmbodiedAgent:
                 novelty = max(0.0, min(1.0, novelty))
                 self._exploration.record_novelty(novelty)
                 if desires is not None:
-                    desires.boost("look_around", novelty * 0.3)
+                    desires.boost("look_around", novelty * 0.3, visual=True)
                 if self._scene is not None:
                     scene_events = await self._scene.update(
                         final_text[:500],

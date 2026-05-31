@@ -9,6 +9,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase X Stage B (2026-05-31): 視覚変化専用 inner_voice prompt
+
+**目的**: scene/視覚変化が起点の desire turn のときだけ、専用 inner_voice prompt
+(カイニット指定:「気になる事はありましたか？現在の状況を判断し、見えたものは
+無視しても構いません。」=沈黙の自由を明示)を注入する。通常の look_around 等
+(視覚起点でない)は既存の汎用 prompt のまま。
+
+**マーカー設計** (`familiar_agent/desires.py`):
+- `DesireSystem._visual_change_armed_at: dict[drive→time.time()]`。`boost()` に
+  キーワード専用 `visual: bool=False` を追加し、`visual=True` の boost が
+  (Stage A の disabled ガードを通過した上で) 当該 drive を arm する。
+- `_consume_visual_change(name)` … `pop` で **1 回だけ消費** + `VISUAL_CHANGE_TTL_SECONDS`
+  (30s) 以内のみ有効。古い arm は pop だけして無効扱い (後続ターンを誤誘導しない)。
+- `dominant_as_prompt(consume_visual=True)` 先頭で dominant drive が consume
+  できたら `_t("inner_voice_visual_change")` を返す (drive 汎用 prompt を **置換**)。
+  `as_coalition()` は `consume_visual=False` で **peek** (one-shot を奪わない) —
+  視覚 boost と workspace coalition が同一 `_run_post_response_pipeline` で走るため、
+  consume すると次 idle tick の inner_voice が視覚 prompt を取り損ねる (evaluator 指摘)。
+  置換理由: look_around の「see() で見てみる/無視しない」系が「無視しても構わない」
+  と矛盾するため。`inner_voice_label`/`directive` のラップ (agent.py:1479) は不変。
+- **per-drive キー**なので視覚起点でない dominant (rest / 沈黙タイムアウト greet 等)
+  は専用 prompt を拾わない。`visual=False` 既定で既存 caller・1487 baseline は不変。
+
+**visual=True を渡す箇所** (`familiar_agent/agent.py`、真に視覚起点の 3 経路):
+- `look_around` novelty boost (agent.py:1010)
+- `_react_to_scene_events`: person appeared → greet_companion / disappeared → worry_companion
+
+**locale**: `inner_voice_visual_change` を `ja.json` + `en.json` に追加。他 85 言語は
+`_t()` の en フォールバック (`_i18n.py:3224`)。i18n parity テストは `_T` キーに対する
+missing チェックのみで、追加キーは安全。
+
+**テスト** (+8): arm→専用prompt / マーカー無→汎用 / 1-shot consume / TTL staleness /
+per-drive / disabled は arm されない / locale 解決 (ja+en) / scene-event 配線
+(test_scene_greeting)。pytest 1487 → 1495 緑、regression なし。
+
+**既知 blocker**: Stage A 実機検証で判明した Problem-2 (say タイムアウト→ReAct
+リトライループ + TTS ハング、いずれも既存バグ) は別タスクで対処予定。inner_voice は
+say の前に system prompt へ注入・ログされるため、Stage B prompt 検証は TTS 完了と
+無関係に app.log grep で可能。
+
 ### Phase X Stage A (2026-05-31): auto_desire 解放 + 個別 drive 無効化フラグ
 
 **目的**: 視覚自走 (Phase X) の最小 viable。既存の desire 自走モデル

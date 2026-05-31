@@ -47,6 +47,7 @@
   "desire_default": "ちょっと気になることがあって…",
   "inner_voice_label": "[今の気持ち — 一緒に暮らす人の発言ではなく、自分自身の内的衝動]",
   "inner_voice_directive": "→ これは自分の内的衝動。返事は不要。衝動に従って行動するだけでいい。",
+  "inner_voice_visual_change": "気になる事はありましたか？現在の状況を判断し、見えたものは無視しても構いません。",
   "desire_turn_marker": "（内的衝動に従って行動）",
   "summary_lang": "日本語",
   "curiosity_none": "なし",

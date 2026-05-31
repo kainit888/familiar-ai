@@ -48,6 +48,21 @@ def test_non_person_appeared_does_not_boost_greet(tmp_path) -> None:
     assert desires.level("greet_companion") < TRIGGER_THRESHOLD
 
 
+def test_person_appeared_arms_visual_change_prompt(tmp_path, monkeypatch) -> None:
+    # Phase X Stage B: a person-appeared scene event arms the visual-change
+    # inner_voice prompt for the resulting (greet_companion) desire turn.
+    monkeypatch.setattr("familiar_agent._i18n._LANG", "ja")
+    desires = _desires(tmp_path)
+    events = [{"event_type": "appeared", "entity_label": "person", "entity_id": None}]
+
+    _react(events, desires)
+
+    dominant = desires.get_dominant()
+    assert dominant is not None and dominant[0] == "greet_companion"
+    prompt = desires.dominant_as_prompt()
+    assert prompt is not None and "見えたものは無視しても構いません" in prompt
+
+
 def test_object_appeared_does_not_boost_greet(tmp_path) -> None:
     desires = _desires(tmp_path)
     events = [{"event_type": "appeared", "entity_label": "laptop", "entity_id": None}]

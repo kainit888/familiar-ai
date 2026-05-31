@@ -47,6 +47,7 @@
   "desire_default": "something caught my attention…",
   "inner_voice_label": "[My current feeling — my own inner impulse, not a message from the person I live with]",
   "inner_voice_directive": "→ This is an internal drive. No need to respond to anyone — just act on the impulse.",
+  "inner_voice_visual_change": "Was there anything that caught your attention? Read the current situation; you may ignore what you saw if you wish.",
   "desire_turn_marker": "(acting on internal impulse)",
   "summary_lang": "English",
   "curiosity_none": "none",

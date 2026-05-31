@@ -117,6 +117,12 @@ def detect_worry_signal(text: str) -> float:
 TRIGGER_THRESHOLD = 0.6
 DECAY_ON_SATISFY = 0.5  # drop hard so it can rebuild and fire again
 
+# Phase X Stage B: a drive boosted by a *visual/scene change* arms a dedicated
+# inner_voice prompt for the next desire turn. The mark is consumed once (popped)
+# and only honored if fresher than this TTL, so a stale scene event never frames
+# an unrelated later turn.
+VISUAL_CHANGE_TTL_SECONDS = 30.0
+
 
 def _parse_disabled_drives(raw: str) -> frozenset[str]:
     """Parse FAMILIAR_DISABLED_DRIVES (comma list) into a normalized name set.
@@ -166,6 +172,9 @@ class DesireSystem:
             )
         self._drive_config_path = drive_config_path
         self._last_fired: dict[str, float] = {}
+        # Phase X Stage B: drive name → time.time() when last boosted by a
+        # visual/scene change. Consumed once by dominant_as_prompt().
+        self._visual_change_armed_at: dict[str, float] = {}
         self._schedule_multiplier = 1.0
         self._social_permission = 1.0
         self._energy_budget = 1.0
@@ -419,13 +428,36 @@ class DesireSystem:
         """Return the current level of a desire (0.0–1.0)."""
         return self._desires.get(desire_name, 0.0)
 
-    def boost(self, desire_name: str, amount: float = 0.2) -> None:
-        """Boost a desire (e.g., dopamine response to novelty)."""
+    def boost(self, desire_name: str, amount: float = 0.2, *, visual: bool = False) -> None:
+        """Boost a desire (e.g., dopamine response to novelty).
+
+        visual=True marks the boost as originating from a visual/scene change
+        (Phase X Stage B), arming the visual-change inner_voice prompt for the
+        next desire turn. Disabled drives (Stage A) neither accumulate nor arm.
+        """
         if desire_name.lower() in self._disabled_drives:
             return  # Phase X Stage A: disabled drives never accumulate.
         current = self._desires.get(desire_name, 0.0)
         self._desires[desire_name] = min(1.0, current + amount)
+        if visual:
+            self._visual_change_armed_at[desire_name.lower()] = time.time()
         self._save()
+
+    def _check_visual_change(self, name: str, *, consume: bool) -> bool:
+        """Was `name` recently boosted by a visual change (within TTL)?
+
+        consume=True pops the mark (one-shot) so it frames exactly one turn;
+        popping even a stale mark keeps it from misleading a later turn.
+        consume=False peeks without removing — used by as_coalition() so the
+        workspace-context path does not steal the one-shot mark before the
+        inner_voice path (desire_tick_prompt) consumes it.
+        """
+        key = name.lower()
+        if consume:
+            armed = self._visual_change_armed_at.pop(key, None)
+        else:
+            armed = self._visual_change_armed_at.get(key)
+        return armed is not None and (time.time() - armed) <= VISUAL_CHANGE_TTL_SECONDS
 
     def update_context(
         self,
@@ -482,12 +514,23 @@ class DesireSystem:
             return None
         return max(candidates, key=lambda x: x[1])
 
-    def dominant_as_prompt(self) -> str | None:
-        """Return a natural-language prompt for the dominant desire, if any."""
+    def dominant_as_prompt(self, *, consume_visual: bool = True) -> str | None:
+        """Return a natural-language prompt for the dominant desire, if any.
+
+        consume_visual=False peeks the visual-change mark instead of consuming
+        it (used by as_coalition so it does not steal the one-shot mark from the
+        inner_voice path).
+        """
         result = self.get_dominant()
         if result is None:
             return None
         name, _ = result
+
+        # Phase X Stage B: if this drive was just boosted by a visual/scene
+        # change, frame the turn with the dedicated prompt (which explicitly
+        # permits silence). Replaces the drive's generic prompt.
+        if self._check_visual_change(name, consume=consume_visual):
+            return _t("inner_voice_visual_change")
 
         # If there's a curiosity target, use it for look_around/explore
         if name in ("look_around", "explore") and self.curiosity_target:
@@ -507,7 +550,9 @@ class DesireSystem:
         if result is None:
             return None
         name, level = result
-        prompt = self.dominant_as_prompt() or name
+        # Peek (don't consume) the visual mark: the one-shot belongs to the
+        # inner_voice path (desire_tick_prompt), not the workspace-context path.
+        prompt = self.dominant_as_prompt(consume_visual=False) or name
         urgency_map = {
             "worry_companion": 0.9,
             "repair": 0.9,
