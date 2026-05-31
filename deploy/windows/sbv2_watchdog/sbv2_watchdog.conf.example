@@ -1,0 +1,32 @@
+# SBV2 watchdog config — copy to sbv2_watchdog.conf and edit for the main PC.
+# Format: KEY=VALUE (one per line, # starts a comment). Environment variables of
+# the same name override these at runtime.
+
+# How often to probe /voice (seconds).
+WATCHDOG_INTERVAL_SEC=300
+
+# How long to wait for a /voice response before calling it a timeout (seconds).
+WATCHDOG_TIMEOUT_SEC=30
+
+# The health-probe URL. A tiny "ping" utterance keeps the probe cheap.
+WATCHDOG_TARGET_URL=http://localhost:5000/voice?text=ping&model_name=jvnv-F1-jp&speaker_id=0&style_weight=0.0
+
+# TCP port SBV2 listens on — used to kill the hung process before relaunch.
+WATCHDOG_PORT=5000
+
+# *** REQUIRED: set this to your real SBV2 launcher (.bat / .exe) ***
+# The watchdog kills whatever listens on WATCHDOG_PORT, then runs this to relaunch.
+WATCHDOG_RESTART_CMD=D:\Pico\StyleBertVITS2\start_sbv2.bat
+
+# Seconds to wait after launch before the first post-restart probe (model load).
+WATCHDOG_MODEL_LOAD_WAIT_SEC=90
+
+# Post-restart probe budget: retries polls, 10s apart, each with this timeout.
+WATCHDOG_POST_RESTART_PROBE_TIMEOUT_SEC=30
+WATCHDOG_POST_RESTART_PROBE_RETRIES=6
+
+# After this many consecutive failed recoveries, log an ERROR-level ALERT.
+WATCHDOG_RESTART_MAX=3
+
+# Where to append the watchdog log.
+WATCHDOG_LOG_PATH=D:\Pico\sbv2_watchdog.log
