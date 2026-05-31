@@ -113,6 +113,19 @@ class TTSConfig:
     # "both" = camera speaker + PC speaker simultaneously.
     output: str = field(default_factory=lambda: os.environ.get("TTS_OUTPUT", "local"))
 
+    def has_voice_output(self) -> bool:
+        """True if a voice-output path is configured (gates `say` tool registration).
+
+        pico_v3 fork: ``TTSTool.say()`` is hardwired to route through
+        ``pico_agent.adapters.tts_sbv2`` → go2rtc HTTP API → Tapo C210, so a
+        configured ``go2rtc_url`` is sufficient to give the agent a voice even
+        with no ElevenLabs key. ``elevenlabs_api_key`` is kept as an alternate
+        trigger so the backend-agnostic upstream path still registers ``say``.
+        Note: ``go2rtc_url`` defaults to ``http://localhost:1984`` (non-empty),
+        so in practice ``say`` registers unless ``GO2RTC_URL`` is set empty.
+        """
+        return bool(self.elevenlabs_api_key or self.go2rtc_url)
+
 
 @dataclass
 class MemoryConfig:

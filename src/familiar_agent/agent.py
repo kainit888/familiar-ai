@@ -1170,7 +1170,7 @@ class EmbodiedAgent:
             )
 
         tts = self.config.tts
-        if tts.elevenlabs_api_key:
+        if tts.has_voice_output():
             self._tts = TTSTool(
                 tts.elevenlabs_api_key,
                 tts.voice_id,

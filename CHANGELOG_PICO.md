@@ -9,6 +9,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### say 登録ゲートを独自 TTS 設定へ切替 (2026-05-31, Phase X 前段)
+
+**背景**: `TTSTool.say()` は Phase C-1/C-5 で既に `pico_agent.adapters.tts_sbv2`
+→ go2rtc → Tapo C210 経路に固定されており、ElevenLabs は dead code
+(`self.api_key` 未使用)。にもかかわらず say ツールの**登録**条件は
+`agent.py` `__init__` の `if tts.elevenlabs_api_key:` のままで、ElevenLabs
+キーが無いと say がツール定義に現れなかった。Phase X(自発発話)で
+`.env` から `ELEVENLABS_API_KEY` を外しても声を保てるよう、ゲートを
+独自 TTS 経路 (go2rtc) の有無へ切り替える。
+
+**修正**:
+- `config.TTSConfig` に `has_voice_output() -> bool` を追加。
+  `bool(self.elevenlabs_api_key or self.go2rtc_url)` を返す。go2rtc_url は
+  既定 `http://localhost:1984` で非空のため、実質 say は常に登録される
+  (`GO2RTC_URL=""` を明示した場合のみ無効)。ElevenLabs キーは upstream
+  (backend-agnostic) 互換のため OR の片側として維持。
+- `agent.py` の登録条件を `if tts.elevenlabs_api_key:` →
+  `if tts.has_voice_output():` へ変更。`TTSTool` の引数は不変
+  (`tts.elevenlabs_api_key` は STT/voice_id 等と共に渡すが say では未使用)。
+- テスト `tests/test_tts_config_gate.py` 7 件追加 (ゲートマトリクス +
+  ElevenLabs キー無し + go2rtc ありで登録される確認、mutation 対応明記)。
+  pytest 1473 → 1480 緑。
+
+**二層分離に関する注記**: 本変更は例外的に `familiar_agent`
+(`config.py` + `agent.py`) に触れる。say 登録ゲートは agent の `__init__`
+配線そのもので pico_agent 側にフックが無く、回避不能。ただし追加した
+`has_voice_output()` は backend-agnostic な述語であり pico 固有ロジックの
+流入ではなく、OR 追加の additive 変更で上流マージ性も維持。
+
+**注記**: `ELEVENLABS_API_KEY` は STT (Scribe v2 Realtime, `STTConfig`) では
+引き続き利用される。本変更は say **登録**ゲートのみに影響し、STT や実音声
+経路 (go2rtc→Tapo) は不変。
+
 ### Phase C-13a (2026-05-31): 幻聴 denylist 追加 + allowlist 見直し
 
 **原因**: C-13 (commit 1717a12) のフィルタ実装後、実機運用 (2026-05-31 11:21
