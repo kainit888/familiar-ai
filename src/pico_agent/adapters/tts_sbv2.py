@@ -75,7 +75,13 @@ Target: TypeAlias = Literal["tapo_speaker", "discord_vc", "obs_audio"]
 
 # ── 設定 (環境変数で上書き可能、ハードコード禁止) ────────────────────────────
 _DEFAULT_BASE_URL = "http://192.168.10.104:5000"
-_DEFAULT_TIMEOUT_SEC = 60.0
+# Problem-2 fix (2026-05-31): SBV2 hung for ~60s with no response, blocking
+# autonomous speech. Fast-fail well inside the agent's say tool budget. A warm
+# SBV2 answers a short utterance in <1s; the watchdog handles cold restarts, so a
+# request taking >15s means the server is hung — which we want to abandon quickly.
+_DEFAULT_TIMEOUT_SEC = 15.0
+_DEFAULT_CONNECT_TIMEOUT_SEC = 5.0
+_DEFAULT_READ_TIMEOUT_SEC = 10.0
 _DEFAULT_GO2RTC_BASE_URL = "http://192.168.10.104:1984"
 _DEFAULT_TAPO_STREAM_NAME = "tapo_c210"
 _DEFAULT_TTS_MODEL_NAME = "jvnv-F1-jp"
@@ -123,12 +129,43 @@ def _get_base_url() -> str:
 
 
 def _get_timeout() -> float:
-    """環境変数 TTS_TIMEOUT_SEC で HTTP timeout 秒数を取得。"""
+    """環境変数 TTS_TIMEOUT_SEC で HTTP 全体 timeout 秒数を取得。"""
     raw = os.environ.get("TTS_TIMEOUT_SEC", "")
     try:
         return float(raw) if raw else _DEFAULT_TIMEOUT_SEC
     except ValueError:
         return _DEFAULT_TIMEOUT_SEC
+
+
+def _get_connect_timeout() -> float:
+    """環境変数 TTS_CONNECT_TIMEOUT_SEC で接続確立 timeout 秒数を取得。"""
+    raw = os.environ.get("TTS_CONNECT_TIMEOUT_SEC", "")
+    try:
+        return float(raw) if raw else _DEFAULT_CONNECT_TIMEOUT_SEC
+    except ValueError:
+        return _DEFAULT_CONNECT_TIMEOUT_SEC
+
+
+def _get_read_timeout() -> float:
+    """環境変数 TTS_READ_TIMEOUT_SEC でソケット読み取り timeout 秒数を取得。"""
+    raw = os.environ.get("TTS_READ_TIMEOUT_SEC", "")
+    try:
+        return float(raw) if raw else _DEFAULT_READ_TIMEOUT_SEC
+    except ValueError:
+        return _DEFAULT_READ_TIMEOUT_SEC
+
+
+def _build_sbv2_timeout() -> aiohttp.ClientTimeout:
+    """SBV2 /voice 用の構造化 timeout。
+
+    connect (接続確立) と sock_read (チャンク間の無受信) を個別に締めることで、
+    サーバがハングしても total を待たずに ~connect/~sock_read 秒で fast-fail する。
+    """
+    return aiohttp.ClientTimeout(
+        total=_get_timeout(),
+        connect=_get_connect_timeout(),
+        sock_read=_get_read_timeout(),
+    )
 
 
 def _get_go2rtc_base_url() -> str:
@@ -343,6 +380,18 @@ async def _fetch_one_chunk(session: aiohttp.ClientSession, chunk: str, query_suf
                 )
                 return b""
             return await resp.read()
+    except asyncio.TimeoutError:
+        logger.warning(
+            "tts_sbv2: SBV2 timeout after {}s, returning empty wav (chunk={!r})",
+            _get_timeout(),
+            chunk[:40],
+        )
+        return b""
+    except aiohttp.ClientConnectorError as e:
+        logger.warning(
+            "tts_sbv2: SBV2 connection refused ({}), returning empty wav", e
+        )
+        return b""
     except Exception as e:
         logger.warning("tts_sbv2: request failed for chunk={!r}: {}", chunk[:40], e)
         return b""
@@ -374,7 +423,7 @@ async def _warmup_once() -> None:
         # フラグは立てない
 
     query = _build_query(_WARMUP_TEXT, speaker_id=0, emotion=None)
-    timeout = aiohttp.ClientTimeout(total=_get_timeout())
+    timeout = _build_sbv2_timeout()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             wav = await _fetch_one_chunk(session, _WARMUP_TEXT, query)
@@ -428,7 +477,7 @@ async def _fetch_wav_parts(
         speaker_id,
     )
 
-    timeout = aiohttp.ClientTimeout(total=_get_timeout())
+    timeout = _build_sbv2_timeout()
     parts: list[bytes] = []
     chunk_delay_ms = _get_chunk_delay_ms()
     try:

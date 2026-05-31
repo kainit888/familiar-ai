@@ -9,6 +9,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase X Problem-2 修正 A (2026-05-31): SBV2 speak fast-fail
+
+**背景**: Stage A 実機で「同一発話3連発」発生。原因は (A) `tts_sbv2.speak()` が
+SBV2 ハング時 ~60s 無応答 → agent の 60s say ツール timeout → (B) LLM が同一 say を
+blind retry。本コミットは A (TTS 層 fast-fail)。B (retry 抑止) は別コミット。
+
+**修正** (`pico_agent/adapters/tts_sbv2.py`、pico_agent 完結):
+- `_DEFAULT_TIMEOUT_SEC` 60→15。新 `_build_sbv2_timeout()` =
+  `ClientTimeout(total=15, connect=5, sock_read=10)` を SBV2 `/voice` fetch
+  (`_fetch_wav_parts`) と `_warmup_once` に適用。go2rtc POST は LAN なので plain total。
+  **構造化 timeout なので `TTS_TIMEOUT_SEC` が大きくても connect/read で fast-fail する**
+  (ハングは接続後の無受信 → sock_read=10s で諦める)。
+- 新 env `TTS_CONNECT_TIMEOUT_SEC`(既定5) / `TTS_READ_TIMEOUT_SEC`(既定10)。
+- `_fetch_one_chunk` に `except asyncio.TimeoutError` / `aiohttp.ClientConnectorError`
+  を追加し WARNING `SBV2 timeout after Xs, returning empty wav` / `connection refused`。
+  制御フロー不変 (空 parts → `speak()` は `EXIT sbv2_failed` で即 None)。
+- `.env.example` に新 knob 追記 (既定 15)。`.env` 本体はカイニット手動だが、構造化
+  timeout のため `TTS_TIMEOUT_SEC=60` のままでも fast-fail する。
+- テスト +6 (default 15 / 構造化 timeout 値 / connect・read env override /
+  speak timeout fast-fail / connection refused)。既存の 60.0 固定 assertion を 15.0 に更新。
+
 ### Phase X Stage B (2026-05-31): 視覚変化専用 inner_voice prompt
 
 **目的**: scene/視覚変化が起点の desire turn のときだけ、専用 inner_voice prompt

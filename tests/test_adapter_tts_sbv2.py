@@ -20,6 +20,7 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
 
+import aiohttp
 import pytest
 
 from pico_agent.adapters import tts_sbv2
@@ -192,6 +193,76 @@ async def test_speak_network_exception_returns_silently():
     ):
         result = await tts_sbv2.speak("hi", target="tapo_speaker")
     assert result is None
+
+
+# ── Problem-2: SBV2 fast-fail (timeout / refused) ──────────────────────────────
+
+
+def test_default_timeout_is_15s(monkeypatch):
+    # Problem-2: default lowered 60→15 so a hung SBV2 fails inside the say budget.
+    monkeypatch.delenv("TTS_TIMEOUT_SEC", raising=False)
+    assert tts_sbv2._DEFAULT_TIMEOUT_SEC == 15.0
+    assert tts_sbv2._get_timeout() == 15.0
+
+
+def test_build_sbv2_timeout_is_structured(monkeypatch):
+    for k in ("TTS_TIMEOUT_SEC", "TTS_CONNECT_TIMEOUT_SEC", "TTS_READ_TIMEOUT_SEC"):
+        monkeypatch.delenv(k, raising=False)
+    t = tts_sbv2._build_sbv2_timeout()
+    assert t.total == 15.0
+    assert t.connect == 5.0
+    assert t.sock_read == 10.0
+
+
+def _make_raising_get_session(exc):
+    """aiohttp.ClientSession mock whose GET context raises `exc` on enter."""
+    mock_resp = MagicMock()
+    mock_resp.__aenter__ = AsyncMock(side_effect=exc)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=mock_resp)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    return mock_session
+
+
+@pytest.mark.asyncio
+async def test_speak_sbv2_timeout_returns_silently(monkeypatch, tmp_path):
+    """SBV2 が応答せずタイムアウト → fast-fail で None、ffmpeg は呼ばれない。"""
+    pre_called: list = []
+
+    async def fake_concat(_src_paths, out_dir=None):
+        pre_called.append("called")
+        return None
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+    sess = _make_raising_get_session(asyncio.TimeoutError())
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=sess):
+        result = await tts_sbv2.speak("hello", target="tapo_speaker")
+    assert result is None
+    assert pre_called == []  # empty wav → never reaches ffmpeg concat
+
+
+@pytest.mark.asyncio
+async def test_speak_sbv2_connection_refused_returns_silently(monkeypatch, tmp_path):
+    """接続拒否 (ClientConnectorError) も fast-fail で None。"""
+    pre_called: list = []
+
+    async def fake_concat(_src_paths, out_dir=None):
+        pre_called.append("called")
+        return None
+
+    monkeypatch.setattr(
+        "pico_agent.adapters.tts_sbv2._concat_and_preprocess", fake_concat
+    )
+    refused = aiohttp.ClientConnectorError(MagicMock(), OSError(111, "refused"))
+    sess = _make_raising_get_session(refused)
+    with patch("pico_agent.adapters.tts_sbv2.aiohttp.ClientSession", return_value=sess):
+        result = await tts_sbv2.speak("hello", target="tapo_speaker")
+    assert result is None
+    assert pre_called == []
 
 
 @pytest.mark.asyncio
@@ -1265,7 +1336,11 @@ def test_valid_targets_constant():
         ("TTS_BASE_URL", "http://sbv2-test:5000", "_get_base_url", "http://sbv2-test:5000"),
         ("TTS_BASE_URL", "http://sbv2-test:5000/", "_get_base_url", "http://sbv2-test:5000"),
         ("TTS_TIMEOUT_SEC", "30.5", "_get_timeout", 30.5),
-        ("TTS_TIMEOUT_SEC", "not_a_number", "_get_timeout", 60.0),
+        ("TTS_TIMEOUT_SEC", "not_a_number", "_get_timeout", 15.0),  # Problem-2: default 60→15
+        ("TTS_CONNECT_TIMEOUT_SEC", "3", "_get_connect_timeout", 3.0),
+        ("TTS_CONNECT_TIMEOUT_SEC", "bad", "_get_connect_timeout", 5.0),
+        ("TTS_READ_TIMEOUT_SEC", "8", "_get_read_timeout", 8.0),
+        ("TTS_READ_TIMEOUT_SEC", "bad", "_get_read_timeout", 10.0),
         ("TTS_VOLUME", "0.7", "_get_tts_volume", 0.7),
         ("TTS_VOLUME", "bad", "_get_tts_volume", 0.5),
         ("TTS_PRE_RESAMPLE", "22050", "_get_tts_pre_resample", 22050),
