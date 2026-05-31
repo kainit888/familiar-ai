@@ -9,6 +9,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase X Stage C (2026-05-31): Tapo ONVIF event 受信層
+
+**目的**: Tapo C210 自身の motion/person 検知 (ONVIF event) を視覚自走の
+bottom-up trigger に使う。polling せず、「event ごとに喋れ」とも命令しない。
+
+**設計**: STT 常時購読と同型。新 `src/pico_agent/adapters/tapo_event.py` が
+ONVIF event を受信し `on_event(TapoEvent)` callback へ流す。**軽量方式 (D1)**:
+event → familiar_agent 側で `desires.boost("look_around", 0.25, visual=True)`
+(person は `greet_companion` も) → 次の idle desire tick で Stage B の視覚変化
+prompt が立ち、ピコが自分で see/判断 (同期 see/scene.update は呼ばない)。Tapo=
+知覚、desire=注意、LLM=判断 の三層分離。
+
+**実装** (`tapo_event.py`、pico_agent 完結・familiar_agent 非 import):
+- `start_event_subscription(on_event, *, host=None) -> asyncio.Task`。依存欠落 /
+  mode=disabled / webhook で host 未設定 なら no-op task (raise しない)。
+- `TapoEvent` dataclass (event_type / timestamp=Pi受信時刻 / topic / raw)。
+- モード (D2/D3、`TAPO_EVENT_MODE` 既定 **pullpoint=ON**):
+  - **pullpoint**: `create_pullpoint_manager`(TTL 自動更新) → `PullMessages` ループ。
+  - **webhook**: Pi 側 aiohttp サーバ + `create_notification_manager` で push 購読
+    (PullPoint が firmware で不動な C210 向けフォールバック)。`TAPO_EVENT_WEBHOOK_HOST` 必須。
+  - **disabled**: no-op。
+- `_classify(topic, simple_items)` 純関数 (person 優先、motion 立下りは無視)、
+  `_parse_soap_notifications` (webhook SOAP)、`_extract_*` (zeep 防御抽出)。
+- 30s debounce (`TAPO_EVENT_DEBOUNCE_SEC`)、person_only filter、reconnect backoff、
+  callback 例外を握って購読継続 (STT 同型)。
+- **TUI 配線** (`tui.py`、5 点 mirror STT): import / `_tapo_events_enabled_default` /
+  `__init__` task field / on_mount worker / `_on_tapo_event`+`_start`+`_stop` /
+  action_quit で cancel。`_on_tapo_event` が `desires.boost(visual=True)`。
+- env: `TAPO_EVENT_MODE`/`DEBOUNCE_SEC=30`/`PERSON_ONLY=false`/`BOOST_AMOUNT=0.25`/
+  webhook 用 `WEBHOOK_HOST`/`PORT`。CAMERA_* 既存再利用。`.env.example` 追記。
+- テスト +31 (`test_tapo_event.py` 22: classify/SOAP/debounce/emit/no-op/PullPoint mock、
+  `test_tui_tapo_event.py` 9: 配線/boost visual=True/disabled ゲート)。1508 → 1539 緑。
+
+**実機検証 (Stage D) 必須** (unit test は ONVIF を mock で回避):
+- C210 が PullPoint を実確立し message 配信するか (firmware 依存、不可なら webhook)
+- 実際の ONVIF Topic 文字列 / person event 対応有無 (`TapoEvent.topic` から採取)
+- 誤発火頻度 → DEBOUNCE / PERSON_ONLY / BOOST_AMOUNT で調整
+
 ### Phase X Problem-2 修正 B (2026-05-31): say blind-retry 抑止
 
 **修正** (`familiar_agent/agent.py` ReAct ループ、agent.py 完結):

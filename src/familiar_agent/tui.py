@@ -34,7 +34,7 @@ from .realtime_stt_session import create_realtime_stt_controller, RealtimeSttCon
 # pico_v3 拡張 (Phase C-Ctrl+T 常時化): Tapo RTSP 音声トラックを Kotoba-Whisper で
 # 常時購読する STT (Phase C-4 実装済 start_rtsp_subscription) を UI 層から配線する。
 # realtime_stt_session と同型 (UI 責務の STT wiring)。一方向 import (familiar_agent→pico_agent)。
-from pico_agent.adapters import stt_kotoba
+from pico_agent.adapters import stt_kotoba, tapo_event
 
 if TYPE_CHECKING:
     from .agent import EmbodiedAgent
@@ -113,6 +113,17 @@ def _continuous_stt_enabled_default() -> bool:
     if raw in ("false", "0", "no", "off"):
         return False
     return True
+
+
+def _tapo_events_enabled_default() -> bool:
+    """Tapo ONVIF イベント購読の ON/OFF を ``TAPO_EVENT_MODE`` から導出 (既定 ON)。
+
+    Phase X Stage C: ``disabled`` のときだけ False。``pullpoint``/``webhook`` (および
+    未設定=既定 pullpoint) は True。実購読は tapo_event 側で mode を再判定するため、
+    ここは「worker を起こすか」だけのゲート (no-op task も安全)。
+    """
+    mode = os.environ.get("TAPO_EVENT_MODE", "pullpoint").strip().lower() or "pullpoint"
+    return mode != "disabled"
 
 
 # Slash commands shown in the autocomplete dropdown
@@ -213,6 +224,9 @@ class FamiliarApp(App):
         # CONTINUOUS_STT (既定 ON) が真なら on_mount で起動し、Ctrl+T で一時停止/再開する。
         self._continuous_stt_task: asyncio.Task | None = None
         self._continuous_stt_enabled: bool = _continuous_stt_enabled_default()
+        # Phase X Stage C: Tapo ONVIF event 購読 (motion/person → desire boost)。
+        self._tapo_event_task: asyncio.Task | None = None
+        self._tapo_events_enabled: bool = _tapo_events_enabled_default()
 
     def _open_log_file(self) -> Path:
         log_dir = Path.home() / ".cache" / "familiar-ai"
@@ -278,6 +292,10 @@ class FamiliarApp(App):
         # 返るため安全 (stt_kotoba.start_rtsp_subscription の仕様)。
         if self._continuous_stt_enabled:
             self.run_worker(self._start_continuous_stt(), exclusive=False)
+        # Phase X Stage C: Tapo event 購読 (既定 ON、mode=disabled で OFF)。no-op task
+        # が返るため依存未満でも安全。
+        if self._tapo_events_enabled:
+            self.run_worker(self._start_tapo_events(), exclusive=False)
         # Show initializing status until embedding model is ready
         if not self.agent.is_embedding_ready:
             asyncio.create_task(self._embedding_ready_watcher())
@@ -664,6 +682,58 @@ class FamiliarApp(App):
         except (asyncio.CancelledError, Exception):
             pass
 
+    async def _on_tapo_event(self, evt: "tapo_event.TapoEvent") -> None:
+        """Tapo ONVIF イベント callback — desire を boost する (Phase X Stage C)。
+
+        二層境界の familiar_agent 側。軽量方式: イベントは「何か動いた」の nudge で、
+        ``look_around`` (person なら ``greet_companion`` も) を visual=True で boost する。
+        次の idle desire tick で Stage B の視覚変化 prompt が立ち、ピコ自身が see/判断する。
+        同期 see()/scene は呼ばない。無効 drive への boost は Stage A で no-op。
+        """
+        try:
+            amount = self._tapo_boost_amount()
+            if evt.event_type == "person":
+                self.desires.boost("greet_companion", amount, visual=True)
+            self.desires.boost("look_around", amount, visual=True)
+            self._write_log(f"[dim]\U0001f441 {evt.event_type} detected (Tapo)[/dim]")
+        except Exception as e:
+            logger.warning("Tapo event handling failed: %s", e)
+
+    @staticmethod
+    def _tapo_boost_amount() -> float:
+        raw = os.environ.get("TAPO_EVENT_BOOST_AMOUNT", "")
+        try:
+            return float(raw) if raw else 0.25
+        except ValueError:
+            return 0.25
+
+    async def _start_tapo_events(self) -> None:
+        """Tapo ONVIF event 購読を起動し task を保持する (依存未満は no-op task)。"""
+        if not self._tapo_events_enabled:
+            return
+        if self._tapo_event_task is not None and not self._tapo_event_task.done():
+            return  # 二重起動防止
+        try:
+            self._tapo_event_task = await tapo_event.start_event_subscription(
+                on_event=self._on_tapo_event
+            )
+            self._log_system("\U0001f441 Tapo events ON (ONVIF motion/person)")
+        except Exception as e:
+            logger.warning("Tapo events start failed: %s", e)
+            self._tapo_event_task = None
+
+    async def _stop_tapo_events(self) -> None:
+        """Tapo event 購読 task を cancel して停止する。"""
+        task = self._tapo_event_task
+        self._tapo_event_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     async def action_restart_realtime_stt(self) -> None:
         """Reconnect realtime STT after a loop or transient transport issue."""
         if not self._realtime_stt:
@@ -787,6 +857,11 @@ class FamiliarApp(App):
             # pico_v3: 常時 RTSP STT task を停止 (cancel)。
             try:
                 await asyncio.wait_for(self._stop_continuous_stt(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            # pico_v3 Stage C: Tapo event task を停止 (cancel)。
+            try:
+                await asyncio.wait_for(self._stop_tapo_events(), timeout=2.0)
             except (asyncio.TimeoutError, Exception):
                 pass
             try:
