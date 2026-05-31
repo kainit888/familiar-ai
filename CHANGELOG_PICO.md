@@ -9,6 +9,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase C-13 (2026-05-31): Whisper STT 幻聴フィルタ (Pi5 テキスト層)
+
+**原因**: Kotoba-Whisper (Whisper Large 系) は無音/環境ノイズを入力されると、
+学習データ (動画字幕) に頻出する定型句を高確信度で出力する hallucination を
+起こす。実機 (2026-05-31 朝、無音放置) で「ありがとうございました」(len=11、
+09:45 周辺で 5 回以上連続) / 「ごめん」(len=3) が頻発し、ピコが
+「どういたしまして」と誤応答する事象を確認。VAD 強化 (`STT_VAD_NOISE_DB=-40dB`
+/ `STT_VAD_MIN_SEGMENT_SEC=1.0`) でも頻度は十分下がらず。
+
+**修正**: `on_speech()` コールバックへ届く **前** にテキストレベルで silent-drop
+する二段目防御を追加。
+
+- 新モジュール `src/pico_agent/stt_hallucination_filter.py`、純関数
+  `is_whisper_hallucination(text) -> bool` (True=破棄)。
+  - denylist ~18 句 (実機観測「ありがとうございました」「ごめん」+ 動画アウトロ
+    定型句「ご視聴ありがとうございました」「チャンネル登録お願いします」等 +
+    英語「Thanks for watching」)。
+  - allowlist (完全一致のみ、denylist より優先): 「ありがとう」「はい」「うん」
+    「ええ」「OK」等。「ありがとう」は denylist「ありがとうございました」と
+    衝突しても通過する。
+  - 正規化: NFKC + 句読点/空白除去 + casefold (全半角・英大小・記号ゆれ吸収)。
+  - 判定順: トグル → allowlist 完全一致 → 単一文字 drop → denylist 完全一致 →
+    短文 (5〜15 字) の **先頭一致 (prefix)** または **署名長 (≥6 字) フレーズ包含**。
+    **末尾一致 (suffix) は不採用** (「〜ありがとうございました」で終わる丁寧な実発話の
+    誤 drop を避ける)。prefix は逆にアウトロ断片 (「次の動画で」「ありがとう…」) を
+    捕捉する低リスク signal で、副次効果として「ありがとう」が prefix catch 対象に
+    なり allowlist が load-bearing になる。包含を署名長フレーズに限ることで短 token
+    (「ごめん」) による「あ、ごめんね」等の実発話誤 drop を防ぐ。
+- 統合: `stt_kotoba._emit_segment()` の `if not text: return` 直後でチェックし、
+  幻聴は `logger.debug("stt_kotoba: dropped hallucination ...")` のみで silent-drop。
+  通常テキストは現状どおり `on_speech()` へ。
+- 環境変数 `STT_HALLUCINATION_FILTER` (既定 ON、`false`/`0`/`no`/`off` で無効化)。
+  `.env.example` に追記。
+- **二層分離**: `pico_agent` 完結 (`familiar_agent` 0 行)。`response_filter` /
+  `self_model_filter` と同型 (deps = os/re/unicodedata/loguru)。
+- echo 検出 (ステートフル) と INFO drop カウンタは複雑度/純関数性のため見送り
+  (将来誤 drop が顕在化したら `WhisperHallucinationFilter` クラスを拡張点に)。
+- テスト 16 件 (18 ケース) 追加 (denylist/allowlist/prefix/単一文字/統合/トグル、
+  mutation 対応明記)。pytest 1451 → 1469 緑、regression なし。
+- 範囲外: `whisper_server.py` の `no_speech_prob` フィルタ (別ワーカ担当)、
+  VAD しきい値調整 (.env で対症済)、Whisper モデル変更。
+
 ### Fixed (2026-05-31): STT 常時 ON が ffmpeg 7.x で即終了する不具合
 
 - `stt_kotoba._build_ffmpeg_rtsp_cmd()` の `-stimeout 5000000` を `-timeout 5000000`

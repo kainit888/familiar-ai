@@ -58,6 +58,8 @@ from urllib.parse import quote
 import aiohttp
 from loguru import logger
 
+from pico_agent.stt_hallucination_filter import is_whisper_hallucination
+
 # Phase C-5.5 調査用: 標準 logging を loguru と並行発行 (familiar_agent/main.py の
 # setup_logging が loguru sink を設定していないため、loguru 出力が app.log に
 # 届かない疑い。実機ログで切り分けるための一時マーカー)。
@@ -487,6 +489,11 @@ async def _emit_segment(
         logger.warning("stt_kotoba.subscription: transcribe failed: {}", e)
         return
     if not text:
+        return
+    if is_whisper_hallucination(text):
+        logger.debug(
+            "stt_kotoba: dropped hallucination text={!r} len={}", text, len(text)
+        )
         return
     try:
         await on_speech(text)
