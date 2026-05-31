@@ -9,6 +9,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Fixed (2026-05-31): STT 常時 ON が ffmpeg 7.x で即終了する不具合
+
+- `stt_kotoba._build_ffmpeg_rtsp_cmd()` の `-stimeout 5000000` を `-timeout 5000000`
+  へ置換。`-stimeout` は ffmpeg 5.0 で削除済 (RTSP demuxer の旧オプション) で、
+  Pi5 の ffmpeg 7.1.3 では "Unrecognized option 'stimeout'" で即終了し、Phase C-11+
+  で配線した STT 常時 ON が完全に動作していなかった (ffmpeg が 150ms で ended し
+  5 秒間隔で再起動ループ)。`-timeout` は同義の置換で TCP I/O timeout 5 秒を維持。
+
 ### Phase C-8.1 (2026-05-26): TTS 配信 WAV 削除レース修正 (動的 delete delay)
 
 **原因**: `tts_sbv2.speak()` の finally は配信 WAV を固定 30s 後に削除していた

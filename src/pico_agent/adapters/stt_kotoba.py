@@ -373,7 +373,12 @@ def _build_ffmpeg_rtsp_cmd(
     Phase C-4 確定:
         - ``-loglevel info`` 必須 (warning だと silencedetect 出力が出ない)
         - ``-rtsp_transport tcp`` で UDP より安定
-        - ``-stimeout 5000000`` (μs) で TCP timeout 5 秒
+        - ``-timeout 5000000`` (μs) で RTSP demuxer の socket TCP I/O timeout 5 秒
+
+    Note:
+        旧 ``-stimeout`` は ffmpeg 5.0 で削除された (RTSP demuxer の旧オプション)。
+        ffmpeg 7.x では ``-timeout`` が同義の置き換え。`-stimeout` を渡すと
+        "Unrecognized option 'stimeout'" で即終了する (Pi5 ffmpeg 7.1.3 で実証)。
     """
     return [
         "ffmpeg",
@@ -382,7 +387,7 @@ def _build_ffmpeg_rtsp_cmd(
         "info",
         "-rtsp_transport",
         "tcp",
-        "-stimeout",
+        "-timeout",
         "5000000",
         "-i",
         rtsp_url,

@@ -723,6 +723,23 @@ def test_build_ffmpeg_rtsp_cmd_uses_tcp_transport():
     assert cmd[idx + 1] == "tcp"
 
 
+def test_build_ffmpeg_rtsp_cmd_does_not_use_removed_stimeout():
+    """-stimeout は ffmpeg 5.0 で削除済み、残骸があると即終了する。"""
+    cmd = stt_kotoba._build_ffmpeg_rtsp_cmd(
+        "rtsp://x", noise_db="-30dB", min_silence_sec=0.5
+    )
+    assert "-stimeout" not in cmd
+
+
+def test_build_ffmpeg_rtsp_cmd_uses_timeout_5s():
+    """-timeout 5000000 (μs = 5 秒) が含まれる (ffmpeg 7.x の RTSP demuxer 用)。"""
+    cmd = stt_kotoba._build_ffmpeg_rtsp_cmd(
+        "rtsp://x", noise_db="-30dB", min_silence_sec=0.5
+    )
+    idx = cmd.index("-timeout")
+    assert cmd[idx + 1] == "5000000"
+
+
 # _parse_silencedetect_line ──────────────────────────
 
 
