@@ -9,6 +9,12 @@ from pathlib import Path
 import time
 from typing import Protocol
 
+from .emotion.body_temp import (
+    read_cpu_temp_celsius,
+    temp_body_stress_delta,
+    temp_category,
+    temp_prompt_label,
+)
 from .mental_state import InteroceptiveSignal
 
 
@@ -69,6 +75,9 @@ class RuntimeInteroceptionProvider:
         if self._turn_count > 12:
             energy -= 0.08
         body_stress = _clamp01(cognitive_load * 0.7 + (0.15 if quiet else 0.0))
+        # Phase E: CPU temperature contributes to body_stress + a prompt label.
+        category = temp_category(read_cpu_temp_celsius())
+        body_stress = _clamp01(body_stress + temp_body_stress_delta(category))
         social_openness = _clamp01(0.58 - (0.18 if quiet else 0.0) - body_stress * 0.25)
         return InteroceptiveSignal(
             provider="runtime",
@@ -79,6 +88,7 @@ class RuntimeInteroceptionProvider:
             cognitive_load=cognitive_load,
             body_stress=body_stress,
             social_openness=social_openness,
+            temp_label=temp_prompt_label(category),
             raw_metrics={
                 "uptime_minutes": uptime_minutes,
                 "pending_tasks": float(self._pending_tasks),

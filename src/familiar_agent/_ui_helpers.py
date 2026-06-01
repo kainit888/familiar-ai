@@ -15,6 +15,7 @@ import os
 from typing import TYPE_CHECKING
 
 from ._i18n import _t
+from .emotion.boredom import boredom_heartbeat_should_fire
 
 if TYPE_CHECKING:
     from .desires import DesireSystem
@@ -225,6 +226,33 @@ def _format_tom_result(result: str) -> str | None:
 
 IDLE_CHECK_INTERVAL: float = 10.0  # seconds between desire checks when idle
 DESIRE_COOLDOWN: float = float(os.environ.get("DESIRE_COOLDOWN", "90"))  # configurable
+
+# Phase E: heartbeat kill-switch (also gated on FAMILIAR_AUTO_DESIRE upstream).
+HEARTBEAT_ENABLED: bool = os.environ.get("HEARTBEAT_ENABLED", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+
+def heartbeat_tick_prompt(
+    boredom_value: float,
+    last_interaction: float,
+    now: float,
+    *,
+    enabled: bool = HEARTBEAT_ENABLED,
+) -> str | None:
+    """Return the heartbeat inner-voice prompt if boredom should fire, else None.
+
+    Phase E: when boredom is high AND the companion has been idle long enough,
+    Pico reaches out (Tapo speaker). The prompt explicitly permits silence.
+    """
+    if not enabled:
+        return None
+    if not boredom_heartbeat_should_fire(boredom_value, last_interaction, now):
+        return None
+    return _t("heartbeat_prompt")
 
 
 def should_fire_idle_desire(

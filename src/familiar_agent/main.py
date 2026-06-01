@@ -22,8 +22,11 @@ from ._ui_helpers import (
     IDLE_CHECK_INTERVAL,
     desire_tick_prompt,
     format_action as _format_action,
+    heartbeat_tick_prompt,
     should_fire_idle_desire,
 )
+from .emotion.boredom import Boredom
+from .emotion.last_interaction import LastInteraction
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -99,7 +102,11 @@ async def repl(agent: EmbodiedAgent, desires: DesireSystem, debug: bool = False)
     # Persistent input queue — stdin reader runs as a background task
     # so user input is captured even while the agent is busy.
     input_queue: asyncio.Queue[str | None] = asyncio.Queue()
-    last_interaction_time: float = time.time()
+    # Phase E: boredom + persisted last-interaction (heartbeat).
+    boredom = Boredom()
+    li_store = LastInteraction()
+    _restored_li = li_store.load()
+    last_interaction_time: float = _restored_li if _restored_li is not None else time.time()
 
     async def _stdin_reader() -> None:
         """Read stdin continuously into the queue."""
@@ -148,6 +155,8 @@ async def repl(agent: EmbodiedAgent, desires: DesireSystem, debug: bool = False)
                 # Process all buffered user messages before doing anything autonomous
                 for user_input in pending:
                     last_interaction_time = time.time()
+                    boredom.decay(now=last_interaction_time)
+                    li_store.update("chat", now=last_interaction_time)
                     await _handle_user(
                         user_input, agent, desires, on_action, on_text, debug, input_queue
                     )
@@ -166,6 +175,25 @@ async def repl(agent: EmbodiedAgent, desires: DesireSystem, debug: bool = False)
             if queued_input is None and input_queue.empty():
                 # Skip desire-driven turns when auto_desire is disabled
                 if not getattr(agent, "config", None) or not agent.config.auto_desire:
+                    continue
+                # Phase E: lazy boredom growth + heartbeat (takes precedence).
+                now = time.time()
+                boredom.tick(now=now)
+                heartbeat = heartbeat_tick_prompt(
+                    boredom.value(now), last_interaction_time, now
+                )
+                if heartbeat is not None:
+                    print(f"\n{_t('heartbeat_murmur')}\n")
+                    last_interaction_time = time.time()
+                    boredom.reset(now=last_interaction_time)
+                    await agent.run(
+                        "",
+                        on_action=on_action,
+                        on_text=on_text,
+                        desires=desires,
+                        inner_voice=heartbeat,
+                        interrupt_queue=input_queue,
+                    )
                     continue
                 # Genuine idle — check desires, but respect cooldown after conversation
                 if not should_fire_idle_desire(
@@ -205,6 +233,10 @@ async def repl(agent: EmbodiedAgent, desires: DesireSystem, debug: bool = False)
                     )
                     desires.satisfy(desire_name)
                     desires.curiosity_target = None
+                    # Phase E: greeting relieves boredom.
+                    if desire_name == "greet_companion":
+                        boredom.decay(now=time.time())
+                        li_store.update("greeting")
                 elif pending_items:
                     # Had pending input but no desire — process it as user message
                     for msg in pending_items:

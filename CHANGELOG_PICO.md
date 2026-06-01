@@ -9,6 +9,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase E (2026-06-01): 感情 — boredom + body_temp + heartbeat
+
+ピコが 1-3 日に 1 回くらい自発的に行動する状態へ。boredom が時間で育ち、対話で
+減衰し、十分育って一定時間無音なら heartbeat が自発発話する。
+
+**新 `emotion/` パッケージ** (familiar_agent 内、`self_state.py` の json 永続パターン踏襲):
+- `boredom.py` — boredom ∈ [0,1]。**遅延時間成長** (アクセス時に
+  `clamp(stored + GROWTH_PER_SEC × elapsed)`、`~/.familiar_ai/boredom.json` に
+  `(value, updated_at)` 永続 → 再起動安全、asyncio task 不要)。既定 0→0.8 ≈ 48h
+  (`BOREDOM_GROWTH_PER_SEC`)。対話で `decay(0.3)`。純関数 `grown_value` /
+  `boredom_heartbeat_should_fire`。
+- `body_temp.py` — `/sys/class/thermal/thermal_zone0/temp` を読み (欠落は None で
+  graceful)、cool/normal/warm/hot に category 化。interoception の `body_stress` に
+  寄与 + prompt に**ラベルのみ** ("feeling warm"/"overheating")。**生 °C はピコに
+  見せない** (CLAUDE.md)。自発発話トリガーなし。
+- `last_interaction.py` — `~/.familiar_ai/last_interaction.json` (ISO8601 + kind)。
+  起動時 load・対話時 update (heartbeat の無音判定が再起動を跨ぐ)。
+
+**heartbeat** (自発発話、既存 heartbeat.py=継続制御とは別物):
+- 純述語 `boredom>0.8 AND idle>30min`。`_ui_helpers.heartbeat_tick_prompt` が
+  既存 idle tick (tui `_desire_tick` / main REPL、10s) で判定 →
+  `agent.run("", inner_voice=heartbeat_prompt)` → **Tapo スピーカー** (Discord なし)。
+  発火後 boredom reset + last_interaction 更新 (再発火防止)。**通常 desire より優先**。
+- ゲート = `FAMILIAR_AUTO_DESIRE` AND `HEARTBEAT_ENABLED` (独立 kill-switch)。
+- locale `heartbeat_prompt` (沈黙の自由を明示) + `heartbeat_murmur` (ja/en)。
+
+**配置**: boredom の lazy 成長を既存 10s idle tick に乗り入れ (「専用 decay tick」を
+新 asyncio task なしで実現)。閾値/レートは emotion モジュールが env 直読み
+(config.py は lean、desires.py 慣習)。`.env.example` に全 env。
+
+**二層分離**: pico_agent 無変更。Stage A/B desire・self_state homeostasis・mood
+half-life・既存 heartbeat.py すべて無変更。`tests/conftest.py` に autouse fixture を
+追加し、全テストの boredom/last_interaction 永続を tmp へ隔離 (実 ~/.familiar_ai 非汚染)。
+
+**テスト +35** (boredom 成長/減衰/永続、body_temp 取得/category/interoception 寄与・
+生°C 非漏洩、heartbeat 述語/選択/locale、last_interaction 永続/復元、TUI 配線/
+heartbeat 優先/起動復元)。mutation 対応。pytest 1557 → 1592 緑、regression なし。
+
+**実機検証 (Stage D、unit 不可)**: body_temp は実機 Pi5、heartbeat は実 idle 後。
+`HEARTBEAT_IDLE_SECONDS`/`BOREDOM_GROWTH_PER_SEC` を一時的に下げて Tapo 自発発話を確認。
+
 ### transcribe 通過テキスト DEBUG ログ化 (2026-06-01)
 
 C-13a evaluator 指摘の改善余地。drop されたテキストは既に DEBUG ログ済だが、

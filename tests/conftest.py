@@ -21,6 +21,28 @@ import pytest
 os.environ.setdefault("FAMILIAR_EMBEDDING_PREWARM", "0")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_emotion_state(tmp_path, monkeypatch):
+    """Phase E: redirect boredom / last_interaction persistence to a per-test tmp
+    dir so no test ever reads or writes the real ~/.familiar_ai state files.
+
+    Tests that construct FamiliarApp (which builds Boredom()/LastInteraction()
+    with default paths) or call interaction/idle methods would otherwise pollute
+    the user's runtime state. Tests passing an explicit ``path=`` are unaffected.
+    """
+    try:
+        monkeypatch.setattr(
+            "familiar_agent.emotion.boredom._DEFAULT_PATH", tmp_path / "boredom.json"
+        )
+        monkeypatch.setattr(
+            "familiar_agent.emotion.last_interaction._DEFAULT_PATH",
+            tmp_path / "last_interaction.json",
+        )
+    except Exception:
+        pass
+    yield
+
+
 # ── ピコ独自 helper: aiohttp mock 共通化 (外出 Day 2 タスク F 産物) ─────
 
 

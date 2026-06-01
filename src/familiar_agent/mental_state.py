@@ -27,6 +27,9 @@ class InteroceptiveSignal:
     cognitive_load: float = 0.3
     body_stress: float = 0.2
     social_openness: float = 0.5
+    # Phase E: coarse body-temperature word ("feeling warm"/"overheating"/""),
+    # never a raw °C (CLAUDE.md: no raw interoception metrics in prompts).
+    temp_label: str = ""
     raw_metrics: dict[str, float] = field(default_factory=dict)
 
     def sanitized(self) -> "InteroceptiveSignal":
@@ -39,6 +42,7 @@ class InteroceptiveSignal:
             cognitive_load=_clamp01(self.cognitive_load),
             body_stress=_clamp01(self.body_stress),
             social_openness=_clamp01(self.social_openness),
+            temp_label=str(self.temp_label),
             raw_metrics={k: float(v) for k, v in self.raw_metrics.items()},
         )
 
@@ -54,6 +58,8 @@ class InteroceptiveSignal:
             parts.append("high-load")
         if self.body_stress > 0.65:
             parts.append("body-tense")
+        if self.temp_label:
+            parts.append(self.temp_label)
         if self.social_openness < 0.35:
             parts.append("socially-guarded")
         elif self.social_openness > 0.7:

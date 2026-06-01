@@ -27,8 +27,11 @@ from ._ui_helpers import (
     desire_tick_prompt,
     format_action as _format_action,
     format_tool_result as _format_tool_result,
+    heartbeat_tick_prompt,
     should_fire_idle_desire,
 )
+from .emotion.boredom import Boredom
+from .emotion.last_interaction import LastInteraction
 from .realtime_stt_session import create_realtime_stt_controller, RealtimeSttController
 
 # pico_v3 拡張 (Phase C-Ctrl+T 常時化): Tapo RTSP 音声トラックを Kotoba-Whisper で
@@ -205,7 +208,11 @@ class FamiliarApp(App):
         self._agent_name = agent.config.agent_name
         self._companion_name = agent.config.companion_name
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
-        self._last_interaction = time.time()
+        # Phase E: boredom + persisted last-interaction (heartbeat).
+        self._boredom = Boredom()
+        self._last_interaction_store = LastInteraction()
+        _restored_li = self._last_interaction_store.load()
+        self._last_interaction = _restored_li if _restored_li is not None else time.time()
         self._agent_running = False
         self._current_text_buf = ""  # buffer for streaming text
         self._log_path = self._open_log_file()
@@ -377,7 +384,7 @@ class FamiliarApp(App):
             return
 
         self._log_user(text)
-        self._last_interaction = time.time()
+        self._mark_interaction("chat")
         await self._input_queue.put(text)
 
     # ── agent loop ─────────────────────────────────────────────────
@@ -553,12 +560,30 @@ class FamiliarApp(App):
             stream.update("")
             self._agent_running = False
 
+    def _mark_interaction(self, kind: str) -> None:
+        """Phase E: record an external interaction — reset cooldown, decay boredom, persist."""
+        now = time.time()
+        self._last_interaction = now
+        self._boredom.decay(now=now)
+        self._last_interaction_store.update(kind, now=now)
+
     async def _desire_tick(self) -> None:
-        """Check desires and fire autonomous actions when idle."""
+        """Check desires/heartbeat and fire autonomous actions when idle."""
         # Skip if auto_desire is disabled (default OFF)
         if not getattr(self.agent.config, "auto_desire", False):
             return
         now = time.time()
+        # Phase E: lazy boredom growth + persist (the dedicated decay tick).
+        self._boredom.tick(now=now)
+        heartbeat = heartbeat_tick_prompt(
+            self._boredom.value(now), self._last_interaction, now
+        )
+        if heartbeat is not None:
+            self._log_system(_t("heartbeat_murmur"))
+            self._last_interaction = time.time()  # prevent immediate re-fire
+            self._boredom.reset(now=self._last_interaction)
+            await self._run_agent("", inner_voice=heartbeat)
+            return  # heartbeat takes precedence over a normal desire this tick
         if not should_fire_idle_desire(
             agent_running=self._agent_running,
             has_pending_input=not self._input_queue.empty(),
@@ -592,6 +617,10 @@ class FamiliarApp(App):
         await self._run_agent("", inner_voice=prompt)
         self.desires.satisfy(desire_name)
         self.desires.curiosity_target = None
+        # Phase E: greeting = reaching out + getting engaged → relieves boredom.
+        if desire_name == "greet_companion":
+            self._boredom.decay(now=time.time())
+            self._last_interaction_store.update("greeting")
 
     # ── Realtime STT (hands-free, always-on) ────────────────────
 
@@ -613,7 +642,7 @@ class FamiliarApp(App):
                     self._write_log(
                         f"[bold cyan]\U0001f3a4 {self._companion_name}[/bold cyan] {text}"
                     )
-                    self._last_interaction = time.time()
+                    self._mark_interaction("stt")
                     stream = self.query_one("#stream", Static)
                     stream.update("")
                 except Exception:
@@ -646,7 +675,7 @@ class FamiliarApp(App):
             )
         except Exception:
             pass
-        self._last_interaction = time.time()
+        self._mark_interaction("stt")
         await self._input_queue.put(text)
 
     async def _start_continuous_stt(self) -> None:
@@ -791,7 +820,7 @@ class FamiliarApp(App):
             text = await record_task
             if text.strip():
                 self._log_user(text)
-                self._last_interaction = time.time()
+                self._mark_interaction("stt")
                 await self._input_queue.put(text)
         except Exception as e:
             self._log_system(f"STT error: {e}")
