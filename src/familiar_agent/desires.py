@@ -24,6 +24,7 @@ DEFAULT_DESIRES = {
     "greet_companion": 0.0,
     "rest": 0.0,
     "worry_companion": 0.0,  # grows only via detect_worry_signal(), not over time
+    "audio_concern": 0.0,  # B4: grows only via audio-event boost(), not over time
     "share_memory": 0.0,  # spontaneous "remember when..." sharing; fires every ~3 min idle
     "curiosity": 0.0,
     "attachment": 0.0,
@@ -219,6 +220,13 @@ class DesireSystem:
                 _t("desire_prompt_worry_companion", companion=self._companion_name),
                 ("legacy", "care"),
                 60,
+            ),
+            "audio_concern": DriveSpec(  # B4: heard an important sound (event-driven)
+                "audio_concern",
+                0.0,
+                _t("desire_prompt_audio_concern"),
+                ("audio", "protect"),
+                30,
             ),
             "share_memory": DriveSpec(
                 "share_memory",
@@ -557,6 +565,7 @@ class DesireSystem:
             "worry_companion": 0.9,
             "repair": 0.9,
             "self_protect": 0.8,
+            "audio_concern": 0.75,  # B4: a concerning sound deserves attention
             "care": 0.7,
             "greet_companion": 0.7,
             "attachment": 0.6,

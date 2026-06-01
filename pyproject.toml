@@ -40,8 +40,14 @@ voice = [
     "soundfile>=0.13.1",
     "av>=14.0.0",
 ]
+# B4: YAMNet environment-sound recognition (Pi5 aarch64). Optional — the feature
+# degrades to a no-op without it. The yamnet.tflite model is NOT bundled (see
+# docs/AUDIO_EVENT_SETUP.md). numpy is already a hard dependency.
+audio_event = [
+    "tflite-runtime>=2.14.0; platform_machine=='aarch64'",
+]
 all = [
-    "familiar-ai[gui,camera,voice]",
+    "familiar-ai[gui,camera,voice,audio_event]",
 ]
 
 [project.scripts]
@@ -96,4 +102,7 @@ voice = [
     "sounddevice>=0.5.5",
     "soundfile>=0.13.1",
     "av>=14.0.0",
+]
+audio_event = [
+    "tflite-runtime>=2.14.0; platform_machine=='aarch64'",
 ]

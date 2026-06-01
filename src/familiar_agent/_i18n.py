@@ -1246,6 +1246,17 @@ _T: dict[str, dict[str, str]] = (
                 "重くならないように、さりげなく。"
             ),
         },
+        "desire_prompt_audio_concern": {
+            "en": (
+                "(internal impulse) I just heard something — a sound I can't quite ignore. "
+                "I want to figure out what it was. Recall the recent sound I noticed, and "
+                "check on it (see() if it might be visible, or say() a short concerned line)."
+            ),
+            "ja": (
+                "（内部衝動）さっき何か聞こえた。気になる音だった。何の音だったか確かめたい。"
+                "さっき気づいた音を思い出して、見えそうならsee()、必要なら短く声をかける。"
+            ),
+        },
         "action_see": {
             "de": "👀 schaut...",
             "en": "👀 looking...",

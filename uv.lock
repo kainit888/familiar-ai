@@ -708,7 +708,11 @@ all = [
     { name = "qasync" },
     { name = "sounddevice" },
     { name = "soundfile" },
+    { name = "tflite-runtime", marker = "platform_machine == 'aarch64'" },
     { name = "zeroconf" },
+]
+audio-event = [
+    { name = "tflite-runtime", marker = "platform_machine == 'aarch64'" },
 ]
 camera = [
     { name = "onvif-zeep-async" },
@@ -728,6 +732,9 @@ voice = [
 ]
 
 [package.dev-dependencies]
+audio-event = [
+    { name = "tflite-runtime", marker = "platform_machine == 'aarch64'" },
+]
 camera = [
     { name = "onvif-zeep-async" },
     { name = "opencv-python" },
@@ -756,7 +763,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "anthropic", specifier = ">=0.40.0" },
     { name = "av", marker = "extra == 'voice'", specifier = ">=14.0.0" },
-    { name = "familiar-ai", extras = ["gui", "camera", "voice"], marker = "extra == 'all'" },
+    { name = "familiar-ai", extras = ["gui", "camera", "voice", "audio-event"], marker = "extra == 'all'" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "google-genai", specifier = ">=1.0" },
     { name = "google-generativeai", specifier = ">=0.8.6" },
@@ -777,14 +784,16 @@ requires-dist = [
     { name = "soundfile", marker = "extra == 'voice'", specifier = ">=0.13.1" },
     { name = "textual", specifier = ">=8.0.0" },
     { name = "textual-autocomplete", specifier = ">=4.0.6" },
+    { name = "tflite-runtime", marker = "platform_machine == 'aarch64' and extra == 'audio-event'", specifier = ">=2.14.0" },
     { name = "tinytuya", specifier = ">=1.15.0" },
     { name = "uvicorn", specifier = ">=0.34.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.22.1" },
     { name = "zeroconf", marker = "extra == 'camera'", specifier = ">=0.132.2" },
 ]
-provides-extras = ["gui", "camera", "voice", "all"]
+provides-extras = ["gui", "camera", "voice", "audio-event", "all"]
 
 [package.metadata.requires-dev]
+audio-event = [{ name = "tflite-runtime", marker = "platform_machine == 'aarch64'", specifier = ">=2.14.0" }]
 camera = [
     { name = "onvif-zeep-async", specifier = ">=4.0.0" },
     { name = "opencv-python", specifier = ">=4.0" },
@@ -4000,6 +4009,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/1e/3a/80411bc7b94969eb116ad1b18db90f8dce8a1de441278c4a81fee55a27ca/textual_autocomplete-4.0.6.tar.gz", hash = "sha256:2ba2f0d767be4480ecacb3e4b130cf07340e033c3500fc424fed9125d27a4586", size = 97967, upload-time = "2025-09-24T21:19:20.213Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9f/66/ebe744d79c87f25a42d2654dddbd09462edd595f2ded715245a51a546461/textual_autocomplete-4.0.6-py3-none-any.whl", hash = "sha256:bff69c19386e2cbb4a007503b058dc37671d480a4fa2ddb3959c15ceb4aff9b5", size = 16499, upload-time = "2025-09-24T21:19:18.489Z" },
+]
+
+[[package]]
+name = "tflite-runtime"
+version = "2.14.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/dd/a701667be92bb884644eeec91ebbde57e197d27d9a79241169b6ce15e1ad/tflite_runtime-2.14.0-cp310-cp310-manylinux_2_34_aarch64.whl", hash = "sha256:d38c6885f5e9673c11a61ccec5cad7c032ab97340718d26b17794137f398b780", size = 2324943, upload-time = "2023-10-03T21:15:40.253Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/e9/5fc0435129c23c17551fcfadc82bd0d5482276213dfbc641f07b4420cb6d/tflite_runtime-2.14.0-cp311-cp311-manylinux_2_34_aarch64.whl", hash = "sha256:ce9fa5d770a9725c746dcbf6f59f3178233b3759f09982e8b2db8d2234c333b0", size = 2325913, upload-time = "2023-10-03T21:15:46.348Z" },
 ]
 
 [[package]]

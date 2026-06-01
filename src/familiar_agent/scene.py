@@ -218,9 +218,21 @@ class SceneTracker:
             )
         self._conn.commit()
 
+    def record_audio_event(self, label: str, confidence: float) -> dict:
+        """B4: record a heard audio event as a scene_event (surfaces via recent_events).
+
+        Audio events coexist with visual (appeared/disappeared) events in the same
+        scene_events table; ``confidence`` is accepted for the caller's logging but
+        the table stores the label (the salient class).
+        """
+        event = {"event_type": "heard", "entity_label": label, "entity_id": None}
+        self._persist_events([event])
+        return event
+
     def context_for_prompt(self, n: int = 10) -> str:
         """Return a compact scene summary for LLM system prompt injection."""
-        if not self._current_entities:
+        heard = [e for e in self.recent_events(n) if e["event_type"] == "heard"]
+        if not self._current_entities and not heard:
             return ""
 
         lines = ["[Current scene]"]
@@ -237,6 +249,9 @@ class SceneTracker:
         if locations:
             labels = ", ".join(e["label"] for e in locations[:n])
             lines.append(f"  Locations: {labels}")
+        if heard:
+            labels = ", ".join(e["entity_label"] for e in heard[:n])
+            lines.append(f"  Recent sounds: {labels}")
 
         return "\n".join(lines)
 

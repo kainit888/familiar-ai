@@ -37,7 +37,7 @@ from .realtime_stt_session import create_realtime_stt_controller, RealtimeSttCon
 # pico_v3 拡張 (Phase C-Ctrl+T 常時化): Tapo RTSP 音声トラックを Kotoba-Whisper で
 # 常時購読する STT (Phase C-4 実装済 start_rtsp_subscription) を UI 層から配線する。
 # realtime_stt_session と同型 (UI 責務の STT wiring)。一方向 import (familiar_agent→pico_agent)。
-from pico_agent.adapters import stt_kotoba, tapo_event
+from pico_agent.adapters import audio_event, stt_kotoba, tapo_event
 
 if TYPE_CHECKING:
     from .agent import EmbodiedAgent
@@ -691,7 +691,8 @@ class FamiliarApp(App):
             return  # 二重起動防止
         try:
             self._continuous_stt_task = await stt_kotoba.start_rtsp_subscription(
-                on_speech=self._continuous_stt_on_speech
+                on_speech=self._continuous_stt_on_speech,
+                on_audio_event=self._on_audio_event,
             )
             self._log_system("\U0001f3a4 Continuous STT ON (Tapo RTSP / Kotoba-Whisper)")
         except Exception as e:
@@ -735,6 +736,41 @@ class FamiliarApp(App):
             return float(raw) if raw else 0.25
         except ValueError:
             return 0.25
+
+    @staticmethod
+    def _audio_boost_amount() -> float:
+        raw = os.environ.get("YAMNET_BOOST_AMOUNT", "")
+        try:
+            return float(raw) if raw else 0.3
+        except ValueError:
+            return 0.3
+
+    async def _on_audio_event(self, evt: "audio_event.AudioEvent") -> None:
+        """B4: 環境音イベント callback (二層境界の familiar_agent 側)。
+
+        音響イベントを記憶(scene_events + observation)に残し、重要なら
+        ``audio_concern`` drive を boost する。**直接 say はしない** — ピコは
+        heartbeat 発火時の判断材料として使う(発話は heartbeat 経由のみ)。
+        """
+        try:
+            scene = getattr(self.agent, "_scene", None)
+            if scene is not None:
+                scene.record_audio_event(evt.top_label, evt.top_confidence)
+            mem = getattr(self.agent, "_memory_tool", None)
+            if mem is not None:
+                topk = ", ".join(f"{lbl}:{c:.2f}" for lbl, c in evt.labels[:3])
+                mem.save(
+                    content=f"Heard a sound: {evt.top_label} ({evt.top_confidence:.2f}) [{topk}]",
+                    kind="audio_event",
+                    emotion="neutral",
+                )
+            if evt.is_important:
+                self.desires.boost("audio_concern", self._audio_boost_amount())
+            self._write_log(
+                f"[dim]\U0001f50a heard {evt.top_label} ({evt.top_confidence:.2f})[/dim]"
+            )
+        except Exception as e:
+            logger.warning("Audio event handling failed: %s", e)
 
     async def _start_tapo_events(self) -> None:
         """Tapo ONVIF event 購読を起動し task を保持する (依存未満は no-op task)。"""

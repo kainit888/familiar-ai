@@ -58,6 +58,7 @@ from urllib.parse import quote
 import aiohttp
 from loguru import logger
 
+from pico_agent.adapters import audio_event
 from pico_agent.stt_hallucination_filter import is_whisper_hallucination
 
 # Phase C-5.5 調査用: 標準 logging を loguru と並行発行 (familiar_agent/main.py の
@@ -466,6 +467,7 @@ async def _emit_segment(
     on_speech: Callable[[str], Awaitable[None]],
     *,
     min_segment_sec: float,
+    on_audio_event: Callable[["audio_event.AudioEvent"], Awaitable[None]] | None = None,
 ) -> None:
     """蓄積した PCM バッファ 1 発話を whisper へ流し on_speech() を呼ぶ。
 
@@ -489,6 +491,8 @@ async def _emit_segment(
         logger.warning("stt_kotoba.subscription: transcribe failed: {}", e)
         return
     if not text:
+        # B4 案C: 発話でないセグメント → YAMNet 環境音分類 (on_audio_event 未指定なら no-op)。
+        await audio_event.maybe_emit_audio_event(wav_bytes, on_audio_event)
         return
     if is_whisper_hallucination(text):
         logger.debug(
@@ -511,6 +515,7 @@ async def _pcm_reader(
     max_segment_sec: float,
     min_segment_sec: float,
     flush_event: asyncio.Event,
+    on_audio_event: Callable[["audio_event.AudioEvent"], Awaitable[None]] | None = None,
 ) -> None:
     """ffmpeg stdout から PCM を読み続け、無音通知 (flush_event) でセグメントを emit。
 
@@ -532,11 +537,21 @@ async def _pcm_reader(
                 "stt_kotoba.subscription: max segment reached ({}B), force flush",
                 len(pcm_buffer),
             )
-            await _emit_segment(pcm_buffer, on_speech, min_segment_sec=min_segment_sec)
+            await _emit_segment(
+                pcm_buffer,
+                on_speech,
+                min_segment_sec=min_segment_sec,
+                on_audio_event=on_audio_event,
+            )
             pcm_buffer.clear()
         if flush_event.is_set():
             flush_event.clear()
-            await _emit_segment(pcm_buffer, on_speech, min_segment_sec=min_segment_sec)
+            await _emit_segment(
+                pcm_buffer,
+                on_speech,
+                min_segment_sec=min_segment_sec,
+                on_audio_event=on_audio_event,
+            )
             pcm_buffer.clear()
 
 
@@ -579,6 +594,7 @@ async def _run_one_ffmpeg_session(
     min_silence_sec: float,
     max_segment_sec: float,
     min_segment_sec: float,
+    on_audio_event: Callable[["audio_event.AudioEvent"], Awaitable[None]] | None = None,
 ) -> None:
     """ffmpeg を 1 回起動 → PCM 受信 + silencedetect 受信 → セグメント切り出し。
 
@@ -618,6 +634,7 @@ async def _run_one_ffmpeg_session(
                 max_segment_sec=max_segment_sec,
                 min_segment_sec=min_segment_sec,
                 flush_event=flush_event,
+                on_audio_event=on_audio_event,
             )
         )
         err_task = asyncio.create_task(_stderr_reader(proc.stderr, flush_event))
@@ -650,7 +667,10 @@ async def _run_one_ffmpeg_session(
         # 終了時に残った PCM を最後に flush
         if pcm_buffer:
             await _emit_segment(
-                pcm_buffer, on_speech, min_segment_sec=min_segment_sec
+                pcm_buffer,
+                on_speech,
+                min_segment_sec=min_segment_sec,
+                on_audio_event=on_audio_event,
             )
 
 
@@ -663,6 +683,7 @@ async def _subscription_loop(
     max_segment_sec: float,
     min_segment_sec: float,
     restart_backoff_sec: float,
+    on_audio_event: Callable[["audio_event.AudioEvent"], Awaitable[None]] | None = None,
 ) -> None:
     """無限ループで ffmpeg を起動・再起動するトップレベルループ。
 
@@ -678,6 +699,7 @@ async def _subscription_loop(
                 min_silence_sec=min_silence_sec,
                 max_segment_sec=max_segment_sec,
                 min_segment_sec=min_segment_sec,
+                on_audio_event=on_audio_event,
             )
         except asyncio.CancelledError:
             logger.info("stt_kotoba.subscription: loop cancelled, exiting")
@@ -703,6 +725,7 @@ async def start_rtsp_subscription(
     vad_threshold: float = 0.5,
     min_silence_ms: int = 500,
     chunk_duration_ms: int = 30,
+    on_audio_event: Callable[["audio_event.AudioEvent"], Awaitable[None]] | None = None,
 ) -> asyncio.Task[None]:
     """Tapo C210 RTSP 音声トラックを連続購読し、発話単位で transcribe を呼ぶ常駐タスクを起動。
 
@@ -773,5 +796,6 @@ async def start_rtsp_subscription(
             max_segment_sec=max_segment_sec,
             min_segment_sec=min_segment_sec,
             restart_backoff_sec=restart_backoff_sec,
+            on_audio_event=on_audio_event,
         )
     )

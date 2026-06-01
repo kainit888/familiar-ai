@@ -9,6 +9,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### B4 (2026-06-01): 環境音認識 (YAMNet audio events)
+
+Phase X Stage C の「event → drive boost → judgment」を音声版で踏襲。常時 STT で
+「発話でない音」(Whisper が空) を YAMNet (521 AudioSet クラス) で分類し、重要な音
+(doorbell/glass/alarm 等) で `audio_concern` drive を boost。ピコは記憶として持ち、
+heartbeat 発火時の判断材料にする (専用の自発発話経路は無い)。
+
+**新 `pico_agent/adapters/audio_event.py`** (familiar_agent 非import、numpy のみ追加依存):
+- lazy YAMNet interpreter (tflite_runtime / モデル欠落 → None で**全機能 no-op**、
+  既存 STT 無影響、警告1回)。`classify(wav)→AudioEvent|None`、`is_important_label`
+  (確信度≥閾値 かつ 重要ラベル部分一致)、`maybe_emit_audio_event`。
+- クラス名は `yamnet_class_map.csv` からロード (override seam 付き)。mock seam
+  `_INTERPRETER_OVERRIDE` でテスト注入。
+- 案C: `stt_kotoba._emit_segment` の `if not text` で「空 transcribe → YAMNet」。
+  `on_audio_event` を `start_rtsp_subscription` に追加 (既定 None=現状不変、**発話経路は無変更**)。
+
+**familiar_agent 配線** (最小):
+- TUI `_on_audio_event` (Stage C `_on_tapo_event` mirror): scene_events 記録 +
+  observation(kind="audio_event") + 重要なら `desires.boost("audio_concern")`。**直接 say しない**。
+- `scene.record_audio_event` + `context_for_prompt` に "Recent sounds" 行
+  (heard イベントを prompt 注入、視覚イベントと共存)。
+- `desires.py`: 新 `audio_concern` drive (event-driven、GROWTH 0.0、urgency 0.75、
+  Stage A disabled / Stage B visual 機構は無変更)。locale `desire_prompt_audio_concern` (ja/en/_T)。
+
+**graceful / optional**: model 欠落で全 no-op。`tflite_runtime` は `[audio_event]`
+optional extra (aarch64 marker)。**model は repo 非同梱**、`docs/AUDIO_EVENT_SETUP.md`
+で取得手順。`.env.example` に YAMNET_* 一式。
+
+**二層分離**: pico_agent は familiar_agent 非import。**テスト +20** (全 mock:
+FakeInterpreter + in-memory sqlite SceneTracker。推論/案C分岐/重要度閾値/scene 統合、
+必須4 mutation 対応)。pytest 1592 → 1612 緑、regression なし。
+
+**実機検証 (Stage D、unit 不可)**: tflite_runtime + yamnet.tflite を配置し、実 doorbell/
+拍手等が分類され audio_concern を boost するか確認。誤発火は閾値/重要ラベルで調整。
+
 ### Phase E (2026-06-01): 感情 — boredom + body_temp + heartbeat
 
 ピコが 1-3 日に 1 回くらい自発的に行動する状態へ。boredom が時間で育ち、対話で

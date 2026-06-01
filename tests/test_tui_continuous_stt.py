@@ -84,8 +84,9 @@ async def test_start_continuous_stt_calls_subscription_with_callback(monkeypatch
     fake_task.done = MagicMock(return_value=False)
     captured: dict = {}
 
-    async def fake_start(*, on_speech):
+    async def fake_start(*, on_speech, on_audio_event=None):
         captured["on_speech"] = on_speech
+        captured["on_audio_event"] = on_audio_event
         return fake_task
 
     monkeypatch.setattr(
@@ -100,6 +101,8 @@ async def test_start_continuous_stt_calls_subscription_with_callback(monkeypatch
     assert callable(captured["on_speech"])
     # 渡された callback は app のメソッド (input_queue へ流す経路)
     assert captured["on_speech"] == app._continuous_stt_on_speech
+    # B4: 環境音イベント callback も配線されている
+    assert captured["on_audio_event"] == app._on_audio_event
 
 
 @pytest.mark.asyncio
