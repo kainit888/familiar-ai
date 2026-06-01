@@ -1121,6 +1121,32 @@ class ObservationMemory:
             logger.warning("Failed to fetch curiosities: %s", e)
             return []
 
+    def recall_web_knowledge(self, n: int = 5) -> list[dict]:
+        """Phase F: return the n most recent web_knowledge entries (time-ordered).
+
+        Each row's ``content`` is the JSON saved by the search_web tool
+        ({query, summary, sources}). Embedding-free (direct SQL) → deterministic.
+        """
+        try:
+            with self._db_lock:
+                db = self._ensure_connected()
+                rows = db.execute(
+                    "SELECT content, date, time FROM observations "
+                    "WHERE kind = 'web_knowledge' AND superseded_by IS NULL "
+                    "ORDER BY timestamp DESC LIMIT ?",
+                    (n,),
+                ).fetchall()
+            return [
+                {"content": r["content"], "date": r["date"], "time": r["time"]}
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning("Failed to fetch web_knowledge: %s", e)
+            return []
+
+    async def recall_web_knowledge_async(self, n: int = 5) -> list[dict]:
+        return await asyncio.to_thread(self.recall_web_knowledge, n)
+
     def format_self_model_for_context(self, self_model: list[dict]) -> str:
         if not self_model:
             return ""

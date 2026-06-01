@@ -50,6 +50,7 @@ from .tools.camera import CameraTool
 from .tools.coding import CodingTool
 from .tools.memory import MemoryTool, ObservationMemory
 from .tools.tom import ToMTool
+from .tools.web_search import WebSearchTool
 from .tools.mobility import MobilityTool
 from .tools.stt import STTTool
 from .tools.tts import TTSTool
@@ -109,6 +110,7 @@ _TOOL_TIMEOUTS: dict[str, float] = {
     "remember": 20.0,
     "recall": 20.0,
     "tom": 20.0,
+    "search_web": 30.0,  # Phase F: Gemini grounding is slow
     "read_file": 30.0,
     "edit_file": 30.0,
     "glob": 20.0,
@@ -868,6 +870,7 @@ class EmbodiedAgent:
         self._memory = ObservationMemory()
         self._memory_worker = MemoryJobWorker(self._memory)
         self._memory_tool = MemoryTool(self._memory)
+        self._web_search = WebSearchTool(self._memory)  # Phase F
         self._tom_tool = ToMTool(
             self._memory,
             default_person=config.resolve_tom_default_person(),
@@ -1218,6 +1221,9 @@ class EmbodiedAgent:
         defs.extend(self._memory_tool.get_tool_definitions())
         defs.extend(self._tom_tool.get_tool_definitions())
         defs.extend(self._coding.get_tool_definitions())
+        if getattr(self, "_web_search", None) is not None and WebSearchTool.available():
+            # Phase F: only advertise search_web with a Gemini key
+            defs.extend(self._web_search.get_tool_definitions())
         if self._mcp:
             defs.extend(self._mcp.get_tool_definitions())
         return defs
@@ -1246,6 +1252,8 @@ class EmbodiedAgent:
             return await self._memory_tool.call(name, tool_input)
         elif name == "tom":
             return await self._tom_tool.call(name, tool_input)
+        elif name == "search_web":
+            return await self._web_search.call(name, tool_input)
         elif name in coding_tools:
             return await self._coding.call(name, tool_input)
         elif self._mcp:

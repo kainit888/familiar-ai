@@ -9,6 +9,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase F (2026-06-01): Web 検索 + curiosity 連動 (Gemini Search Grounding)
+
+curiosity drive が立ったターンで、ピコ自身の判断 (tool 呼出) で Web を調べられる
+ように。検索は Gemini 3.1 Flash-Lite + Google Search Grounding (google-genai SDK)。
+結果 (要約 + grounding 出典) を observations.db に `kind="web_knowledge"` で保存し、
+Phase E heartbeat 発火時に最近の web_knowledge を共有候補として提示 (タイトル + 出典
+リンク)。**ピコが共有するか黙るかは自己判断**。検索失敗は silent (WARNING ログのみ、
+ピコは黙る。fallback なし)。
+
+**新 `tools/web_search.py`** (familiar_agent 内、google-genai のみ追加依存):
+- `WebSearchTool` (`search_web` tool)、`WebKnowledge`/`Source` dataclass、
+  `search_grounding(query)`/`recent_web_knowledge(memory)`。
+- grounding 応答パース: `resp.text` = 要約、`candidates[0].grounding_metadata.
+  grounding_chunks[i].web.{title,uri}` = 出典 (vertexaisearch redirect URL)。
+- 鍵解決は主 PLATFORM 独立: `GOOGLE_API_KEY → GEMINI_API_KEY → API_KEY`
+  (API_KEY は PLATFORM=gemini 時のみ。anthropic 鍵を genai に渡さない)。
+- `available()` = `WEB_SEARCH_ENABLED` (既定 ON) ∧ 鍵あり。tool は鍵がある時だけ広告。
+- mock seam `_CLIENT_OVERRIDE` / `client=` 引数で実 API/quota 不使用のテスト。
+
+**familiar_agent 配線** (最小):
+- `agent.py`: tool 登録 (`_all_tool_defs` は `available()` ガード + 部分構築 agent
+  向け `getattr` 防御)、`_execute_tool` ルーティング、`_TOOL_TIMEOUTS["search_web"]=30s`。
+- `desires.py`: curiosity `DriveSpec` prompt を locale 化 (`desire_prompt_curiosity`)。
+  検索は**任意** — 振り返る/思い出す/黙るも可。curiosity_target は vision/memory/
+  自分の問い の 3 経路から自己設定可。
+- `memory.py`: `recall_web_knowledge()` (kind+recency の直 SQL、意味検索しない)。
+- `_ui_helpers.py`: `heartbeat_tick_prompt(..., memory=)` に web_knowledge 共有ブロック
+  (`_web_share_block`)。tui/main の単一呼出箇所に `memory=` 注入。
+- locale `heartbeat_web_share` / `web_knowledge_share_line` (ja/en json、_T 非追加で
+  parity-safe)。Discord 等の外部経路なし・即時 say なし。
+
+**二層分離**: pico_agent 無変更、backend.py (対話用 Gemini) 無影響。**テスト +21**
+(全 mock: FakeGroundingResponse/FakeClient + in-memory sqlite。grounding パース/
+web_knowledge 保存/curiosity 判断 3 経路/heartbeat 注入、必須4 mutation 対応)。
+pytest 1612 → 1633 緑、regression なし。
+
+**実機検証 (カイニット、unit 不可)**: `.env` に GOOGLE_API_KEY 設定 + curiosity 発火で
+実 grounding が走り web_knowledge が貯まるか、heartbeat で自然に共有されるか確認。
+
 ### B4 (2026-06-01): 環境音認識 (YAMNet audio events)
 
 Phase X Stage C の「event → drive boost → judgment」を音声版で踏襲。常時 STT で

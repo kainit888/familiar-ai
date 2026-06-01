@@ -576,7 +576,10 @@ class FamiliarApp(App):
         # Phase E: lazy boredom growth + persist (the dedicated decay tick).
         self._boredom.tick(now=now)
         heartbeat = heartbeat_tick_prompt(
-            self._boredom.value(now), self._last_interaction, now
+            self._boredom.value(now),
+            self._last_interaction,
+            now,
+            memory=getattr(self.agent, "_memory", None),
         )
         if heartbeat is not None:
             self._log_system(_t("heartbeat_murmur"))

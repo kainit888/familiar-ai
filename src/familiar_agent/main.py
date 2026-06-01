@@ -180,7 +180,10 @@ async def repl(agent: EmbodiedAgent, desires: DesireSystem, debug: bool = False)
                 now = time.time()
                 boredom.tick(now=now)
                 heartbeat = heartbeat_tick_prompt(
-                    boredom.value(now), last_interaction_time, now
+                    boredom.value(now),
+                    last_interaction_time,
+                    now,
+                    memory=getattr(agent, "_memory", None),
                 )
                 if heartbeat is not None:
                     print(f"\n{_t('heartbeat_murmur')}\n")

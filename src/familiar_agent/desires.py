@@ -238,7 +238,7 @@ class DesireSystem:
             "curiosity": DriveSpec(
                 "curiosity",
                 GROWTH_RATES["curiosity"],
-                "Internal impulse: investigate what feels unclear or newly interesting.",
+                _t("desire_prompt_curiosity"),  # Phase F: invites optional search_web
                 ("curiosity",),
                 45,
             ),

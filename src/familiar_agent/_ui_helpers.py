@@ -236,23 +236,53 @@ HEARTBEAT_ENABLED: bool = os.environ.get("HEARTBEAT_ENABLED", "true").strip().lo
 )
 
 
+def _web_share_block(memory) -> str:
+    """Phase F: append recent web_knowledge as permissive share candidates.
+
+    Returns "" when there is nothing recent (so the heartbeat prompt is unchanged)
+    or on any error (the heartbeat must never crash).
+    """
+    try:
+        from .tools.web_search import recent_web_knowledge
+
+        items = recent_web_knowledge(memory, n=3)
+        if not items:
+            return ""
+        lines = [_t("heartbeat_web_share")]
+        for wk in items:
+            if wk.sources:
+                title, uri = wk.sources[0].title, wk.sources[0].uri
+            else:
+                title, uri = (wk.summary[:40] or wk.query[:40]), ""
+            lines.append(_t("web_knowledge_share_line", title=title, uri=uri))
+        return "".join(lines)
+    except Exception:
+        return ""
+
+
 def heartbeat_tick_prompt(
     boredom_value: float,
     last_interaction: float,
     now: float,
     *,
     enabled: bool = HEARTBEAT_ENABLED,
+    memory=None,
 ) -> str | None:
     """Return the heartbeat inner-voice prompt if boredom should fire, else None.
 
     Phase E: when boredom is high AND the companion has been idle long enough,
     Pico reaches out (Tapo speaker). The prompt explicitly permits silence.
+    Phase F: when ``memory`` is given, recent web_knowledge is appended as
+    permissive share candidates (Pico decides whether to share — never forced).
     """
     if not enabled:
         return None
     if not boredom_heartbeat_should_fire(boredom_value, last_interaction, now):
         return None
-    return _t("heartbeat_prompt")
+    base = _t("heartbeat_prompt")
+    if memory is None:
+        return base
+    return base + _web_share_block(memory)
 
 
 def should_fire_idle_desire(
