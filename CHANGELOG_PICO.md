@@ -9,6 +9,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase I (2026-06-01): STT 幻聴由来の誤記憶 cleanup (B1 範囲外の技術債)
+
+B1 (deafae6) で範囲外として残した別系統の技術債。Phase C-13/C-13a で Whisper 幻聴
+フィルタが両側に入る前に、無音/雑音を定型句 (「ありがとうございました」「はい」「いい」
+等) と誤認識した発話が observations.db に誤記憶として蓄積。B1 と同じ dry-run + apply +
+WAL-safe backup パターンの **dev メンテスクリプト**で精査・除去する。
+
+**Q1-5 判断 (Code 委任):**
+- **Q1 検出**: live filter (`pico_agent.stt_hallucination_filter`) の denylist/allowlist/
+  正規化を **import** で単一ソース化 (コピーで drift させない)。実 DB の誤記憶は幻聴句が
+  `「…」` 引用で物語に埋め込まれた形 (live filter を発話全体にかけても当たらない) → Path A
+  (companion 引用句一致) + Path B (短い単発幻聴) で検出。
+- **Q2 分類**: **soft-supersede 既定** (`superseded_by` マーク)。observations は embeddings/
+  links から ON DELETE CASCADE 参照のため hard DELETE は破壊的。recall は `superseded_by
+  IS NULL` で除外＝ピコのアクティブ記憶から消える。`--mode remove` も用意 (CASCADE 警告)。
+  allowlist 句・hedge (「空耳かもしれない」)・denylist 外の締め言葉 (「おやすみなさい」→
+  review-manual) は **keep** (false-negative 寄り)。
+- **Q3 dry-run/backup**: B1 完全踏襲。dry-run 既定、`--apply`、SQLite backup API (cp 不可)。
+  **0 件→backup なし no-op**。冪等 (superseded 済みは再走査対象外)。
+- **Q4 配置**: `scripts/dev/cleanup_observations_stt_hallucination.py`。
+- **Q5 runtime**: dev 専用、familiar_agent/pico_agent **無変更**。filter の read-only import のみ。
+
+**純関数 `classify_row(*, content, kind, companion_name) -> (action, reason)`** (I/O/env/DB 非依存)。
+
+**実 DB dry-run 結果 (2026-06-01)**: 全 78 active 行のうち **auto-supersede 候補 2 件**
+(ffb2069e「いい」/ 51a9094f「はい」, いずれも happy 物語に幻聴句を織込)、**review-manual 1 件**
+(「了解。おやすみなさい。」, keep)、hedged 2 / no-hallucination 73。--apply はカイニット承認後。
+
+**ピコランタイム無変更** (scripts/dev のみ)。**テスト +14** (B1 同様 tmp DB + 実 schema、
+必須4 mutation 対応)。pytest 1679 → 1693 緑、regression なし。
+
 ### Phase H (2026-06-01): self_narrative への web_knowledge 統合 (Phase F 続き)
 
 Phase F (cf0ba01) の範囲外項目。ピコが Web 検索で得た知識 (kind="web_knowledge") を
