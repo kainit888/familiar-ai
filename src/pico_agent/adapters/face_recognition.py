@@ -119,10 +119,14 @@ def _get_recognizer() -> Any | None:
     _RECOGNIZER_TRIED = True
     try:
         import face_recognition as _lib  # type: ignore[import-not-found]
-    except Exception:
+    except (Exception, SystemExit):
+        # SystemExit: a broken install can call quit()/sys.exit() at import time
+        # (e.g. face_recognition_models missing pkg_resources). That is BaseException,
+        # not Exception, so we must catch it explicitly to degrade to a no-op rather
+        # than crash agent construction. Any import-time failure → recognition off.
         _warn_once(
-            "face_recognition: library not installed; face recognition disabled "
-            "(install 'familiar-ai[face_recognition]')"
+            "face_recognition: library unavailable or broken; face recognition "
+            "disabled (install/repair 'familiar-ai[face_recognition]')"
         )
         return None
     _RECOGNIZER_SINGLETON = _lib

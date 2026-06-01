@@ -9,6 +9,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase H (2026-06-01): self_narrative への web_knowledge 統合 (Phase F 続き)
+
+Phase F (cf0ba01) の範囲外項目。ピコが Web 検索で得た知識 (kind="web_knowledge") を
+一人称日記 (self_narrative.jsonl) に「私が学んだこと」として統合する。最終的に書くか
+否かはピコの LLM judgment (Phase F/E と同じ autonomy パターン)。
+
+**設計判断 (Q1-6、Code 委任):**
+- **Q1 統合先 = 既存 `self_narrative.jsonl` 再利用**: schema `{date,text,mood,trigger}` の
+  `trigger="web_knowledge"` で対応。既に morning context / workspace に注入されるので
+  自動的に「学んだこと」として語れる (新ファイル/新読込経路 不要)。
+- **Q2 トリガー = 任意の LLM 合成リフレクション**: 直近 lookup を渡し「心に残れば一文書いて、
+  無理に書かなくていい」と促す。空応答→無記録 (autonomy)。self_narrative は元々 LLM 合成
+  (テンプレ文字列ではない) なので locale は**合成プロンプト**を供給。
+- **Q3 タイミング = session close の `_write_today_narrative` の隣**: 既に utility backend 起動・
+  self_narrative 書込・timeout 管理がある唯一の地点に 1 行追記。heartbeat だと毎 tick 同じ
+  row を再 fold してしまう。
+- **Q4 重複防止 = `query` キーの sidecar ledger** (`~/.familiar_ai/web_knowledge_integrated.json`):
+  `recall_web_knowledge` は行 id 非公開＋Phase F 保存層 無改変の制約下で、唯一安定な
+  reference-path 公開フィールド `WebKnowledge.query` で統合済みを管理。0 件なら disk 不触。
+- **Q5 文面 = locale 2 キー** (`self_narrative_web_prompt` 合成プロンプト + `self_narrative_web_share_line`
+  候補整形)、ja/en json のみ (parity-safe)。`desire_prompt_curiosity` の語り口踏襲、一人称・60字・
+  過去形・沈黙許可。
+- **Q6 構造 = 既存 4 フィールド schema 不変**: source/query は observations.db に既存 (single source)。
+  新フィールドは既存 self_narrative テストを壊すため追加しない。
+
+**新 `web_knowledge_ledger.py`** (~55 行、self_narrative/emotion と同じ json 永続パターン):
+`WebKnowledgeLedger.seen(query)` / `.mark(query)`、読み書き失敗は raise せず log + 続行。
+
+**familiar_agent 配線 (最小侵入):**
+- `agent.py`: ledger 生成 + 新 `_maybe_integrate_web_knowledge()` (Phase F `recent_web_knowledge`
+  再利用、ledger で `query` 既統合除外、先頭1件を `complete()` で合成、**非空なら** `write(trigger=
+  "web_knowledge")` + `ledger.mark`、全体 try/except + `utility_timeout_s`)。`close()` の
+  `_write_today_narrative` 直後に 1 行呼出。
+- locale ja/en に 2 キー。`conftest.py`: self_narrative/ledger の `_DEFAULT_PATH` を tmp へ隔離する
+  autouse fixture 拡張 (従来 self_narrative.jsonl が未隔離だった gap を解消、既存 agent テストにも有益)。
+
+**Phase G 派生の堅牢性修正 (1 箇所)**: `pico_agent/adapters/face_recognition.py::_get_recognizer`
+の import を `except Exception` → `except (Exception, SystemExit)` へ。環境に **壊れた**
+face_recognition ライブラリ (face_recognition_models が pkg_resources 不在で import 時に
+`quit()`→`SystemExit`) が入った結果、SystemExit は BaseException ゆえ既存 graceful を貫通し
+agent 構築をクラッシュさせていた (full suite で顕在化)。これは機能追加でなく Phase G の
+graceful 前提の補修 (壊れた install→no-op)。回帰テスト 1 件追加。
+
+**二層分離**: familiar_agent が主体、Phase F (保存) は無改変で Phase H (読込・統合) と分業。
+pico_agent は上記 1 行の堅牢性修正のみ (Phase H 機能は familiar_agent 内)。**テスト +17**
+(全 mock: FakeBackend + in-memory sqlite。ledger/統合/autonomy(空応答→無記録)/graceful(0件・timeout・
+error)/locale parity + broken-lib SystemExit、必須4 mutation 対応)。pytest 1662 → 1679 緑、regression なし。
+
+**実機検証 (カイニット、unit 不可)**: Phase F で web 検索後、セッション終了時に日記へ「私が学んだこと」
+が一文加わり、翌朝の continuation context に現れるか確認。
+
 ### Phase G (2026-06-01): 顔認識 (face recognition、Problem-1 完結)
 
 Problem-1 (commit e59abba) で予約した `face_recognition_enabled` フラグの実装本体。

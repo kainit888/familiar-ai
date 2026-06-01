@@ -55,6 +55,8 @@
   "desire_prompt_curiosity": "(internal impulse) Something feels unclear or newly interesting. You may set what you're curious about as a focus — from what you just saw, a past interest you recall, or simply your own wondering. If there's something you genuinely want to know, you may look it up with search_web. But you don't have to search — just reflecting, recalling, or staying quiet is perfectly fine.",
   "heartbeat_web_share": "\n\n[Recently you looked up] You may share one of these — with its title and link — if it feels right. Or just stay quiet; silence is completely fine.",
   "web_knowledge_share_line": "\n- {title} — {uri}",
+  "self_narrative_web_prompt": "Lately you looked something up and learned this:\n{item}\n\nIf it stays with you as 'something I learned', write one diary line about it in the first person ('I'), within 60 characters, past tense. You don't have to write anything — if it doesn't stay with you, just leave it. No preamble or explanation.",
+  "self_narrative_web_share_line": "Looked up \"{query}\": {summary}",
   "face_likeness_note": "[Face recognition] The person in view resembles {name} (confidence {confidence}). This is only a hint — judge their identity yourself with your usual caution, from the conversation and context. Do not hard-assert who they are based on this alone.",
   "desire_turn_marker": "(acting on internal impulse)",
   "summary_lang": "English",

@@ -36,6 +36,7 @@ from .routines import parse_schedule_config
 from .concern_engine import ConcernEngine
 from .self_state import SelfState
 from .self_narrative import SelfNarrative
+from .web_knowledge_ledger import WebKnowledgeLedger
 from .exploration import ExplorationTracker
 from .scene import SceneTracker
 from .attention_schema import AttentionSchema
@@ -884,6 +885,7 @@ class EmbodiedAgent:
         self._relationship = RelationshipTracker()
         self._self_state = SelfState()
         self._self_narrative = SelfNarrative()
+        self._web_knowledge_ledger = WebKnowledgeLedger()  # Phase H
         self._concerns = ConcernEngine()
         self._workspace = GlobalWorkspace()
         self._workspace.register_broadcast_listener(self._self_state.on_broadcast)
@@ -2557,6 +2559,47 @@ class EmbodiedAgent:
         except Exception as e:
             logger.warning("Could not write today's self narrative: %s", e)
 
+    async def _maybe_integrate_web_knowledge(self) -> None:
+        """Phase H: fold one recent web lookup into the first-person diary.
+
+        Optional + autonomy-preserving (Phase F/E pattern): the LLM is invited to
+        write a diary line about something it looked up; an empty reply writes
+        nothing and leaves the row eligible next session. Reuses Phase F's
+        ``recent_web_knowledge`` reference path (no new storage, no raw SQL) and
+        dedups on the ``query`` string via the sidecar ledger. Graceful: 0 rows,
+        a failing/timing-out backend, or any error → no-op. Runs once per session
+        at close, after the primary self-narrative write, bounded by
+        ``utility_timeout_s``.
+        """
+        if self._turn_count == 0:
+            return  # No conversation happened — nothing to narrate
+        try:
+            from .tools.web_search import recent_web_knowledge
+
+            items = await asyncio.to_thread(recent_web_knowledge, self._memory, 5)
+            fresh = [wk for wk in items if not self._web_knowledge_ledger.seen(wk.query)]
+            if not fresh:
+                return  # nothing new to fold in (graceful 0-row / all-seen path)
+            wk = fresh[0]
+            item_line = _t(
+                "self_narrative_web_share_line",
+                query=wk.query,
+                summary=(wk.summary[:200] if wk.summary else ""),
+            )
+            prompt = _t("self_narrative_web_prompt", item=item_line)
+            mood, _ = self._decayed_mood()
+            text = await asyncio.wait_for(
+                self._utility_backend.complete(prompt, max_tokens=120),
+                timeout=self.config.utility_timeout_s,
+            )
+            if text and text.strip():
+                # Pico chose to keep it — write + mark only on a non-empty reply.
+                self._self_narrative.write(text.strip(), mood=mood, trigger="web_knowledge")
+                self._web_knowledge_ledger.mark(wk.query)
+                logger.info("Self-narrative web_knowledge integrated: %s", text.strip()[:60])
+        except Exception as e:
+            logger.warning("Could not integrate web_knowledge into self narrative: %s", e)
+
     async def close(self) -> None:
         """Clean up resources. Bounded by timeouts to avoid hanging on exit."""
         if self._camera:
@@ -2568,6 +2611,9 @@ class EmbodiedAgent:
 
         # Write today's self-narrative before shutting down.
         await self._write_today_narrative()
+
+        # Phase H: optionally fold a recent web lookup into the diary (autonomy).
+        await self._maybe_integrate_web_knowledge()
 
         # Generate (or refresh) today's day summary before shutting down.
         # Skipped when no separate utility backend is configured.

@@ -146,6 +146,24 @@ def test_is_available_false_without_library():
     assert fr.is_available() is False
 
 
+def test_broken_library_systemexit_degrades_to_none(monkeypatch):
+    # A broken install (e.g. face_recognition_models missing pkg_resources) calls
+    # quit() at import time → SystemExit (BaseException, not Exception). Must still
+    # degrade to a no-op, not crash agent construction.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "face_recognition":
+            raise SystemExit(None)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert fr._get_recognizer() is None  # no SystemExit propagates
+    assert fr.recognize(b"x", known=_known()) is None
+
+
 def test_warn_once_only_warns_one_time(monkeypatch):
     calls = []
     monkeypatch.setattr(fr.logger, "warning", lambda *a, **k: calls.append(1))

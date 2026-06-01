@@ -38,6 +38,15 @@ def _isolate_emotion_state(tmp_path, monkeypatch):
             "familiar_agent.emotion.last_interaction._DEFAULT_PATH",
             tmp_path / "last_interaction.json",
         )
+        # Phase H: also isolate the self-narrative diary and the web_knowledge
+        # integration ledger so agent-constructing tests never touch real home.
+        monkeypatch.setattr(
+            "familiar_agent.self_narrative._DEFAULT_PATH", tmp_path / "self_narrative.jsonl"
+        )
+        monkeypatch.setattr(
+            "familiar_agent.web_knowledge_ledger._DEFAULT_PATH",
+            tmp_path / "web_knowledge_integrated.json",
+        )
     except Exception:
         pass
     yield
