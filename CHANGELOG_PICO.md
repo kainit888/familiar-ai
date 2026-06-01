@@ -9,6 +9,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### 技術債清算 (2026-06-01): qwen2.5:1.5b 運用停止
+
+Phase C-11 で utility 経路を Pi5 LiteRT Gemma 4 E2B (localhost:11435) に本番
+カットオーバー後、並列維持していた Ollama `qwen2.5:1.5b` を削除 (VRAM 整理 +
+起動短縮)。ランタイムは既に `UTILITY_MODEL=gemma-4-e2b` で稼働しており、
+qwen2.5:1.5b への active な依存は無い (参照はコメント/docstring/テスト fixture
+文字列のみ)。
+
+- 実機: `ollama rm qwen2.5:1.5b` (986MB)。他モデル (moondream / qwen2.5-coder
+  1.5b・3b / qwen2.5:3b) は据置。
+- `.env.example`: Ollama 利用例の `UTILITY_MODEL`/`SCENE_MODEL` を
+  `qwen2.5:1.5b` → `qwen2.5:3b` (まだ存在) へ更新。
+- コード/テスト変更なし。必要なら `ollama pull qwen2.5:1.5b` で再導入可。
+
 ### Problem-1 後処理 (2026-06-01): 既存記憶 DB の誤認監査スクリプト
 
 **目的**: Problem-1 修正 (e59abba) 前に蓄積した vision 由来 identity 誤認の
