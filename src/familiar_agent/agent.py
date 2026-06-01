@@ -50,6 +50,7 @@ from .tape import check_plan_blocked, generate_plan, generate_replan
 from .tools.camera import CameraTool
 from .tools.coding import CodingTool
 from .tools.memory import MemoryTool, ObservationMemory
+from .tools.discord_post import DiscordPostTool
 from .tools.tom import ToMTool
 from .tools.web_search import WebSearchTool
 from .tools.mobility import MobilityTool
@@ -112,6 +113,7 @@ _TOOL_TIMEOUTS: dict[str, float] = {
     "recall": 20.0,
     "tom": 20.0,
     "search_web": 30.0,  # Phase F: Gemini grounding is slow
+    "post_to_discord": 30.0,  # Phase D-1: lazy bot connect + send can be slow
     "read_file": 30.0,
     "edit_file": 30.0,
     "glob": 20.0,
@@ -872,6 +874,7 @@ class EmbodiedAgent:
         self._memory_worker = MemoryJobWorker(self._memory)
         self._memory_tool = MemoryTool(self._memory)
         self._web_search = WebSearchTool(self._memory)  # Phase F
+        self._discord_post = DiscordPostTool()  # Phase D-1
         self._tom_tool = ToMTool(
             self._memory,
             default_person=config.resolve_tom_default_person(),
@@ -1226,6 +1229,9 @@ class EmbodiedAgent:
         if getattr(self, "_web_search", None) is not None and WebSearchTool.available():
             # Phase F: only advertise search_web with a Gemini key
             defs.extend(self._web_search.get_tool_definitions())
+        if getattr(self, "_discord_post", None) is not None and DiscordPostTool.available():
+            # Phase D-1: only advertise post_to_discord when Discord is fully set up
+            defs.extend(self._discord_post.get_tool_definitions())
         if self._mcp:
             defs.extend(self._mcp.get_tool_definitions())
         return defs
@@ -1290,6 +1296,8 @@ class EmbodiedAgent:
             return await self._tom_tool.call(name, tool_input)
         elif name == "search_web":
             return await self._web_search.call(name, tool_input)
+        elif name == "post_to_discord":
+            return await self._discord_post.call(name, tool_input)
         elif name in coding_tools:
             return await self._coding.call(name, tool_input)
         elif self._mcp:

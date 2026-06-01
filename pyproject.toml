@@ -86,6 +86,17 @@ extend-exclude = ["*.iss"]
 ignore_missing_imports = true
 python_version = "3.10"
 
+# Phase D-1: familiar_agent/tools/discord_post.py imports PicoBot from
+# pico_agent.discord_bridge. That package carries pre-existing, intentionally-kept
+# baseline type issues (the on_ready redef in bot.py:123 is documented as a Phase-D
+# baseline; voice_channel.py is out of scope). Treat the discord_bridge package as
+# opaque from the type checker so importing PicoBot does not surface those baseline
+# errors in the `mypy src/familiar_agent` gate. We do NOT modify that code.
+[[tool.mypy.overrides]]
+module = "pico_agent.discord_bridge.*"
+follow_imports = "skip"
+ignore_errors = true
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",

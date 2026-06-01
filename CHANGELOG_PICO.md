@@ -9,6 +9,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase D-1 (2026-06-01): Discord 自発 post 経路 (Phase F の最終 Discord 出力分)
+
+Phase F の Q5(d)「最終的に Discord から出力できたら嬉しい」を実装。ピコが heartbeat/
+idle turn 中に自分の judgment で Discord text channel へ投稿できる `post_to_discord`
+tool を追加 (Tapo スピーカーの Phase E heartbeat と並ぶもう一つの共有経路)。呼ぶ/呼ば
+ないがピコの autonomy。既存の受動応答 (on_message) は無変更。VC は範囲外。
+
+**調査で判明した重要事実:**
+- discord_bridge は **`pico_agent/` 配下**(spec 想定の `familiar_agent/discord_bridge` は不在)。
+- Discord bot は**現状どこからも起動されていない**(Phase D スケルトン、`PicoBot.start()`
+  呼出が repo 全体で皆無)。→ 再利用できる live client がないため、新 tool が初回 post 時に
+  `PicoBot` を 1 つ lazy 起動し既存 `send_message`(graceful 実装)を呼ぶ。これに伴い受動応答
+  も live 化する(カイニット承認済挙動)。
+
+**設計判断 (Q1-6、Code 委任):**
+- Q1=`PicoBot.send_message`(bot.py、get_channel→fetch_channel→send、全例外握り潰し)再利用。
+- Q2=接続情報は既存 discord_bridge 共通 (`DISCORD_TOKEN`/`OWNER_ID`/`GUILD_ID`) + 新 env
+  **`DISCORD_POST_CHANNEL_ID`**(env-direct、web_search.py 同型。repo に `load_secret` は不在)。
+- Q3=**plain text のみ**(embed/mention なし)。web_knowledge は heartbeat block の title+URL を
+  ピコが自分で文章化(Tapo 共有と同じ)。
+- Q4=**heartbeat/idle turn 経由で LLM が tool 呼出**(新ループ追加なし)。
+- Q5=**専用 cooldown 600s**(env `DISCORD_POST_COOLDOWN_S`、`time.monotonic` gate、成功時のみ更新)。
+  Phase F の 90s(turn 頻度用)は流用せず独立。
+- Q6=**tool `post_to_discord` 登録**(Phase F `search_web` 同型、`available()` gate)。呼べば post、
+  呼ばなければ沈黙=autonomy。
+
+**新 `tools/discord_post.py`**: `DiscordPostTool`(`available()`/`get_tool_definitions`/`call`)、
+mock seam `_BOT_OVERRIDE`、lazy `_get_bot`(on_ready まで bounded 待ち)、cooldown。失敗
+(token/接続/channel/送信例外)は全て graceful no-op で文字列を返すのみ(例外を投げない)。
+
+**familiar_agent 配線 (最小、Phase F と同型 4 点)**: `agent.py` import + `__init__` 生成 +
+`_all_tool_defs` gated 登録 + `_execute_tool` route + `_TOOL_TIMEOUTS`。locale ja/en に 2 キー
+(`discord_post_tool_desc`/`_cooldown_notice`、parity-safe)。`.env.example` に Discord 一式。
+
+**mypy 対応**: 新 tool が `pico_agent.discord_bridge` から `PicoBot` を import するため mypy が
+discord_bridge へ追従し既存 baseline エラー(VC の Any/None.play、bot.py:123 の意図的 on_ready
+redef)を gate に露出。`pyproject.toml` に `[[tool.mypy.overrides]] pico_agent.discord_bridge.*`
+を `follow_imports="skip"` で追加し、当該コードを**修正せず** gate を緑に保つ(VC/redef は範囲外)。
+
+**二層分離**: pico_agent は無変更(import のみ)、VC(voice_channel)は不参照。**テスト +21**
+(全 mock: FakeBot + 既存 on_message retention + cooldown/gate/autonomy/graceful、必須4 mutation
+対応)。pytest 1693 → 1714 緑、regression なし。
+
+**実機検証 (カイニット、unit 不可)**: `.env` に `DISCORD_POST_CHANNEL_ID` 等設定 → curiosity/
+heartbeat でピコが調べたことを Discord に投稿するか、受動応答が壊れていないか確認。
+
 ### Phase I (2026-06-01): STT 幻聴由来の誤記憶 cleanup (B1 範囲外の技術債)
 
 B1 (deafae6) で範囲外として残した別系統の技術債。Phase C-13/C-13a で Whisper 幻聴

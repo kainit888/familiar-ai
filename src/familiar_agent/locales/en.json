@@ -57,6 +57,8 @@
   "web_knowledge_share_line": "\n- {title} — {uri}",
   "self_narrative_web_prompt": "Lately you looked something up and learned this:\n{item}\n\nIf it stays with you as 'something I learned', write one diary line about it in the first person ('I'), within 60 characters, past tense. You don't have to write anything — if it doesn't stay with you, just leave it. No preamble or explanation.",
   "self_narrative_web_share_line": "Looked up \"{query}\": {summary}",
+  "discord_post_tool_desc": "Post a short message to your Discord text channel to share something with カイニット — e.g. something you just looked up, learned, or a thought worth sharing. Use only when you genuinely want to share; staying quiet is completely fine. Plain text in your own voice; include a link inline if relevant.",
+  "discord_post_cooldown_notice": "(you posted to Discord recently — let it rest for now)",
   "face_likeness_note": "[Face recognition] The person in view resembles {name} (confidence {confidence}). This is only a hint — judge their identity yourself with your usual caution, from the conversation and context. Do not hard-assert who they are based on this alone.",
   "desire_turn_marker": "(acting on internal impulse)",
   "summary_lang": "English",
