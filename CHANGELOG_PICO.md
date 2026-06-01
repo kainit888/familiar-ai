@@ -9,6 +9,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Phase G (2026-06-01): 顔認識 (face recognition、Problem-1 完結)
+
+Problem-1 (commit e59abba) で予約した `face_recognition_enabled` フラグの実装本体。
+カメラに映る人物がカイニットに似ているかを 128 次元顔ベクトル照合で判定し、`see()`
+結果に「らしさ」ヒント (identity + confidence) を**加算注入**する。最終的な
+「カイニットだ / 別人だ」判断はピコの LLM judgment に委ねる (autonomy 維持、
+`identity_uncertainty_guidance` 整合)。ToM default は `unknown_person` のまま不変。
+
+**設計判断 (Q1-7、Code 委任):**
+- **Q1 ライブラリ = `face_recognition` (dlib)**: 一覧中で唯一 128 次元 identity 埋め込み
+  ＋compare を 1 コールで返す。MediaPipe は検出のみで identity 不可。dlib ビルド >30分は
+  optional extra + graceful no-op で運用影響ゼロ。`_get_recognizer()` seam で将来 InsightFace 差替可。
+- **Q2 登録 = 静的画像 + enroll スクリプト**: `~/.familiar_ai/face_samples/<name>/*.jpg` を
+  `scripts/enroll_face.py` が平均エンコード化。手動最小・familiar_agent 非肥大。
+- **Q3 保存 = `~/.familiar_ai/face_encodings/<name>.npy`**: 数値配列、暗号化不要、手動管理容易、
+  DB 移行不要 (observations.db 再計算なし)。
+- **Q4 精度 = env tolerance + confidence 両用**: `FACE_RECOGNITION_TOLERANCE`(既定0.6) で言及可否、
+  confidence は verbatim でピコへ。
+- **Q5 渡し方 = 加算「らしさ」チャネル (上書きしない)**: ToM 経路不変、hedge 文付きで autonomy 維持。
+- **Q6 タイミング = `see()` 実行時のみ**: フレーム既存・追加撮影なし。`face_locations()` が人物ゲート
+  (0 顔→None で無注入)。
+- **Q7 install = optional extra + graceful no-op** (B4 と同型、`platform_machine=='aarch64'`)。
+
+**新 `pico_agent/adapters/face_recognition.py`** (familiar_agent 非 import、numpy のみ追加):
+- lazy library + encodings ロード (`face_recognition` ライブラリ / npy 欠落 → 全機能 no-op、
+  警告1回)。`recognize_b64(b64)→FaceMatch|None`、`recognize(bytes)`、`is_available()`。
+- mock seam `_RECOGNIZER_OVERRIDE` / `_ENCODINGS_OVERRIDE` (B4 `_INTERPRETER_OVERRIDE` 同型)。
+- tolerance しきい値超え → None (誤認回避)、confidence = clamp(1 - dist/tolerance, 0, 1)。
+
+**familiar_agent 配線 (最小侵入):**
+- `agent.py`: tool ループの `see` 結果に `_maybe_annotate_identity`(gate) → `_annotate_identity`
+  (locale 文組立。pico_agent は `_i18n` 非 import)。flag off / 非 see / 無 match / 例外 → text 不変。
+- `config.py`: env 3 個 (`FACE_RECOGNITION_TOLERANCE` / `FACE_ENCODINGS_DIR` / `FACE_SAMPLES_DIR`)。
+  `resolve_tom_default_person()` の warning を「認識器不在時のみ」へ条件化 (lazy in-method import で
+  config→pico_agent 結合回避)＝Problem-1 の無条件 warning bug を修正。**ラベルは常に unknown_person**
+  (companion_name へ絶対フォールバックしない＝退行防止)。
+- locale `face_likeness_note` (ja/en json のみ、parity-safe)。
+- `scripts/enroll_face.py` (独立 CLI、agent/DB 非接触)、`docs/FACE_RECOGNITION_SETUP.md`、
+  `pyproject.toml` extra `face_recognition`、`.env.example`。
+
+**二層分離**: pico_agent は familiar_agent 非 import、backend.py 無影響。**テスト +29**
+(全 mock: FakeRecognizer + 実 face_distance ユークリッド距離で tolerance 実動。認識本体/
+identity 解決/graceful degrade/注入 gate、必須4 mutation 対応)。pytest 1633 → 1662 緑、regression なし。
+
+**実機検証 (カイニット、unit 不可)**: dlib インストール + 顔写真 enroll + `FACE_RECOGNITION_ENABLED=true`
+で実 see() に顔ヒントが乗り、ピコが誤認せず文脈判断するか確認。tolerance で誤検出を調整。
+
 ### Phase F (2026-06-01): Web 検索 + curiosity 連動 (Gemini Search Grounding)
 
 curiosity drive が立ったターンで、ピコ自身の判断 (tool 呼出) で Web を調べられる

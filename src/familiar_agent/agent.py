@@ -1228,6 +1228,40 @@ class EmbodiedAgent:
             defs.extend(self._mcp.get_tool_definitions())
         return defs
 
+    def _maybe_annotate_identity(self, tool_name: str, text: str, image_b64: str | None) -> str:
+        """Phase G gate: only see() frames, only when the flag is on and an image
+        exists, get a face-likeness hint. Everything else passes through unchanged
+        (Problem-1: flag off => existing behavior exactly preserved)."""
+        if tool_name == "see" and image_b64 and self.config.face_recognition_enabled:
+            return self._annotate_identity(text, image_b64)
+        return text
+
+    def _annotate_identity(self, text: str, image_b64: str) -> str:
+        """Phase G: append a non-asserting face-likeness hint to a see() result.
+
+        Identity is a hint for the LLM only — the ToM default stays
+        ``unknown_person`` and the final "it's Kainit / someone else" call is
+        Pico's (Problem-1 autonomy + identity_uncertainty_guidance). Fully
+        graceful: missing library, no match, or any error returns ``text``
+        unchanged. The face recognizer lives in pico_agent (sensory layer);
+        only the locale phrasing is assembled here.
+        """
+        try:
+            from pico_agent.adapters import face_recognition
+
+            match = face_recognition.recognize_b64(image_b64)
+        except Exception as e:  # never let identity hinting break vision
+            logger.warning("face identity annotation failed: %s", e)
+            return text
+        if match is None:
+            return text
+        note = _t(
+            "face_likeness_note",
+            name=match.name,
+            confidence=f"{match.confidence:.2f}",
+        )
+        return f"{text}\n\n{note}"
+
     async def _execute_tool(self, name: str, tool_input: dict) -> tuple[str, str | None]:
         """Route tool call to the right handler. Returns (text, image_b64_or_None)."""
         camera_tools = {"see", "look"}
@@ -3081,6 +3115,10 @@ class EmbodiedAgent:
                             text, image = f"Tool error: {e}", None
                             self._last_tool_error = str(e)
                             self._tool_failure_streak += 1
+
+                        # Phase G: annotate a see() frame with a face-likeness hint
+                        # (additive only; ToM default stays unknown_person).
+                        text = self._maybe_annotate_identity(tc.name, text, image)
 
                         if (
                             tape_backend

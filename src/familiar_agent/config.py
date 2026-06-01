@@ -178,6 +178,22 @@ class AgentConfig:
     face_recognition_enabled: bool = field(
         default_factory=lambda: _bool_env("FACE_RECOGNITION_ENABLED", default=False)
     )
+    # Phase G: face recognition tuning. The pico_agent adapter reads these same
+    # env vars at runtime; the fields exist for .env documentation + parity.
+    # Lower tolerance = stricter match (fewer false positives, more misses).
+    face_recognition_tolerance: float = field(
+        default_factory=lambda: float(os.environ.get("FACE_RECOGNITION_TOLERANCE", "0.6") or "0.6")
+    )
+    face_encodings_dir: str = field(
+        default_factory=lambda: os.path.expanduser(
+            os.environ.get("FACE_ENCODINGS_DIR", "~/.familiar_ai/face_encodings")
+        )
+    )
+    face_samples_dir: str = field(
+        default_factory=lambda: os.path.expanduser(
+            os.environ.get("FACE_SAMPLES_DIR", "~/.familiar_ai/face_samples")
+        )
+    )
 
     # Platform: "anthropic" | "gemini" | "openai" | "kimi" | "glm"
     platform: str = field(default_factory=lambda: os.environ.get("PLATFORM", "anthropic"))
@@ -273,14 +289,34 @@ class AgentConfig:
     def resolve_tom_default_person(self) -> str:
         """Resolve the ToM default-person label (Problem-1 fix).
 
-        Face recognition is out of scope: when the flag is on but no recognizer
-        exists, warn and still return the label — never fall back to
-        companion_name (that is the misidentification bug being fixed).
+        The ToM default label stays ``unknown_person`` regardless: face
+        recognition (Phase G) feeds identity to Pico as an additive hint on the
+        see() result, never by overwriting this default — so we never fall back
+        to companion_name (that is the misidentification bug being fixed).
+
+        We only warn when the flag is on but the recognizer is genuinely
+        unavailable (library or face encodings missing). When recognition is
+        actually working, no warning is emitted.
         """
-        if self.face_recognition_enabled:
+        if self.face_recognition_enabled and not self._face_recognition_available():
             logging.getLogger(__name__).warning(
-                "FACE_RECOGNITION_ENABLED is set but face recognition is not "
-                "implemented; using TOM_DEFAULT_PERSON_LABEL=%r instead.",
+                "FACE_RECOGNITION_ENABLED is set but no face recognizer is "
+                "available (missing library or face encodings); using "
+                "TOM_DEFAULT_PERSON_LABEL=%r and skipping identity hints.",
                 self.tom_default_person,
             )
         return self.tom_default_person
+
+    @staticmethod
+    def _face_recognition_available() -> bool:
+        """Whether the pico_agent face recognizer can actually run.
+
+        Lazy, in-method import so config.py keeps no import-time dependency on
+        pico_agent (config is imported everywhere). Any failure → unavailable.
+        """
+        try:
+            from pico_agent.adapters import face_recognition
+
+            return face_recognition.is_available()
+        except Exception:
+            return False

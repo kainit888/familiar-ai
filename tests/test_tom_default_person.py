@@ -67,7 +67,10 @@ def test_face_recognition_enabled_true_still_uses_label(monkeypatch, caplog):
         resolved = cfg.resolve_tom_default_person()
     assert resolved == "guest"
     assert resolved != cfg.companion_name
-    assert "not implemented" in caplog.text
+    # Phase G: recognition is now implemented; the warning fires because no
+    # recognizer is *available* here (library/encodings absent), not because it
+    # is unimplemented. Behavior (label kept, never companion_name) is unchanged.
+    assert "no face recognizer is available" in caplog.text
 
 
 # ── locale ガイダンス ──────────────────────────────────────────────────────────

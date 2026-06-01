@@ -14,4 +14,4 @@ adapters/ 配下経由のみ」原則に従う)。
 
 from __future__ import annotations
 
-__all__ = ["tts_sbv2", "stt_kotoba", "vision_qwen3vl"]
+__all__ = ["tts_sbv2", "stt_kotoba", "vision_qwen3vl", "audio_event", "face_recognition"]
