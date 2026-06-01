@@ -9,6 +9,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### Problem-1 後処理 (2026-06-01): 既存記憶 DB の誤認監査スクリプト
+
+**目的**: Problem-1 修正 (e59abba) 前に蓄積した vision 由来 identity 誤認の
+observation を精査・是正する dev スクリプト。ランタイム無変更 (DB メンテ専用)。
+
+**実データ所見 (重要)**: 実 DB (78 obs) を dry-run 監査した結果、**vision 由来
+identity 誤認の候補は 0 件**。前向きの Problem-1 修正だけで十分だった。内訳:
+not-vision 76 / stt-confirmed 1 (`4e5fad13` は画像有だが「聞こえてる？」と STT 確認
+同時) / uncertainty 1 (`6c2cccfa` は「一緒に見てるのかな」と hedge 済)。「カイニットが
+『いい/はい』と言って」系は STT 幻聴 (C-13) 由来で vision でないため対象外・keep。
+
+**実装** (`scripts/dev/cleanup_observations_problem1.py`、stdlib のみ):
+- 純関数 `classify_row`: 保守的順序 (非vision / companion非断定 / 不確実性 /
+  STT確認 → keep、それ以外 → rewrite)。hedge 済み記憶を誤って書き換えない。
+- 既定 `--dry-run` (DB 無変更)。`--apply` で実行、変更前に **SQLite backup API**
+  で WAL-safe スナップショット (`observations.db.bak_problem1_<date>`、cp は使わない)。
+- 既定 `--mode rewrite` (companion 名→中立ラベル上書き、非破壊: obs_embeddings/
+  memory_links の CASCADE を避け記憶・リンク・埋め込みを保持)。`--mode remove` も可。
+- `--companion`/`--label`/`--backup-suffix` 設定可。
+- テスト +6 (`test_cleanup_observations_problem1.py`: classify 各種 / dry-run 無変更 /
+  rewrite / remove / STT・uncertainty 保持 / backup 先行作成)。pytest 1547 → 1553 緑。
+
+**実 DB への `--apply` は現状 no-op** (0 候補)。範囲外: STT 幻聴由来誤記憶、
+self_narrative.jsonl、顔認識実装。
+
 ### Problem-1 修正 (2026-06-01): 視覚 identity の誤認 (無条件「カイニット」)
 
 **原因**: 顔認識が無く、`agent.py:873` が `ToMTool(default_person=config.companion_name)`
