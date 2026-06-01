@@ -495,6 +495,8 @@ async def _emit_segment(
             "stt_kotoba: dropped hallucination text={!r} len={}", text, len(text)
         )
         return
+    # 通過した発話を DEBUG で記録 (将来の grounding / 認識履歴用。INFO は運用ログ汚染)。
+    logger.debug("stt_kotoba: transcribed text={!r} len={}", text, len(text))
     try:
         await on_speech(text)
     except Exception as e:

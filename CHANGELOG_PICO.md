@@ -9,6 +9,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased] — Stage 2 Phase C-11 完了 (2026-05-26)
 
+### transcribe 通過テキスト DEBUG ログ化 (2026-06-01)
+
+C-13a evaluator 指摘の改善余地。drop されたテキストは既に DEBUG ログ済だが、
+通過 (on_speech へ流れた) テキストは記録されず、後から「ピコが何を拾ったか」を
+追えなかった。`stt_kotoba._emit_segment()` で幻聴チェック通過後・on_speech 直前に
+`logger.debug("stt_kotoba: transcribed text={!r} len={}", text, len(text))` を追加。
+drop 時は既存の drop ログ、通過時は transcribed ログ、空は両方なし。DEBUG なので
+大量でも運用 INFO ログを汚さない。pico_agent 完結 (familiar_agent 無変更)。
+テスト +3 (通過時ログ / 空時ログ無し / drop 時は transcribed 無し)。1554 → 1557 緑。
+
 ### 技術債清算 (2026-06-01): qwen2.5:1.5b 運用停止
 
 Phase C-11 で utility 経路を Pi5 LiteRT Gemma 4 E2B (localhost:11435) に本番

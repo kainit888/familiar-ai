@@ -31,6 +31,8 @@ denylist へ移動済 (実機で幻聴頻出)。
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from pico_agent.adapters import stt_kotoba
@@ -207,3 +209,57 @@ async def test_filter_disabled_via_env(monkeypatch):
         _pcm_above_min(), _on_speech, min_segment_sec=0.3
     )
     assert received == ["ありがとうございました"]
+
+
+# ── 通過テキストの DEBUG ログ化 (Phase C-13 後処理) ─────────────────────────────
+#
+# mutation 対応:
+#   - transcribed DEBUG ログを消す → test_transcribed_text_logged_when_passes が fail
+#   - drop 経路でも transcribed を出す → test_transcribed_text_not_logged_when_dropped が fail
+
+
+def _debug_msgs(mock_logger) -> list[str]:
+    """MagicMock 化した logger.debug の呼び出しメッセージ (第1引数) を集める。"""
+    return [c.args[0] for c in mock_logger.debug.call_args_list if c.args]
+
+
+async def _run_emit_with_logger(monkeypatch, text: str):
+    async def _fake_transcribe(audio_bytes, sample_rate=16000):
+        return text
+
+    received: list[str] = []
+
+    async def _on_speech(t: str) -> None:
+        received.append(t)
+
+    mock_logger = MagicMock()
+    monkeypatch.setattr(stt_kotoba, "transcribe", _fake_transcribe)
+    monkeypatch.setattr(stt_kotoba, "logger", mock_logger)
+    await stt_kotoba._emit_segment(_pcm_above_min(), _on_speech, min_segment_sec=0.3)
+    return mock_logger, received
+
+
+@pytest.mark.asyncio
+async def test_transcribed_text_logged_when_passes(monkeypatch):
+    mock_logger, received = await _run_emit_with_logger(monkeypatch, "ピコさん聞こえてる")
+    msgs = _debug_msgs(mock_logger)
+    assert any("transcribed" in m for m in msgs)
+    assert received == ["ピコさん聞こえてる"]  # 通過もしている
+
+
+@pytest.mark.asyncio
+async def test_transcribed_text_not_logged_when_empty(monkeypatch):
+    mock_logger, received = await _run_emit_with_logger(monkeypatch, "")
+    msgs = _debug_msgs(mock_logger)
+    assert not any("transcribed" in m for m in msgs)
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_transcribed_text_not_logged_when_dropped(monkeypatch):
+    # 幻聴は drop ログのみ、transcribed ログは出さない
+    mock_logger, received = await _run_emit_with_logger(monkeypatch, "ありがとうございました")
+    msgs = _debug_msgs(mock_logger)
+    assert any("dropped hallucination" in m for m in msgs)
+    assert not any("transcribed" in m for m in msgs)
+    assert received == []
